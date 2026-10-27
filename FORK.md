@@ -19,6 +19,10 @@
 
 #4456 的影响：Windows 上 GUI 只把 `gui-sock-<pid>` 这个文件名发布到共享内存，新启动的 `wezterm-gui` 和 `wezterm cli` 按自己的工作目录去解析，于是任务栏、开始菜单、右键菜单每次启动都会新开一个进程（每个进程有几百 MB 的基础开销），在 WezTerm 外运行 `wezterm cli` 也会连不上。
 
+## 日常维护入口
+
+日常维护由 dotfiles 仓库（`sean2077/dotfiles`）里的 `scripts/wezterm-fork.ps1` 完成。它负责回拉上游、rebase、推送、构建、安装和切换启动入口；Windows 上每次同步配置时都会运行它。下面是它背后的手动步骤，用于脚本停下（例如 rebase 冲突）时人工处理。
+
 ## 回拉上游
 
 ```sh
@@ -35,10 +39,10 @@ git push --force-with-lease origin patched
 
 ```powershell
 $env:PATH = "$env:USERPROFILE\.local\opt\strawberry-perl\perl\bin;" + $env:PATH
-cargo build --release -p wezterm -p wezterm-gui -p wezterm-mux-server
+cargo build --release -p wezterm -p wezterm-gui -p wezterm-mux-server -p strip-ansi-escapes
 ```
 
-安装目录是 `~/.local/opt/wezterm`。其中运行时文件（`conpty.dll`、`OpenConsole.exe`、`libEGL.dll`、`libGLESv2.dll`、`mesa/opengl32.dll`、`strip-ansi-escapes.exe`）从官方安装目录复制，三个 exe 用 `target/release` 下的构建产物覆盖。覆盖前要先关掉所有从这个目录启动的 WezTerm，否则 exe 被占用，无法覆盖。
+安装目录是 `~/.local/opt/wezterm`。构建会把运行时文件（`conpty.dll`、`OpenConsole.exe`、`libEGL.dll`、`libGLESv2.dll`、`mesa/opengl32.dll`）一起放进 `target/release`，与 4 个 exe 一并复制过去即可。运行中的 WezTerm 会占用 exe，但 Windows 允许重命名被占用的文件：先把旧文件改名，再复制新文件（脚本就是这么做的）。
 
 复用已有进程要求启动器和正在运行的 GUI 是**同一个 exe 路径**，所以任务栏、开始菜单、右键菜单要全部指向同一个安装目录。
 
