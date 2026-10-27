@@ -16,8 +16,11 @@
 | 提交主题 | 来源 | 上游状态 | 何时可以删 |
 |---|---|---|---|
 | windows: resolve the published gui socket name against the runtime dir | cherry-pick 自 [#8181](https://github.com/wezterm/wezterm/pull/8181)（作者 Yoshiyuki Kumon） | 未合并；同类 PR 还有 #7896、#8201 | 上游合并任一修复 [#4456](https://github.com/wezterm/wezterm/issues/4456) 的 PR 之后 |
+| windows: only notify the IME when the cursor rect actually changes<br>windows: reset the cached IME cursor rect on focus/context/composition start | cherry-pick 自 [#8166](https://github.com/wezterm/wezterm/pull/8166)（作者 Yoshiyuki Kumon） | 未合并 | 上游合并 #8166 之后 |
 
 #4456 的影响：Windows 上 GUI 只把 `gui-sock-<pid>` 这个文件名发布到共享内存，新启动的 `wezterm-gui` 和 `wezterm cli` 按自己的工作目录去解析，于是任务栏、开始菜单、右键菜单每次启动都会新开一个进程（每个进程有几百 MB 的基础开销），在 WezTerm 外运行 `wezterm cli` 也会连不上。
+
+#8166 的影响：Windows 上 `TermWindow::update_text_cursor` 在每帧绘制时都调用 `ImmSetCandidateWindow`（Builtin preedit）或 `ImmSetCompositionWindow`（System preedit），而 IME 每次收到调用都会销毁并重建候选窗，于是组合输入时候选窗每敲一键闪一次（Google 日语输入法、微软 IME、Rime/Weasel 都如此；Claude Code、Codex CLI 这类高频重绘的 TUI 更明显）。补丁缓存上次上报给 IME 的光标矩形，位置不变就跳过调用；在 `WM_SETFOCUS`、`WM_IME_SETCONTEXT`、`WM_IME_STARTCOMPOSITION`、`WM_IME_ENDCOMPOSITION` 以及配置变化时清缓存，保证重新获得焦点、每次组合开始时至少重新上报一次。
 
 ## 日常维护入口
 
