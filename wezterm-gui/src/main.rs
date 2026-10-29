@@ -410,6 +410,11 @@ async fn async_run_terminal_gui(
     opts: StartCommand,
     should_publish: bool,
 ) -> anyhow::Result<()> {
+    // Instances that crash or are killed skip the remove_file below and leave
+    // their gui-sock-* marker behind forever. Prune them when a new GUI starts:
+    // the helper only drops sockets that fail to connect and are older than a
+    // second, so an instance still starting up is never mistaken for a dead one.
+    let _ = wezterm_client::discovery::discover_gui_socks();
     let unix_socket_path =
         config::RUNTIME_DIR.join(format!("gui-sock-{}", unsafe { libc::getpid() }));
     std::env::set_var("WEZTERM_UNIX_SOCKET", unix_socket_path.clone());
