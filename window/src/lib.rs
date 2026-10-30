@@ -259,6 +259,11 @@ pub trait WindowOps {
     /// Hide a visible window
     fn hide(&self);
 
+    /// Whether this window registered its quake mode global hotkey.
+    fn quake_hotkey_available(&self) -> bool {
+        false
+    }
+
     /// Schedule the window to be closed
     fn close(&self);
 

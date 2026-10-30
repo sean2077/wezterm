@@ -888,7 +888,12 @@ impl TermWindow {
                 myself.created(RenderContext::WebGpu(Rc::clone(&webgpu)))?;
             }
             myself.load_os_parameters();
-            window.show();
+            let start_hidden = config.quake.enabled
+                && config.quake.start_hidden
+                && window.quake_hotkey_available();
+            if !start_hidden {
+                window.show();
+            }
             myself.subscribe_to_pane_updates();
             myself.emit_window_event("window-config-reloaded", None);
             myself.emit_status_event();

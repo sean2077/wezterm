@@ -56,6 +56,9 @@ const GCS_RESULTSTR: DWORD = 0x800;
 const GCS_COMPSTR: DWORD = 0x8;
 const ISC_SHOWUICOMPOSITIONWINDOW: DWORD = 0x80000000;
 
+#[path = "quake.rs"]
+mod quake;
+
 #[allow(non_snake_case)]
 #[repr(C)]
 pub struct CANDIDATEFORM {
@@ -130,6 +133,7 @@ pub(crate) struct WindowInner {
     /// Last cursor rect reported to the IME; used to avoid re-sending the
     /// same position on every paint (which makes IME candidate windows flicker).
     last_ime_cursor: Option<Rect>,
+    quake: quake::QuakeState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Ord, PartialOrd)]
@@ -551,6 +555,7 @@ impl Window {
             paint_throttled: false,
             invalidated: true,
             last_ime_cursor: None,
+            quake: quake::QuakeState::default(),
         }));
 
         // Careful: `raw` owns a ref to inner, but there is no Drop impl
@@ -585,6 +590,8 @@ impl Window {
         conn.windows
             .borrow_mut()
             .insert(hwnd.clone(), Rc::clone(&inner));
+
+        quake::sync_hotkey(&mut inner.borrow_mut());
 
         Ok(window_handle)
     }
@@ -695,6 +702,7 @@ impl WindowInner {
         self.config = config.clone();
         self.last_ime_cursor = None;
         self.apply_decoration();
+        quake::sync_hotkey(self);
     }
 
     fn toggle_fullscreen(&mut self) {
@@ -809,6 +817,10 @@ impl WindowOps for Window {
 
     fn hide(&self) {
         schedule_show_window(self.0, ShowWindowCommand::Minimize);
+    }
+
+    fn quake_hotkey_available(&self) -> bool {
+        quake::hotkey_available()
     }
 
     fn focus(&self) {
@@ -1128,6 +1140,7 @@ unsafe fn wm_ncdestroy(
     if !raw.is_null() {
         let inner = take_rc_from_pointer(raw);
         let mut inner = inner.borrow_mut();
+        quake::unregister_hotkey(&mut inner);
         inner.events.dispatch(WindowEvent::Destroyed);
         inner.hwnd = HWindow(null_mut());
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
@@ -1291,6 +1304,10 @@ unsafe fn wm_nchittest(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) ->
 }
 
 fn get_window_state(hwnd: HWND) -> WindowState {
+    if unsafe { IsWindowVisible(hwnd) } == 0 {
+        return WindowState::HIDDEN;
+    }
+
     let mut placement = WINDOWPLACEMENT {
         length: std::mem::size_of::<WINDOWPLACEMENT>() as _,
         ..Default::default()
@@ -1617,10 +1634,14 @@ unsafe fn wm_kill_focus(
     _wparam: WPARAM,
     _lparam: LPARAM,
 ) -> Option<LRESULT> {
-    rc_from_hwnd(hwnd)?
-        .borrow_mut()
-        .events
-        .dispatch(WindowEvent::FocusChanged(false));
+    if let Some(inner) = rc_from_hwnd(hwnd) {
+        let config = {
+            let mut inner = inner.borrow_mut();
+            inner.events.dispatch(WindowEvent::FocusChanged(false));
+            inner.config.quake.clone()
+        };
+        quake::focus_lost(hwnd, &config);
+    }
     None
 }
 
@@ -2989,6 +3010,7 @@ unsafe fn do_wnd_proc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) -> 
         WM_WINDOWPOSCHANGED => wm_windowposchanged(hwnd, msg, wparam, lparam),
         WM_SETFOCUS => wm_set_focus(hwnd, msg, wparam, lparam),
         WM_KILLFOCUS => wm_kill_focus(hwnd, msg, wparam, lparam),
+        WM_HOTKEY => quake::wm_hotkey(hwnd, wparam),
         WM_DEADCHAR | WM_KEYDOWN | WM_KEYUP | WM_SYSCHAR | WM_CHAR | WM_IME_CHAR | WM_SYSKEYUP
         | WM_SYSKEYDOWN => key(hwnd, msg, wparam, lparam),
         WM_SIZING => {
@@ -3011,6 +3033,9 @@ unsafe fn do_wnd_proc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) -> 
         WM_DROPFILES => drop_files(hwnd, msg, wparam, lparam),
         WM_ERASEBKGND => Some(1),
         WM_CLOSE => {
+            if quake::close_hides(hwnd) {
+                return Some(0);
+            }
             if let Some(inner) = rc_from_hwnd(hwnd) {
                 let mut inner = inner.borrow_mut();
                 inner.events.dispatch(WindowEvent::CloseRequested);
