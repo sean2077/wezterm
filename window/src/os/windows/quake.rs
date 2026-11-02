@@ -23,6 +23,12 @@ static QUAKE_HOTKEY_REGISTERED: AtomicBool = AtomicBool::new(false);
 pub(super) struct QuakeState {
     hotkey_spec: Option<KeyNoAction>,
     registered: bool,
+    /// Runtime fullscreen state. `ToggleFullScreen` flips this while quake
+    /// mode is active, and F3 re-shows the window with the same state.
+    fullscreen: bool,
+    /// The config value last copied into `fullscreen`, so a config reload can
+    /// reset the runtime state when `config.quake.fullscreen` changes.
+    config_fullscreen: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,6 +47,10 @@ pub(super) fn hotkey_available() -> bool {
 /// the tool-window style in sync. Safe to call with `WindowInner` borrowed:
 /// it never calls a function that can synchronously re-enter the window proc.
 pub(super) fn sync_hotkey(inner: &mut WindowInner) {
+    if inner.quake.config_fullscreen != inner.config.quake.fullscreen {
+        inner.quake.config_fullscreen = inner.config.quake.fullscreen;
+        inner.quake.fullscreen = inner.config.quake.fullscreen;
+    }
     let desired = if inner.config.quake.enabled {
         inner.config.quake.hotkey.clone()
     } else {
@@ -109,12 +119,12 @@ pub(super) fn wm_hotkey(hwnd: HWND, wparam: WPARAM) -> Option<LRESULT> {
     let Some(inner) = rc_from_hwnd(hwnd) else {
         return Some(0);
     };
-    let config = {
+    let (config, fullscreen) = {
         let inner = inner.borrow();
-        inner.config.quake.clone()
+        (inner.config.quake.clone(), inner.quake.fullscreen)
     };
     if config.enabled {
-        toggle(hwnd, &config);
+        toggle(hwnd, &config, fullscreen);
     }
     Some(0)
 }
@@ -161,22 +171,22 @@ pub(super) fn close_hides(hwnd: HWND) -> bool {
     enabled
 }
 
-fn toggle(hwnd: HWND, config: &QuakeConfig) {
+fn toggle(hwnd: HWND, config: &QuakeConfig, fullscreen: bool) {
     let visible = unsafe { IsWindowVisible(hwnd) } != 0;
     let iconic = unsafe { IsIconic(hwnd) } != 0;
     if visible && !iconic {
         unsafe {
             ShowWindowAsync(hwnd, SW_HIDE);
-        }
+        };
         return;
     }
-    if let Err(err) = show_quake(hwnd, config) {
+    if let Err(err) = show_quake(hwnd, config, fullscreen) {
         log::error!("quake: {err}");
     }
 }
 
-fn show_quake(hwnd: HWND, config: &QuakeConfig) -> Result<(), String> {
-    let bounds = quake_bounds(config)?;
+fn show_quake(hwnd: HWND, config: &QuakeConfig, fullscreen: bool) -> Result<(), String> {
+    let bounds = quake_bounds(config, fullscreen)?;
 
     // An iconified window (for example after Win+M) has to be restored before
     // it can be placed; SetWindowPos alone does not update its restored rect.
@@ -186,6 +196,23 @@ fn show_quake(hwnd: HWND, config: &QuakeConfig) -> Result<(), String> {
         }
     }
 
+    apply_bounds(hwnd, config, &bounds)?;
+
+    unsafe {
+        // The borrow is no longer held here, so a synchronous ShowWindow is
+        // safe: WM_SETFOCUS/WM_SIZE handlers may borrow WindowInner again.
+        ShowWindow(hwnd, SW_SHOW);
+        if SetForegroundWindow(hwnd) == 0 {
+            log::warn!("quake: SetForegroundWindow was refused");
+        }
+    }
+    Ok(())
+}
+
+/// Move and size the quake window to `bounds`. Callers must not hold a
+/// `WindowInner` borrow: SetWindowPos can synchronously re-enter the window
+/// proc, which borrows `WindowInner` again.
+fn apply_bounds(hwnd: HWND, config: &QuakeConfig, bounds: &Bounds) -> Result<(), String> {
     let insert_after = if config.always_on_top {
         HWND_TOPMOST
     } else {
@@ -225,15 +252,30 @@ fn show_quake(hwnd: HWND, config: &QuakeConfig) -> Result<(), String> {
                 std::io::Error::last_os_error()
             ));
         }
-
-        // The borrow is no longer held here, so a synchronous ShowWindow is
-        // safe: WM_SETFOCUS/WM_SIZE handlers may borrow WindowInner again.
-        ShowWindow(hwnd, SW_SHOW);
-        if SetForegroundWindow(hwnd) == 0 {
-            log::warn!("quake: SetForegroundWindow was refused");
-        }
     }
     Ok(())
+}
+
+/// Toggle quake fullscreen from the GUI's `ToggleFullScreen` action. The
+/// bounds are applied asynchronously because the caller holds a `WindowInner`
+/// borrow, and SetWindowPos may re-enter the window proc synchronously.
+pub(super) fn toggle_fullscreen(inner: &mut WindowInner) {
+    if !inner.config.quake.enabled {
+        return;
+    }
+    inner.quake.fullscreen = !inner.quake.fullscreen;
+    let config = inner.config.quake.clone();
+    let fullscreen = inner.quake.fullscreen;
+    let hwnd = inner.hwnd;
+    promise::spawn::spawn(async move {
+        match quake_bounds(&config, fullscreen)
+            .and_then(|bounds| apply_bounds(hwnd.0, &config, &bounds))
+        {
+            Ok(()) => log::info!("quake: fullscreen={fullscreen}"),
+            Err(err) => log::error!("quake: {err}"),
+        }
+    })
+    .detach();
 }
 
 fn register_hotkey(hwnd: HWND, spec: &KeyNoAction) -> Result<(), String> {
@@ -284,7 +326,7 @@ fn modifiers_to_mod(mods: Modifiers) -> UINT {
     out
 }
 
-fn quake_bounds(config: &QuakeConfig) -> Result<Bounds, String> {
+fn quake_bounds(config: &QuakeConfig, fullscreen: bool) -> Result<Bounds, String> {
     let monitor = match config.monitor {
         QuakeMonitor::Cursor => {
             let mut point: POINT = unsafe { std::mem::zeroed() };
@@ -314,10 +356,10 @@ fn quake_bounds(config: &QuakeConfig) -> Result<Bounds, String> {
     }
 
     let mut effective = config.clone();
-    let area = if config.fullscreen {
+    let area = if fullscreen {
         // Extend one pixel above the monitor so WezTerm does not infer a
-        // FULL_SCREEN state; the Lua fullscreen toggle restores the dropdown
-        // height through set_inner_size, which is ignored while FULL_SCREEN.
+        // FULL_SCREEN state; restoring the work-area height through
+        // SetWindowPos is ignored while FULL_SCREEN.
         effective.width_percent = 100;
         effective.height_percent = 100;
         RECT {

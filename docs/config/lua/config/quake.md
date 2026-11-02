@@ -33,7 +33,7 @@ config.quake = {
 | `start_hidden` | boolean | `false` | Skip the initial `ShowWindow`; wait for the hotkey |
 | `hide_on_focus_loss` | boolean | `false` | Hide when the foreground window leaves this window's root-owner family |
 | `always_on_top` | boolean | `true` | Keep the shown window above other windows |
-| `fullscreen` | boolean | `false` | Show across the whole monitor; set through a per-window override by the quake fullscreen key so F3 re-show keeps it |
+| `fullscreen` | boolean | `false` | Start with the fullscreen quake bounds; `ToggleFullScreen` flips it while the window is shown and F3 re-show keeps the current state |
 | `edge` | `Top`, `Bottom` | `Top` | Work-area edge to anchor to |
 | `alignment` | `Start`, `Center`, `End` | `Center` | Alignment along that edge |
 | `width_percent` | 10–100 | `100` | Width as a percentage of the monitor work area |
@@ -45,6 +45,11 @@ Notes:
 - The hotkey is registered against the window handle via `RegisterHotKey`; it
   is global and exclusive. If registration fails the window is shown instead of
   staying hidden.
+- While quake mode is active, the normal `ToggleFullScreen` action toggles
+  between the configured dropdown bounds and the full monitor instead of
+  entering the native fullscreen state. The state is remembered across F3
+  hides, so a Lua key handler only needs to bind the action; no geometry
+  calculation is required.
 - Intended for a dedicated instance, for example:
   `wezterm-gui.exe --config-file path/to/quake.lua start --class org.wezfurlong.wezterm.quake`.
 - Use `window_decorations = 'NONE'` so the outer and client rectangles
