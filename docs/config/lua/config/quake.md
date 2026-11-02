@@ -33,6 +33,7 @@ config.quake = {
 | `start_hidden` | boolean | `false` | Skip the initial `ShowWindow`; wait for the hotkey |
 | `hide_on_focus_loss` | boolean | `false` | Hide when the foreground window leaves this window's root-owner family |
 | `always_on_top` | boolean | `true` | Keep the shown window above other windows |
+| `fullscreen` | boolean | `false` | Show across the whole monitor; set through a per-window override by the quake fullscreen key so F3 re-show keeps it |
 | `edge` | `Top`, `Bottom` | `Top` | Work-area edge to anchor to |
 | `alignment` | `Start`, `Center`, `End` | `Center` | Alignment along that edge |
 | `width_percent` | 10–100 | `100` | Width as a percentage of the monitor work area |

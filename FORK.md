@@ -30,7 +30,7 @@
 
 `config.quake` 让一个专用 WezTerm 实例作为 Guake 式下拉终端：窗口在登录时隐藏启动，注册全局热键（例如 F3），按热键在“隐藏”和“工作区顶部矩形”之间切换；支持置顶、失焦收起、关闭即隐藏。实现位于 `window/src/os/windows/quake.rs`，使用 `RegisterHotKey` + `WM_HOTKEY`，窗口样式设为 `WS_EX_TOOLWINDOW`，因此不出现在任务栏或 Alt+Tab。
 
-用法：用 `--config-file` 指定一个 `quake.lua`，并用 `--class` 给专用实例一个独立类名。`quake.lua` 应设置 `config.quake`、`window_decorations = "NONE"`（外框与客户区一致，几何才准确）、`tab_bar_at_bottom = true`。热键注册失败时窗口会回落为可见状态，而不是留下隐形实例；`WM_CLOSE` 在 quake 模式下只收起窗口，显式退出仍用 `QuitApplication`。
+用法：用 `--config-file` 指定一个 `quake.lua`，并用 `--class` 给专用实例一个独立类名。`quake.lua` 应设置 `config.quake`、`window_decorations = "NONE"`（外框与客户区一致，几何才准确）、`tab_bar_at_bottom = true`。热键注册失败时窗口会回落为可见状态，而不是留下隐形实例；`WM_CLOSE` 在 quake 模式下只收起窗口，显式退出仍用 `QuitApplication`。全屏状态（`config.quake.fullscreen`）由 Lua 通过 per-window config override 写入，F3 收起再呼出后保持全屏；再按一次全屏键回到 `height_percent`。
 
 该功能仅 Windows 有实现；上游目前没有全局热键/quake 模式。补丁同时在 `window/Cargo.toml` 显式声明了 `winapi/shellapi` feature：窗口代码原本就使用 `DragAcceptFiles`，此前只是靠其他 crate 的 feature 合并才编过，单独构建 `window` crate 会失败。
 

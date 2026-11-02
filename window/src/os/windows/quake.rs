@@ -312,7 +312,24 @@ fn quake_bounds(config: &QuakeConfig) -> Result<Bounds, String> {
             std::io::Error::last_os_error()
         ));
     }
-    bounds_for_work_area(info.rcWork, config)
+
+    let mut effective = config.clone();
+    let area = if config.fullscreen {
+        // Extend one pixel above the monitor so WezTerm does not infer a
+        // FULL_SCREEN state; the Lua fullscreen toggle restores the dropdown
+        // height through set_inner_size, which is ignored while FULL_SCREEN.
+        effective.width_percent = 100;
+        effective.height_percent = 100;
+        RECT {
+            left: info.rcMonitor.left,
+            top: info.rcMonitor.top - 1,
+            right: info.rcMonitor.right,
+            bottom: info.rcMonitor.bottom,
+        }
+    } else {
+        info.rcWork
+    };
+    bounds_for_work_area(area, &effective)
 }
 
 fn bounds_for_work_area(work: RECT, config: &QuakeConfig) -> Result<Bounds, String> {
