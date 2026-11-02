@@ -380,15 +380,38 @@ impl crate::TermWindow {
         } else {
             0.
         };
+        let window_buttons_at_left = self
+            .config
+            .window_decorations
+            .contains(window::WindowDecorations::INTEGRATED_BUTTONS)
+            && (self.config.integrated_title_button_alignment
+                == IntegratedTitleButtonAlignment::Left
+                || self.config.integrated_title_button_style
+                    == IntegratedTitleButtonStyle::MacOsNative);
+        // The right status and the integrated window buttons float over the
+        // tab strip, so the uniform tab share must leave room for them.
+        let reserved_side_width: f32 = items
+            .iter()
+            .filter_map(|item| {
+                let occupies_side = match item.item {
+                    TabBarItem::LeftStatus => true,
+                    TabBarItem::RightStatus => true,
+                    TabBarItem::WindowButton(_) => true,
+                    _ => false,
+                };
+                occupies_side.then(|| item.title.len() as f32 * metrics.cell_size.width as f32)
+            })
+            .sum();
+        let uniform_width =
+            (self.terminal_size.pixel_width as f32 - reserved_side_width - new_tab_width).max(0.);
         let max_tab_width = if self.config.tab_bar_uniform_width && tab_count > 0. {
-            // Split the bar between the tabs only. The new tab button has a
-            // fixed size, so it must not consume one tab's share. Use the
-            // terminal's pixel width rather than dimensions.pixel_width: the
-            // latter can be a stale/window-frame value that is wider than the
-            // actual client area and makes the first tab claim too much.
-            ((self.terminal_size.pixel_width as f32 - new_tab_width) / tab_count
-                - (1.5 * metrics.cell_size.width as f32))
-                .max(0.)
+            // Split the remaining bar between the tabs only. The new tab
+            // button and the side status/buttons have fixed sizes, so they
+            // must not consume one tab's share. Use the terminal's pixel width
+            // rather than dimensions.pixel_width: the latter can be a
+            // stale/window-frame value that is wider than the actual client
+            // area and makes the first tab claim too much.
+            (uniform_width / tab_count - (1.5 * metrics.cell_size.width as f32)).max(0.)
         } else {
             ((self.dimensions.pixel_width as f32 / num_tabs)
                 - (1.5 * metrics.cell_size.width as f32))
@@ -399,7 +422,7 @@ impl crate::TermWindow {
         // every tab gets the same share instead of each one claiming a global
         // estimate and squeezing the last tab.
         let mut remaining_tabs = tab_count;
-        let mut remaining_width = self.terminal_size.pixel_width as f32 - new_tab_width;
+        let mut remaining_width = uniform_width;
 
         // Reserve space for the native titlebar buttons
         if self
@@ -474,15 +497,6 @@ impl crate::TermWindow {
                     .colors(bar_colors.clone()),
             );
         }
-
-        let window_buttons_at_left = self
-            .config
-            .window_decorations
-            .contains(window::WindowDecorations::INTEGRATED_BUTTONS)
-            && (self.config.integrated_title_button_alignment
-                == IntegratedTitleButtonAlignment::Left
-                || self.config.integrated_title_button_style
-                    == IntegratedTitleButtonStyle::MacOsNative);
 
         let left_padding = if window_buttons_at_left {
             if self.config.integrated_title_button_style == IntegratedTitleButtonStyle::MacOsNative
