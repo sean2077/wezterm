@@ -2028,10 +2028,9 @@ impl TermWindow {
             // small.
             let metrics = crate::utilsprites::RenderMetrics::with_font_metrics(&font.metrics());
             let cell_width = (metrics.cell_size.width as f32).max(1.0);
-            // Match the tab layout, which splits terminal_size.pixel_width;
-            // dimensions.pixel_width includes padding/border and would make
-            // the title budget a few cells too wide.
-            (self.terminal_size.pixel_width as f32 / cell_width) as usize
+            // dimensions.pixel_width is the physical tab-bar width used by the
+            // layout; terminal_size.pixel_width is a logical/scaled value.
+            (self.dimensions.pixel_width as f32 / cell_width) as usize
         });
         let new_tab_bar = TabBarState::new(
             self.dimensions.pixel_width / self.render_metrics.cell_size.width as usize,
