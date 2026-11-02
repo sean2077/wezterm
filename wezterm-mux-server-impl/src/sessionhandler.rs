@@ -402,9 +402,13 @@ impl SessionHandler {
                             let mut tabs = vec![];
                             let mut tab_titles = vec![];
                             let mut window_titles = HashMap::new();
+                            let mut active_tab_ids = HashMap::new();
                             for window_id in mux.iter_windows().into_iter() {
                                 let window = mux.get_window(window_id).unwrap();
                                 window_titles.insert(window_id, window.get_title().to_string());
+                                if let Some(tab) = window.get_active_tab() {
+                                    active_tab_ids.insert(window_id, tab.tab_id());
+                                }
                                 for tab in window.iter_tabs() {
                                     tabs.push(tab.codec_pane_tree());
                                     tab_titles.push(tab.get_title());
@@ -415,6 +419,7 @@ impl SessionHandler {
                                 tabs,
                                 tab_titles,
                                 window_titles,
+                                active_tab_ids,
                             }))
                         },
                         send_response,

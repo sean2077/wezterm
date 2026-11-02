@@ -44,12 +44,15 @@ impl ListCommand {
                     let tabs = tab_index.entry(entry.window_id).or_default();
                     let next_tab = tabs.len();
                     let tab_idx = *tabs.entry(entry.tab_id).or_insert(next_tab);
+                    let is_active_tab =
+                        panes.active_tab_ids.get(&entry.window_id) == Some(&entry.tab_id);
                     output_items.push(CliListResultItem::from(
                         entry.clone(),
                         tab_title,
                         window_title,
                         win_idx,
                         tab_idx,
+                        is_active_tab,
                     ));
                 }
                 match cursor.preorder_next() {
@@ -101,6 +104,10 @@ impl ListCommand {
                         name: "WINIDX".to_string(),
                         alignment: Alignment::Right,
                     },
+                    Column {
+                        name: "ACTIVE".to_string(),
+                        alignment: Alignment::Left,
+                    },
                 ];
                 let data = output_items
                     .iter()
@@ -115,6 +122,11 @@ impl ListCommand {
                             output_item.cwd.to_string(),
                             output_item.tab_index.to_string(),
                             output_item.window_index.to_string(),
+                            if output_item.is_active_tab {
+                                "yes".to_string()
+                            } else {
+                                String::new()
+                            },
                         ]
                     })
                     .collect::<Vec<_>>();
@@ -170,6 +182,8 @@ struct CliListResultItem {
     tab_index: usize,
     /// Zero-based index of the window in the mux's window iteration order.
     window_index: usize,
+    /// True when this pane belongs to its window's active tab.
+    is_active_tab: bool,
 }
 
 impl CliListResultItem {
@@ -179,6 +193,7 @@ impl CliListResultItem {
         window_title: &str,
         window_index: usize,
         tab_index: usize,
+        is_active_tab: bool,
     ) -> CliListResultItem {
         let mux::tab::PaneEntry {
             window_id,
@@ -236,6 +251,7 @@ impl CliListResultItem {
             tty_name,
             tab_index,
             window_index,
+            is_active_tab,
         }
     }
 }
