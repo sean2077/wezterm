@@ -137,6 +137,13 @@ pub enum TermWindowNotif {
     },
     GetConfigOverrides(Sender<wezterm_dynamic::Value>),
     SetConfigOverrides(wezterm_dynamic::Value),
+    SetConfigOverride {
+        key: String,
+        value: wezterm_dynamic::Value,
+    },
+    ClearConfigOverride {
+        key: String,
+    },
     CancelOverlayForPane(PaneId),
     CancelOverlayForTab {
         tab_id: TabId,
@@ -1198,6 +1205,24 @@ impl TermWindow {
                     self.config_was_reloaded();
                 }
             }
+            TermWindowNotif::SetConfigOverride { key, value } => {
+                let mut object = match std::mem::take(&mut self.config_overrides) {
+                    wezterm_dynamic::Value::Object(object) => object,
+                    _ => wezterm_dynamic::Object::default(),
+                };
+                object.insert(wezterm_dynamic::Value::String(key), value);
+                self.config_overrides = wezterm_dynamic::Value::Object(object);
+                self.config_was_reloaded();
+            }
+            TermWindowNotif::ClearConfigOverride { key } => {
+                let mut object = match std::mem::take(&mut self.config_overrides) {
+                    wezterm_dynamic::Value::Object(object) => object,
+                    _ => wezterm_dynamic::Object::default(),
+                };
+                object.remove(&wezterm_dynamic::Value::String(key));
+                self.config_overrides = wezterm_dynamic::Value::Object(object);
+                self.config_was_reloaded();
+            }
             TermWindowNotif::CancelOverlayForPane(pane_id) => {
                 self.cancel_overlay_for_pane(pane_id);
             }
@@ -1415,10 +1440,12 @@ impl TermWindow {
         Ok(())
     }
 
-    fn schedule_status_update(&self) {
-        if let Some(window) = self.window.as_ref() {
-            window.notify(TermWindowNotif::EmitStatusUpdate);
-        }
+    fn schedule_status_update(&mut self) {
+        // Coalesce status updates through the configured interval instead of
+        // emitting one for every title change; high-output TUI programs change
+        // the title constantly and previously made update-status fire per
+        // frame.
+        self.schedule_next_status_update();
     }
 
     fn is_pane_visible(&mut self, pane_id: PaneId) -> bool {
@@ -1994,6 +2021,10 @@ impl TermWindow {
             None => false,
         };
 
+        let fancy_title_width = self.fonts.title_font().ok().map(|font| {
+            let cell_width = (font.metrics().cell_width.get() as f32).max(1.0);
+            (self.dimensions.pixel_width as f32 / cell_width) as usize
+        });
         let new_tab_bar = TabBarState::new(
             self.dimensions.pixel_width / self.render_metrics.cell_size.width as usize,
             if hovering_in_tab_bar {
@@ -2007,6 +2038,7 @@ impl TermWindow {
             &self.config,
             &self.left_status,
             &self.right_status,
+            fancy_title_width,
         );
         if new_tab_bar != self.tab_bar {
             self.tab_bar = new_tab_bar;
@@ -3181,6 +3213,17 @@ impl TermWindow {
         // perform below; here we allow the user to define an `open-uri` event
         // handler that can bypass the normal `open_url` functionality.
         if let Some(link) = self.current_highlight.as_ref().cloned() {
+            // Expand $CWD in hyperlink formats at click time, when the pane's
+            // current working directory is available. format-time expansion
+            // cannot see the pane and leaves relative paths for Lua to repair.
+            let cwd = pane
+                .get_current_working_dir(CachePolicy::AllowStale)
+                .and_then(|url| url.to_file_path().ok())
+                .map(|p| p.to_string_lossy().to_string());
+            let link = match cwd {
+                Some(cwd) => link.uri().to_string().replace("$CWD", &cwd),
+                None => link.uri().to_string(),
+            };
             let window = GuiWin::new(self);
             let pane = MuxPane(pane.pane_id());
 
@@ -3210,7 +3253,7 @@ impl TermWindow {
             }
 
             promise::spawn::spawn(config::with_lua_config_on_main_thread(move |lua| {
-                open_uri(lua, window, pane, link.uri().to_string())
+                open_uri(lua, window, pane, link)
             }))
             .detach();
         }
