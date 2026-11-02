@@ -19,6 +19,9 @@
 | windows: only notify the IME when the cursor rect actually changes<br>windows: reset the cached IME cursor rect on focus/context/composition start | cherry-pick 自 [#8166](https://github.com/wezterm/wezterm/pull/8166)（作者 Yoshiyuki Kumon） | 未合并 | 上游合并 #8166 之后 |
 | gui: prune stale gui-sock files when the GUI starts | 自用 | — | 上游在 GUI 启动路径也清理死 socket 后可删 |
 | windows: add a config-driven quake dropdown mode | 自用 | — | 上游提供等价的全局热键/quake 模式后可删 |
+| windows: toggle quake bounds from the native fullscreen action | 自用 | — | 上游提供等价的 quake 模式后可删 |
+| gui: add an opt-in uniform fancy tab bar width | 自用 | — | 上游提供等价的标签栏布局选项后可删 |
+| cli: report tab/window indices and focus the owning GUI window | 自用 | — | 上游的 `list` 输出索引且 `activate-*` 会前台化窗口后可删 |
 
 #4456 的影响：Windows 上 GUI 只把 `gui-sock-<pid>` 这个文件名发布到共享内存，新启动的 `wezterm-gui` 和 `wezterm cli` 按自己的工作目录去解析，于是任务栏、开始菜单、右键菜单每次启动都会新开一个进程（每个进程有几百 MB 的基础开销），在 WezTerm 外运行 `wezterm cli` 也会连不上。
 
@@ -30,7 +33,9 @@
 
 `config.quake` 让一个专用 WezTerm 实例作为 Guake 式下拉终端：窗口在登录时隐藏启动，注册全局热键（例如 F3），按热键在“隐藏”和“工作区顶部矩形”之间切换；支持置顶、失焦收起、关闭即隐藏。实现位于 `window/src/os/windows/quake.rs`，使用 `RegisterHotKey` + `WM_HOTKEY`，窗口样式设为 `WS_EX_TOOLWINDOW`，因此不出现在任务栏或 Alt+Tab。
 
-用法：用 `--config-file` 指定一个 `quake.lua`，并用 `--class` 给专用实例一个独立类名。`quake.lua` 应设置 `config.quake`、`window_decorations = "NONE"`（外框与客户区一致，几何才准确）、`tab_bar_at_bottom = true`。热键注册失败时窗口会回落为可见状态，而不是留下隐形实例；`WM_CLOSE` 在 quake 模式下只收起窗口，显式退出仍用 `QuitApplication`。全屏状态（`config.quake.fullscreen`）由 Lua 通过 per-window config override 写入，F3 收起再呼出后保持全屏；再按一次全屏键回到 `height_percent`。
+用法：用 `--config-file` 指定一个 `quake.lua`，并用 `--class` 给专用实例一个独立类名。`quake.lua` 应设置 `config.quake`、`window_decorations = "NONE"`（外框与客户区一致，几何才准确）、`tab_bar_at_bottom = true`。热键注册失败时窗口会回落为可见状态，而不是留下隐形实例；`WM_CLOSE` 在 quake 模式下只收起窗口，显式退出仍用 `QuitApplication`。全屏状态由 `QuakeState` 在窗口进程内维护：quake 模式下原生的 `ToggleFullScreen` 动作改为在“配置的下拉矩形”和“整个显示器”之间切换，F3 收起再呼出后保持当前状态；Lua 只需绑定 `wezterm.action.ToggleFullScreen`，不需要计算几何或写 per-window override。
+
+`config.tab_bar_uniform_width = true` 让 fancy 标签栏的每个 tab 等宽，并把 `+` 按钮从均分分母中拿出来、按固定宽度布局；标题短于份额时补齐、超出时截断，标签栏几何不再随标题长度变化。
 
 该功能仅 Windows 有实现；上游目前没有全局热键/quake 模式。补丁同时在 `window/Cargo.toml` 显式声明了 `winapi/shellapi` feature：窗口代码原本就使用 `DragAcceptFiles`，此前只是靠其他 crate 的 feature 合并才编过，单独构建 `window` crate 会失败。
 
