@@ -515,6 +515,14 @@ pub struct Config {
     #[dynamic(default = "default_tab_max_width")]
     pub tab_max_width: usize,
 
+    /// If true, the fancy tab bar gives every tab the same width and lays
+    /// the new tab button out separately, instead of letting the button
+    /// consume one share of the available width. Tab titles that are shorter
+    /// than their share are padded to it; longer ones are truncated.
+    /// The default is false.
+    #[dynamic(default)]
+    pub tab_bar_uniform_width: bool,
+
     /// If true, hide the tab bar if the window only has a single tab.
     #[dynamic(default)]
     pub hide_tab_bar_if_only_one_tab: bool,
