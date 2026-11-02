@@ -477,6 +477,7 @@ impl crate::TermWindow {
                         elem.max_width = Some(Dimension::Pixels(max_tab_width));
                     }
                     let tab_colors = elem.colors.clone();
+                    let tab_hover_colors = elem.hover_colors.clone();
                     elem.content = match elem.content {
                         ElementContent::Text(_) => unreachable!(),
                         ElementContent::Poly { .. } => unreachable!(),
@@ -495,7 +496,8 @@ impl crate::TermWindow {
                                         .item_type(UIItemType::TabBar(item.item.clone()))
                                         .float(Float::Right)
                                         .zindex(1)
-                                        .colors(tab_colors),
+                                        .colors(tab_colors)
+                                        .hover_colors(tab_hover_colors),
                                 );
                             }
                             ElementContent::Children(kids)
