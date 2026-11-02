@@ -2023,7 +2023,10 @@ impl TermWindow {
 
         let fancy_title_width = self.fonts.title_font().ok().map(|font| {
             let cell_width = (font.metrics().cell_width.get() as f32).max(1.0);
-            (self.dimensions.pixel_width as f32 / cell_width) as usize
+            // Match the tab layout, which splits terminal_size.pixel_width;
+            // dimensions.pixel_width includes padding/border and would make
+            // the title budget a few cells too wide.
+            (self.terminal_size.pixel_width as f32 / cell_width) as usize
         });
         let new_tab_bar = TabBarState::new(
             self.dimensions.pixel_width / self.render_metrics.cell_size.width as usize,
@@ -3219,7 +3222,7 @@ impl TermWindow {
             let cwd = pane
                 .get_current_working_dir(CachePolicy::AllowStale)
                 .and_then(|url| url.to_file_path().ok())
-                .map(|p| p.to_string_lossy().to_string());
+                .map(|p| p.to_string_lossy().replace('\\', "/"));
             let link = match cwd {
                 Some(cwd) => link.uri().to_string().replace("$CWD", &cwd),
                 None => link.uri().to_string(),

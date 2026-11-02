@@ -494,8 +494,11 @@ impl TabBarState {
             // Match the 0.6 side-reserve factor used by the fancy layout, plus
             // roughly the new-tab button and the floating close button, so the
             // padded title ends before the close button instead of underneath it.
-            let reserved =
-                (((status_cells + window_buttons) as f32) * 0.6) as usize + 2 + close_button;
+            let reserved = (((status_cells + window_buttons) as f32)
+                * (config.tab_bar_side_reserve_ratio as f32).clamp(0.0, 1.0))
+                as usize
+                + 2
+                + close_button;
             let width = fancy_title_width.unwrap_or(config.tab_max_width);
             (width.saturating_sub(reserved) / number_of_tabs.max(1)).max(1)
         } else {
