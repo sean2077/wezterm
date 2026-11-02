@@ -473,8 +473,25 @@ impl TabBarState {
         // window size; use the title font's cell width to turn the real window
         // width into a title-cell budget.
         let first_pass_max = if config.use_fancy_tab_bar {
+            // The title budget must exclude the left/right status text and
+            // the integrated window buttons; otherwise the padded title is
+            // wider than the actual tab and gets truncated.
+            let status_cells = parse_status_text(left_status, CellAttributes::default()).len()
+                + parse_status_text(right_status, CellAttributes::default()).len();
+            let window_buttons = if config
+                .window_decorations
+                .contains(window::WindowDecorations::INTEGRATED_BUTTONS)
+            {
+                3
+            } else {
+                0
+            };
+            // Match the 0.6 side-reserve factor used by the fancy layout, plus
+            // roughly the new-tab button, so the padded title ends where the
+            // tab element ends.
+            let reserved = (((status_cells + window_buttons) as f32) * 0.6) as usize + 2;
             let width = fancy_title_width.unwrap_or(config.tab_max_width);
-            (width.saturating_sub(new_tab.len()) / number_of_tabs.max(1)).max(1)
+            (width.saturating_sub(reserved) / number_of_tabs.max(1)).max(1)
         } else {
             config.tab_max_width
         };
