@@ -6,6 +6,7 @@ use wezterm_client::client::Client;
 mod activate_pane;
 mod activate_pane_direction;
 mod activate_tab;
+mod activate_window;
 mod adjust_pane_size;
 mod get_pane_direction;
 mod get_text;
@@ -148,6 +149,10 @@ Outputs the pane-id for the newly created pane on success"
     #[command(name = "activate-tab", rename_all = "kebab")]
     ActivateTab(activate_tab::ActivateTab),
 
+    /// Activate (focus) a window and bring it to the foreground
+    #[command(name = "activate-window", rename_all = "kebab")]
+    ActivateWindow(activate_window::ActivateWindow),
+
     /// Change the title of a tab
     #[command(name = "set-tab-title", rename_all = "kebab")]
     SetTabTitle(set_tab_title::SetTabTitle),
@@ -195,6 +200,7 @@ async fn run_cli_async(opts: &crate::Opt, cli: CliCommand) -> anyhow::Result<()>
         CliSubCommand::ActivatePane(cmd) => cmd.run(client).await,
         CliSubCommand::AdjustPaneSize(cmd) => cmd.run(client).await,
         CliSubCommand::ActivateTab(cmd) => cmd.run(client).await,
+        CliSubCommand::ActivateWindow(cmd) => cmd.run(client).await,
         CliSubCommand::SetTabTitle(cmd) => cmd.run(client).await,
         CliSubCommand::SetWindowTitle(cmd) => cmd.run(client).await,
         CliSubCommand::RenameWorkspace(cmd) => cmd.run(client).await,
