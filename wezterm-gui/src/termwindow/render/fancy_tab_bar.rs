@@ -405,7 +405,7 @@ impl crate::TermWindow {
             // The status text and buttons render more compactly than a
             // character-cell estimate; reserving the full estimate leaves a
             // visible gap. Slightly over half matches the footprint.
-            * 0.55;
+            * 0.6;
         let uniform_width =
             (self.terminal_size.pixel_width as f32 - reserved_side_width - new_tab_width).max(0.);
         let max_tab_width = if self.config.tab_bar_uniform_width && tab_count > 0. {
