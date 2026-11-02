@@ -382,8 +382,11 @@ impl crate::TermWindow {
         };
         let max_tab_width = if self.config.tab_bar_uniform_width && tab_count > 0. {
             // Split the bar between the tabs only. The new tab button has a
-            // fixed size, so it must not consume one tab's share.
-            ((self.dimensions.pixel_width as f32 - new_tab_width) / tab_count
+            // fixed size, so it must not consume one tab's share. Use the
+            // terminal's pixel width rather than dimensions.pixel_width: the
+            // latter can be a stale/window-frame value that is wider than the
+            // actual client area and makes the first tab claim too much.
+            ((self.terminal_size.pixel_width as f32 - new_tab_width) / tab_count
                 - (1.5 * metrics.cell_size.width as f32))
                 .max(0.)
         } else {
@@ -396,7 +399,7 @@ impl crate::TermWindow {
         // every tab gets the same share instead of each one claiming a global
         // estimate and squeezing the last tab.
         let mut remaining_tabs = tab_count;
-        let mut remaining_width = self.dimensions.pixel_width as f32 - new_tab_width;
+        let mut remaining_width = self.terminal_size.pixel_width as f32 - new_tab_width;
 
         // Reserve space for the native titlebar buttons
         if self
