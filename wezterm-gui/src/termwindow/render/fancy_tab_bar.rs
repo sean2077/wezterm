@@ -476,12 +476,27 @@ impl crate::TermWindow {
                     } else {
                         elem.max_width = Some(Dimension::Pixels(max_tab_width));
                     }
+                    let tab_colors = elem.colors.clone();
                     elem.content = match elem.content {
                         ElementContent::Text(_) => unreachable!(),
                         ElementContent::Poly { .. } => unreachable!(),
                         ElementContent::Children(mut kids) => {
                             if self.config.show_close_tab_button_in_tabs {
                                 kids.push(make_x_button(&font, &metrics, &colors, tab_idx, active));
+                            }
+                            if let Some(right) = &item.right_title {
+                                // Float the callback's right-hand suffix before
+                                // the close button so it stays on the tab's
+                                // right edge regardless of proportional title
+                                // glyph widths.
+                                kids.push(
+                                    Element::with_line(&font, right, palette)
+                                        .vertical_align(tab_vertical_alignment)
+                                        .item_type(UIItemType::TabBar(item.item.clone()))
+                                        .float(Float::Right)
+                                        .zindex(1)
+                                        .colors(tab_colors),
+                                );
                             }
                             ElementContent::Children(kids)
                         }

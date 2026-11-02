@@ -38,6 +38,7 @@ pub enum TabBarItem {
 pub struct TabEntry {
     pub item: TabBarItem,
     pub title: Line,
+    pub right_title: Option<Line>,
     x: usize,
     width: usize,
 }
@@ -49,6 +50,34 @@ struct TitleText {
     /// True when the built-in title path rendered an indeterminate spinner
     /// frame. A custom format-tab-title callback always leaves this false.
     has_indeterminate: bool,
+    /// Text after a U+001F marker in the callback result. The tab bar renders
+    /// this as a right-floated element so it stays on the right edge even with
+    /// a proportional title font.
+    right: Option<Line>,
+}
+
+const RIGHT_MARKER: char = '\u{1f}';
+
+fn split_right(items: Vec<FormatItem>) -> (Vec<FormatItem>, Option<Vec<FormatItem>>) {
+    for (idx, item) in items.iter().enumerate() {
+        if let FormatItem::Text(s) = item {
+            if let Some(pos) = s.find(RIGHT_MARKER) {
+                let mut left: Vec<FormatItem> = items[..idx].to_vec();
+                let left_text = s[..pos].to_string();
+                if !left_text.is_empty() {
+                    left.push(FormatItem::Text(left_text));
+                }
+                let mut right: Vec<FormatItem> = Vec::new();
+                let right_text = s[pos + RIGHT_MARKER.len_utf8()..].to_string();
+                if !right_text.is_empty() {
+                    right.push(FormatItem::Text(right_text));
+                }
+                right.extend(items[idx + 1..].iter().cloned());
+                return (left, if right.is_empty() { None } else { Some(right) });
+            }
+        }
+    }
+    (items, None)
 }
 
 fn call_format_tab_title(
@@ -82,23 +111,40 @@ fn call_format_tab_title(
                 mlua::Value::Nil => Ok(None),
                 mlua::Value::Table(_) => {
                     let items = <Vec<FormatItem>>::from_lua(v, &*lua)?;
-
-                    let esc = format_as_escapes(items.clone())?;
+                    let (left_items, right_items) = split_right(items);
+                    let esc = format_as_escapes(left_items.clone())?;
                     let line = parse_status_text(&esc, CellAttributes::default());
+                    let right = match right_items {
+                        Some(items) => {
+                            let esc = format_as_escapes(items)?;
+                            Some(parse_status_text(&esc, CellAttributes::default()))
+                        }
+                        None => None,
+                    };
 
                     Ok(Some(TitleText {
-                        items,
+                        items: left_items,
                         len: line.len(),
                         has_indeterminate: false,
+                        right,
                     }))
                 }
                 _ => {
                     let s = String::from_lua(v, &*lua)?;
-                    let line = parse_status_text(&s, CellAttributes::default());
+                    let (left, right) = match s.find(RIGHT_MARKER) {
+                        Some(pos) => (
+                            s[..pos].to_string(),
+                            Some(s[pos + RIGHT_MARKER.len_utf8()..].to_string()),
+                        ),
+                        None => (s, None),
+                    };
+                    let line = parse_status_text(&left, CellAttributes::default());
+                    let right = right.map(|r| parse_status_text(&r, CellAttributes::default()));
                     Ok(Some(TitleText {
                         len: line.len(),
-                        items: vec![FormatItem::Text(s)],
+                        items: vec![FormatItem::Text(left)],
                         has_indeterminate: false,
+                        right,
                     }))
                 }
             }
@@ -292,6 +338,7 @@ fn compute_tab_title(
                 len,
                 items,
                 has_indeterminate,
+                right: None,
             }
         }
     }
@@ -310,6 +357,7 @@ impl TabBarState {
             items: vec![TabEntry {
                 item: TabBarItem::None,
                 title: Line::from_text(" ", &CellAttributes::blank(), 1, None),
+                right_title: None,
                 x: 1,
                 width: 1,
             }],
@@ -408,6 +456,7 @@ impl TabBarState {
             items.push(TabEntry {
                 item: TabBarItem::WindowButton(*button),
                 title: title.to_owned(),
+                right_title: None,
                 x: *x,
                 width,
             });
@@ -570,6 +619,7 @@ impl TabBarState {
             items.push(TabEntry {
                 item: TabBarItem::LeftStatus,
                 title: left_status_line.clone(),
+                right_title: None,
                 x,
                 width: left_status_line.len(),
             });
@@ -625,6 +675,7 @@ impl TabBarState {
             items.push(TabEntry {
                 item: TabBarItem::Tab { tab_idx, active },
                 title,
+                right_title: tab_title.right.clone(),
                 x: tab_start_idx,
                 width,
             });
@@ -647,6 +698,7 @@ impl TabBarState {
             items.push(TabEntry {
                 item: TabBarItem::NewTabButton,
                 title: new_tab_button.clone(),
+                right_title: None,
                 x: button_start,
                 width,
             });
@@ -709,6 +761,7 @@ impl TabBarState {
         items.push(TabEntry {
             item: TabBarItem::RightStatus,
             title: right_status_line.clone(),
+            right_title: None,
             x,
             width: status_space_available,
         });
