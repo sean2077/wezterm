@@ -369,9 +369,28 @@ impl crate::TermWindow {
                 _ => 0.,
             })
             .sum();
-        let max_tab_width = ((self.dimensions.pixel_width as f32 / num_tabs)
-            - (1.5 * metrics.cell_size.width as f32))
-            .max(0.);
+        let tab_count = items
+            .iter()
+            .filter(|item| matches!(item.item, TabBarItem::Tab { .. }))
+            .count() as f32;
+        let max_tab_width = if self.config.tab_bar_uniform_width && tab_count > 0. {
+            // Split the bar between the tabs only. The new tab button has a
+            // fixed size, so it must not consume one tab's share.
+            let new_tab_width = if self.config.show_new_tab_button_in_tab_bar {
+                // Mirror NewTabButton's poly width, horizontal padding
+                // (0.5 + 0.5 cells), 1px borders and left margin (0.5 cell).
+                metrics.cell_size.height as f32 * 0.5 + metrics.cell_size.width as f32 * 1.5 + 2.
+            } else {
+                0.
+            };
+            ((self.dimensions.pixel_width as f32 - new_tab_width) / tab_count
+                - (1.5 * metrics.cell_size.width as f32))
+                .max(0.)
+        } else {
+            ((self.dimensions.pixel_width as f32 / num_tabs)
+                - (1.5 * metrics.cell_size.width as f32))
+                .max(0.)
+        };
 
         // Reserve space for the native titlebar buttons
         if self
@@ -406,6 +425,14 @@ impl crate::TermWindow {
                 }
                 TabBarItem::Tab { tab_idx, active } => {
                     let mut elem = item_to_elem(item);
+                    if self.config.tab_bar_uniform_width {
+                        // min_width is a content width; subtract the tab's
+                        // horizontal padding (1 cell) and borders (2px) so
+                        // the rendered element matches max_tab_width exactly.
+                        elem.min_width = Some(Dimension::Pixels(
+                            (max_tab_width - metrics.cell_size.width as f32 - 2.).max(0.),
+                        ));
+                    }
                     elem.max_width = Some(Dimension::Pixels(max_tab_width));
                     elem.content = match elem.content {
                         ElementContent::Text(_) => unreachable!(),
