@@ -404,8 +404,8 @@ impl crate::TermWindow {
             .sum::<f32>()
             // The status text and buttons render more compactly than a
             // character-cell estimate; reserving the full estimate leaves a
-            // visible gap. Half matches the rendered footprint.
-            * 0.5;
+            // visible gap. Slightly over half matches the footprint.
+            * 0.55;
         let uniform_width =
             (self.terminal_size.pixel_width as f32 - reserved_side_width - new_tab_width).max(0.);
         let max_tab_width = if self.config.tab_bar_uniform_width && tab_count > 0. {
@@ -415,7 +415,7 @@ impl crate::TermWindow {
             // rather than dimensions.pixel_width: the latter can be a
             // stale/window-frame value that is wider than the actual client
             // area and makes the first tab claim too much.
-            (uniform_width / tab_count - (1.5 * metrics.cell_size.width as f32)).max(0.)
+            (uniform_width / tab_count).max(0.)
         } else {
             ((self.dimensions.pixel_width as f32 / num_tabs)
                 - (1.5 * metrics.cell_size.width as f32))
@@ -462,10 +462,8 @@ impl crate::TermWindow {
                 TabBarItem::Tab { tab_idx, active } => {
                     let mut elem = item_to_elem(item);
                     if self.config.tab_bar_uniform_width && remaining_tabs > 0. {
-                        let spacing = 1.5 * metrics.cell_size.width as f32;
-                        let tab_width =
-                            ((remaining_width - spacing * remaining_tabs) / remaining_tabs).max(0.);
-                        remaining_width = (remaining_width - tab_width - spacing).max(0.);
+                        let tab_width = (remaining_width / remaining_tabs).max(0.);
+                        remaining_width = (remaining_width - tab_width).max(0.);
                         remaining_tabs -= 1.;
                         // min_width is a content width; subtract the tab's
                         // horizontal padding (1 cell) and borders (2px) so
