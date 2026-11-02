@@ -404,8 +404,8 @@ impl crate::TermWindow {
             .sum::<f32>()
             // The status text and buttons render more compactly than a
             // character-cell estimate; reserving the full estimate leaves a
-            // visible gap. Three fifths matches the rendered footprint.
-            * (3.0 / 5.0);
+            // visible gap. Half matches the rendered footprint.
+            * 0.5;
         let uniform_width =
             (self.terminal_size.pixel_width as f32 - reserved_side_width - new_tab_width).max(0.);
         let max_tab_width = if self.config.tab_bar_uniform_width && tab_count > 0. {
