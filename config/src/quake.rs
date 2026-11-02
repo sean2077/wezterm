@@ -53,6 +53,12 @@ pub struct QuakeConfig {
     #[dynamic(default = "default_quake_true")]
     pub always_on_top: bool,
 
+    /// Show across the whole monitor instead of the work area. The quake
+    /// fullscreen key toggles this through a per-window config override so the
+    /// state survives F3 hide/show.
+    #[dynamic(default)]
+    pub fullscreen: bool,
+
     #[dynamic(default)]
     pub edge: QuakeEdge,
 
@@ -77,6 +83,7 @@ impl Default for QuakeConfig {
             start_hidden: false,
             hide_on_focus_loss: false,
             always_on_top: true,
+            fullscreen: false,
             edge: QuakeEdge::Top,
             alignment: QuakeAlignment::Center,
             width_percent: 100,
@@ -120,6 +127,7 @@ mod tests {
         assert!(!q.start_hidden);
         assert!(!q.hide_on_focus_loss);
         assert!(q.always_on_top);
+        assert!(!q.fullscreen);
         assert_eq!(q.edge, QuakeEdge::Top);
         assert_eq!(q.alignment, QuakeAlignment::Center);
         assert_eq!((q.width_percent, q.height_percent), (100, 45));
