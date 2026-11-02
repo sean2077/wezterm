@@ -200,6 +200,20 @@ impl UserData for GuiWin {
                 .notify(TermWindowNotif::SetConfigOverrides(value));
             Ok(())
         });
+        methods.add_method(
+            "set_config_override",
+            |_, this, (key, value): (String, mlua::Value)| {
+                let value = lua_value_to_dynamic(value)?;
+                this.window
+                    .notify(TermWindowNotif::SetConfigOverride { key, value });
+                Ok(())
+            },
+        );
+        methods.add_method("clear_config_override", |_, this, key: String| {
+            this.window
+                .notify(TermWindowNotif::ClearConfigOverride { key });
+            Ok(())
+        });
         methods.add_async_method("is_focused", |_, this, _: ()| async move {
             let (tx, rx) = smol::channel::bounded(1);
             this.window

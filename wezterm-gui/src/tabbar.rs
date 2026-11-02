@@ -429,6 +429,7 @@ impl TabBarState {
         config: &ConfigHandle,
         left_status: &str,
         right_status: &str,
+        fancy_title_width: Option<usize>,
     ) -> Self {
         let colors = colors.cloned().unwrap_or_else(TabBarColors::default);
 
@@ -466,6 +467,17 @@ impl TabBarState {
         // are symbols representing minimize, maximize and close.
 
         let mut active_tab_no = 0;
+        let number_of_tabs = tab_info.len();
+        // The first pass needs a budget for format-tab-title. In fancy mode
+        // the callback used to receive config.tab_max_width regardless of the
+        // window size; use the title font's cell width to turn the real window
+        // width into a title-cell budget.
+        let first_pass_max = if config.use_fancy_tab_bar {
+            let width = fancy_title_width.unwrap_or(config.tab_max_width);
+            (width.saturating_sub(new_tab.len()) / number_of_tabs.max(1)).max(1)
+        } else {
+            config.tab_max_width
+        };
 
         let tab_titles: Vec<TitleText> = if config.show_tabs_in_tab_bar {
             tab_info
@@ -474,32 +486,28 @@ impl TabBarState {
                     if tab.is_active {
                         active_tab_no = tab.tab_index;
                     }
-                    compute_tab_title(
-                        tab,
-                        tab_info,
-                        pane_info,
-                        config,
-                        false,
-                        config.tab_max_width,
-                    )
+                    compute_tab_title(tab, tab_info, pane_info, config, false, first_pass_max)
                 })
                 .collect()
         } else {
             vec![]
         };
         let titles_len: usize = tab_titles.iter().map(|s| s.len).sum();
-        let number_of_tabs = tab_titles.len();
 
         let available_cells =
             title_width.saturating_sub(number_of_tabs.saturating_sub(1) + new_tab.len());
-        let tab_width_max = if config.use_fancy_tab_bar || available_cells >= titles_len {
-            // We can render each title with its full width
-            usize::max_value()
+        let tab_width_max = if config.use_fancy_tab_bar {
+            first_pass_max
         } else {
-            // We need to clamp the length to balance them out
-            available_cells / number_of_tabs
-        }
-        .min(config.tab_max_width);
+            (if available_cells >= titles_len {
+                // We can render each title with its full width
+                usize::max_value()
+            } else {
+                // We need to clamp the length to balance them out
+                available_cells / number_of_tabs.max(1)
+            })
+            .min(config.tab_max_width)
+        };
 
         let mut line = Line::with_width(0, SEQ_ZERO);
 
