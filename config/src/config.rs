@@ -523,6 +523,12 @@ pub struct Config {
     #[dynamic(default)]
     pub tab_bar_uniform_width: bool,
 
+    /// Fraction of the side status/button width reserved when splitting the
+    /// fancy tab bar between tabs. Tune this when the tab titles overlap the
+    /// status text or window buttons. Defaults to 0.6.
+    #[dynamic(default = "default_tab_bar_side_reserve_ratio")]
+    pub tab_bar_side_reserve_ratio: f64,
+
     /// If true, hide the tab bar if the window only has a single tab.
     #[dynamic(default)]
     pub hide_tab_bar_if_only_one_tab: bool,
@@ -1897,6 +1903,10 @@ fn default_enq_answerback() -> String {
 
 fn default_tab_max_width() -> usize {
     16
+}
+
+fn default_tab_bar_side_reserve_ratio() -> f64 {
+    0.6
 }
 
 fn default_update_interval() -> u64 {
