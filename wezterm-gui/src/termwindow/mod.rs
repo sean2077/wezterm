@@ -2022,7 +2022,12 @@ impl TermWindow {
         };
 
         let fancy_title_width = self.fonts.title_font().ok().map(|font| {
-            let cell_width = (font.metrics().cell_width.get() as f32).max(1.0);
+            // Use the same metrics as build_fancy_tab_bar. font.metrics()
+            // .cell_width is not the rendered title cell width for a
+            // proportional font such as Segoe UI, and made the budget far too
+            // small.
+            let metrics = crate::utilsprites::RenderMetrics::with_font_metrics(&font.metrics());
+            let cell_width = (metrics.cell_size.width as f32).max(1.0);
             // Match the tab layout, which splits terminal_size.pixel_width;
             // dimensions.pixel_width includes padding/border and would make
             // the title budget a few cells too wide.
