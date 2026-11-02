@@ -373,16 +373,16 @@ impl crate::TermWindow {
             .iter()
             .filter(|item| matches!(item.item, TabBarItem::Tab { .. }))
             .count() as f32;
+        let new_tab_width = if self.config.show_new_tab_button_in_tab_bar {
+            // Mirror NewTabButton's poly width, horizontal padding
+            // (0.5 + 0.5 cells), 1px borders and left margin (0.5 cell).
+            metrics.cell_size.height as f32 * 0.5 + metrics.cell_size.width as f32 * 1.5 + 2.
+        } else {
+            0.
+        };
         let max_tab_width = if self.config.tab_bar_uniform_width && tab_count > 0. {
             // Split the bar between the tabs only. The new tab button has a
             // fixed size, so it must not consume one tab's share.
-            let new_tab_width = if self.config.show_new_tab_button_in_tab_bar {
-                // Mirror NewTabButton's poly width, horizontal padding
-                // (0.5 + 0.5 cells), 1px borders and left margin (0.5 cell).
-                metrics.cell_size.height as f32 * 0.5 + metrics.cell_size.width as f32 * 1.5 + 2.
-            } else {
-                0.
-            };
             ((self.dimensions.pixel_width as f32 - new_tab_width) / tab_count
                 - (1.5 * metrics.cell_size.width as f32))
                 .max(0.)
@@ -391,6 +391,12 @@ impl crate::TermWindow {
                 - (1.5 * metrics.cell_size.width as f32))
                 .max(0.)
         };
+
+        // Uniform mode consumes the remaining space as it walks the items, so
+        // every tab gets the same share instead of each one claiming a global
+        // estimate and squeezing the last tab.
+        let mut remaining_tabs = tab_count;
+        let mut remaining_width = self.dimensions.pixel_width as f32 - new_tab_width;
 
         // Reserve space for the native titlebar buttons
         if self
@@ -425,15 +431,22 @@ impl crate::TermWindow {
                 }
                 TabBarItem::Tab { tab_idx, active } => {
                     let mut elem = item_to_elem(item);
-                    if self.config.tab_bar_uniform_width {
+                    if self.config.tab_bar_uniform_width && remaining_tabs > 0. {
+                        let spacing = 1.5 * metrics.cell_size.width as f32;
+                        let tab_width =
+                            ((remaining_width - spacing * remaining_tabs) / remaining_tabs).max(0.);
+                        remaining_width = (remaining_width - tab_width - spacing).max(0.);
+                        remaining_tabs -= 1.;
                         // min_width is a content width; subtract the tab's
                         // horizontal padding (1 cell) and borders (2px) so
-                        // the rendered element matches max_tab_width exactly.
+                        // the rendered element matches tab_width exactly.
                         elem.min_width = Some(Dimension::Pixels(
-                            (max_tab_width - metrics.cell_size.width as f32 - 2.).max(0.),
+                            (tab_width - metrics.cell_size.width as f32 - 2.).max(0.),
                         ));
+                        elem.max_width = Some(Dimension::Pixels(tab_width));
+                    } else {
+                        elem.max_width = Some(Dimension::Pixels(max_tab_width));
                     }
-                    elem.max_width = Some(Dimension::Pixels(max_tab_width));
                     elem.content = match elem.content {
                         ElementContent::Text(_) => unreachable!(),
                         ElementContent::Poly { .. } => unreachable!(),
