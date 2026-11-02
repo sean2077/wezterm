@@ -1,6 +1,7 @@
 use crate::cli::CliOutputFormatKind;
 use clap::Parser;
 use serde::Serializer as _;
+use std::collections::HashMap;
 use tabout::{tabulate_output, Alignment, Column};
 use wezterm_client::client::Client;
 use wezterm_term::TerminalSize;
@@ -20,6 +21,14 @@ impl ListCommand {
         let mut output_items = vec![];
         let panes = client.list_panes().await?;
 
+        // The tabs arrive grouped by window, in the same order as the mux's
+        // window and tab iteration. Number them here rather than exposing the
+        // internal mux ids as the only ordinal, so callers can line the output
+        // up with the GUI's tab bar.
+        let mut window_index: HashMap<mux::window::WindowId, usize> = HashMap::new();
+        let mut tab_index: HashMap<mux::window::WindowId, HashMap<mux::tab::TabId, usize>> =
+            HashMap::new();
+
         for (tabroot, tab_title) in panes.tabs.into_iter().zip(panes.tab_titles.iter()) {
             let mut cursor = tabroot.into_tree().cursor();
 
@@ -30,10 +39,17 @@ impl ListCommand {
                         .get(&entry.window_id)
                         .map(|s| s.as_str())
                         .unwrap_or("");
+                    let next_win = window_index.len();
+                    let win_idx = *window_index.entry(entry.window_id).or_insert(next_win);
+                    let tabs = tab_index.entry(entry.window_id).or_default();
+                    let next_tab = tabs.len();
+                    let tab_idx = *tabs.entry(entry.tab_id).or_insert(next_tab);
                     output_items.push(CliListResultItem::from(
                         entry.clone(),
                         tab_title,
                         window_title,
+                        win_idx,
+                        tab_idx,
                     ));
                 }
                 match cursor.preorder_next() {
@@ -77,6 +93,14 @@ impl ListCommand {
                         name: "CWD".to_string(),
                         alignment: Alignment::Left,
                     },
+                    Column {
+                        name: "TABIDX".to_string(),
+                        alignment: Alignment::Right,
+                    },
+                    Column {
+                        name: "WINIDX".to_string(),
+                        alignment: Alignment::Right,
+                    },
                 ];
                 let data = output_items
                     .iter()
@@ -89,6 +113,8 @@ impl ListCommand {
                             format!("{}x{}", output_item.size.cols, output_item.size.rows),
                             output_item.title.to_string(),
                             output_item.cwd.to_string(),
+                            output_item.tab_index.to_string(),
+                            output_item.window_index.to_string(),
                         ]
                     })
                     .collect::<Vec<_>>();
@@ -139,10 +165,21 @@ struct CliListResultItem {
     is_active: bool,
     is_zoomed: bool,
     tty_name: Option<String>,
+    /// Zero-based index of the tab within its window, matching the GUI's
+    /// tab bar order.
+    tab_index: usize,
+    /// Zero-based index of the window in the mux's window iteration order.
+    window_index: usize,
 }
 
 impl CliListResultItem {
-    fn from(pane: mux::tab::PaneEntry, tab_title: &str, window_title: &str) -> CliListResultItem {
+    fn from(
+        pane: mux::tab::PaneEntry,
+        tab_title: &str,
+        window_title: &str,
+        window_index: usize,
+        tab_index: usize,
+    ) -> CliListResultItem {
         let mux::tab::PaneEntry {
             window_id,
             tab_id,
@@ -197,6 +234,8 @@ impl CliListResultItem {
             is_active: is_active_pane,
             is_zoomed: is_zoomed_pane,
             tty_name,
+            tab_index,
+            window_index,
         }
     }
 }
