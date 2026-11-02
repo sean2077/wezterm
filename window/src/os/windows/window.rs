@@ -706,6 +706,10 @@ impl WindowInner {
     }
 
     fn toggle_fullscreen(&mut self) {
+        if self.config.quake.enabled {
+            quake::toggle_fullscreen(self);
+            return;
+        }
         unsafe {
             let hwnd = self.hwnd.0;
             let style = GetWindowLongW(hwnd, GWL_STYLE);
