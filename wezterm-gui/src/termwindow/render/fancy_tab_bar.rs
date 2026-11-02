@@ -408,7 +408,7 @@ impl crate::TermWindow {
             // without rebuilding the fork.
             * (self.config.tab_bar_side_reserve_ratio as f32).clamp(0.0, 1.0);
         let uniform_width =
-            (self.terminal_size.pixel_width as f32 - reserved_side_width - new_tab_width).max(0.);
+            (self.dimensions.pixel_width as f32 - reserved_side_width - new_tab_width).max(0.);
         let max_tab_width = if self.config.tab_bar_uniform_width && tab_count > 0. {
             // Split the remaining bar between the tabs only. The new tab
             // button and the side status/buttons have fixed sizes, so they
