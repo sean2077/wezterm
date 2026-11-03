@@ -549,7 +549,15 @@ impl TabBarState {
                 + 2
                 + close_button;
             let width = fancy_title_width.unwrap_or(config.tab_max_width);
-            (width.saturating_sub(reserved) / number_of_tabs.max(1)).max(1)
+            let share = (width.saturating_sub(reserved) / number_of_tabs.max(1)).max(1);
+            // In uniform mode the layout caps each tab at a fixed width; the
+            // callback's budget must follow, or it renders titles for a share
+            // the tab will never have.
+            if config.tab_bar_uniform_width && config.tab_bar_uniform_max_width > 0 {
+                share.min(config.tab_bar_uniform_max_width)
+            } else {
+                share
+            }
         } else {
             config.tab_max_width
         };
