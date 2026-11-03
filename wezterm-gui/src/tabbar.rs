@@ -642,13 +642,22 @@ impl TabBarState {
 
             // Recompute the title so that it factors in both the hover state
             // and the adjusted maximum tab width based on available space.
+            // Under uniform tabs the first pass result is the tab's content
+            // width, not its layout width; feeding it back as the second
+            // budget truncates the title again (the callback subtracts its
+            // chrome allowance), so keep the pass-1 share instead.
+            let second_pass_max = if config.use_fancy_tab_bar && config.tab_bar_uniform_width {
+                tab_width_max
+            } else {
+                tab_title_len
+            };
             let tab_title = compute_tab_title(
                 &tab_info[tab_idx],
                 tab_info,
                 pane_info,
                 config,
                 hover,
-                tab_title_len,
+                second_pass_max,
             );
 
             let cell_attrs = if active {
