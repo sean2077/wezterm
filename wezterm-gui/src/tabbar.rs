@@ -54,30 +54,44 @@ struct TitleText {
     /// this as a right-floated element so it stays on the right edge even with
     /// a proportional title font.
     right: Option<Line>,
+    /// Width of the fixed left block (index + badge), marked by U+001E in the
+    /// callback result. Zero when the callback does not use the marker.
+    left_len: usize,
 }
 
 const RIGHT_MARKER: char = '\u{1f}';
+const TITLE_MARKER: char = '\u{1e}';
 
-fn split_right(items: Vec<FormatItem>) -> (Vec<FormatItem>, Option<Vec<FormatItem>>) {
+/// Split a FormatItem list at the first occurrence of `marker`, returning the
+/// items before it, the items after it, and whether the marker was present.
+fn split_marker(
+    items: Vec<FormatItem>,
+    marker: char,
+) -> (Vec<FormatItem>, Vec<FormatItem>, bool) {
     for (idx, item) in items.iter().enumerate() {
         if let FormatItem::Text(s) = item {
-            if let Some(pos) = s.find(RIGHT_MARKER) {
+            if let Some(pos) = s.find(marker) {
                 let mut left: Vec<FormatItem> = items[..idx].to_vec();
                 let left_text = s[..pos].to_string();
                 if !left_text.is_empty() {
                     left.push(FormatItem::Text(left_text));
                 }
                 let mut right: Vec<FormatItem> = Vec::new();
-                let right_text = s[pos + RIGHT_MARKER.len_utf8()..].to_string();
+                let right_text = s[pos + marker.len_utf8()..].to_string();
                 if !right_text.is_empty() {
                     right.push(FormatItem::Text(right_text));
                 }
                 right.extend(items[idx + 1..].iter().cloned());
-                return (left, if right.is_empty() { None } else { Some(right) });
+                return (left, right, true);
             }
         }
     }
-    (items, None)
+    (items, vec![], false)
+}
+
+fn split_right(items: Vec<FormatItem>) -> (Vec<FormatItem>, Option<Vec<FormatItem>>) {
+    let (left, right, found) = split_marker(items, RIGHT_MARKER);
+    (left, if found && !right.is_empty() { Some(right) } else { None })
 }
 
 fn call_format_tab_title(
@@ -112,7 +126,20 @@ fn call_format_tab_title(
                 mlua::Value::Table(_) => {
                     let items = <Vec<FormatItem>>::from_lua(v, &*lua)?;
                     let (left_items, right_items) = split_right(items);
-                    let esc = format_as_escapes(left_items.clone())?;
+                    // U+001E separates the fixed left block (index + badge)
+                    // from the title. The tab bar measures the left block and
+                    // passes the rest of the share to the title as its budget.
+                    let (left_items, title_items, has_title_marker) =
+                        split_marker(left_items, TITLE_MARKER);
+                    let left_len = if has_title_marker {
+                        let esc = format_as_escapes(left_items.clone())?;
+                        parse_status_text(&esc, CellAttributes::default()).len()
+                    } else {
+                        0
+                    };
+                    let mut all_items = left_items;
+                    all_items.extend(title_items);
+                    let esc = format_as_escapes(all_items.clone())?;
                     let line = parse_status_text(&esc, CellAttributes::default());
                     let right = match right_items {
                         Some(items) => {
@@ -123,10 +150,11 @@ fn call_format_tab_title(
                     };
 
                     Ok(Some(TitleText {
-                        items: left_items,
+                        items: all_items,
                         len: line.len(),
                         has_indeterminate: false,
                         right,
+                        left_len,
                     }))
                 }
                 _ => {
@@ -145,6 +173,7 @@ fn call_format_tab_title(
                         items: vec![FormatItem::Text(left)],
                         has_indeterminate: false,
                         right,
+                        left_len: 0,
                     }))
                 }
             }
@@ -339,6 +368,7 @@ fn compute_tab_title(
                 items,
                 has_indeterminate,
                 right: None,
+                left_len: 0,
             }
         }
     }
@@ -541,13 +571,16 @@ impl TabBarState {
                 0
             };
             // Match the 0.6 side-reserve factor used by the fancy layout, plus
-            // roughly the new-tab button and the floating close button, so the
-            // padded title ends before the close button instead of underneath it.
+            // roughly the new-tab button. Under uniform tabs the close button
+            // floats on the right and is charged to the title budget by the
+            // second pass (which knows the real left/right block widths), so
+            // don't reserve it a second time here.
+            let uniform = config.tab_bar_uniform_width;
             let reserved = (((status_cells + window_buttons) as f32)
                 * (config.tab_bar_side_reserve_ratio as f32).clamp(0.0, 1.0))
                 as usize
                 + 2
-                + close_button;
+                + if uniform { 0 } else { close_button };
             let width = fancy_title_width.unwrap_or(config.tab_max_width);
             let share = (width.saturating_sub(reserved) / number_of_tabs.max(1)).max(1);
             // In uniform mode the layout caps each tab at a fixed width; the
@@ -642,12 +675,14 @@ impl TabBarState {
 
             // Recompute the title so that it factors in both the hover state
             // and the adjusted maximum tab width based on available space.
-            // Under uniform tabs the first pass result is the tab's content
-            // width, not its layout width; feeding it back as the second
-            // budget truncates the title again (the callback subtracts its
-            // chrome allowance), so keep the pass-1 share instead.
+            // Under uniform tabs the callback marks its fixed left block with
+            // U+001E; the rest of the share, minus that block and the
+            // right-floated suffix/close button, is the title's budget.
             let second_pass_max = if config.use_fancy_tab_bar && config.tab_bar_uniform_width {
+                let right_cells = tab_title.right.as_ref().map(|r| r.len()).unwrap_or(0);
                 tab_width_max
+                    .saturating_sub(tab_title.left_len + right_cells + 2)
+                    .max(1)
             } else {
                 tab_title_len
             };
