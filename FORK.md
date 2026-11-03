@@ -38,7 +38,7 @@
 
 `config.tab_bar_uniform_width = true` 让 fancy 标签栏的每个 tab 等宽，并把 `+` 按钮从均分分母中拿出来、按固定宽度布局；标题短于份额时补齐、超出时截断，标签栏几何不再随标题长度变化。均分预算优先使用 `terminal_size.pixel_width`，并扣除右侧状态栏和集成窗口按钮的占用。`config.tab_bar_side_reserve_ratio`（默认 0.6）控制这部分预留的比例，调参不需要重新编译。`config.tab_bar_uniform_max_width`（字符格，默认 0 = 不限）给每个 tab 的等宽份额加天花板：tab 少时不再撑满整条标签栏，改为停在固定宽度，余量留在标签栏右侧而不是每个 tab 的内部。`config.tab_bar_uniform_fit_content = true` 把份额只当作上限：tab 收缩到标题实际需要的宽度，短标题的 tab 变窄、标签栏靠左排列，余量集中在末尾；标题超过份额时由 `format-tab-title` 端截断。
 
-`format-tab-title` 的第 6 个参数（`max_width`）在 fancy bar 下现在按标题字体宽度和 tab 数换算成真实预算，不再是恒定的 `tab_max_width`。`window:set_config_override(key, value)` / `clear_config_override(key)` 用于增量修改 per-window override；hyperlink URI 中的 `$CWD` 在点击时展开为当前 pane 的工作目录；`update-status` / `update-right-status` 统一按 `status_update_interval` 调度，不再随高频标题变化每帧触发。
+`format-tab-title` 的第 6 个参数（`max_width`）在 fancy bar 下现在按标题字体宽度和 tab 数换算成真实预算，不再是恒定的 `tab_max_width`；第二遍渲染在 uniform 模式下沿用同一份额，而不是第一遍返回的内容宽度（否则标题会被二次截断）。`window:set_config_override(key, value)` / `clear_config_override(key)` 用于增量修改 per-window override；hyperlink URI 中的 `$CWD` 在点击时展开为当前 pane 的工作目录；`update-status` / `update-right-status` 统一按 `status_update_interval` 调度，不再随高频标题变化每帧触发。
 
 `format-tab-title` 的返回值可以用 U+001F 分成左右两段：右段作为右浮动元素渲染在关闭按钮左侧。比例字体下标题文字的实际 advance 小于单元格预算，靠空格/EM SPACE 填充无法精确对齐；右浮动后缀不依赖字体宽度。
 
