@@ -523,6 +523,14 @@ pub struct Config {
     #[dynamic(default)]
     pub tab_bar_uniform_width: bool,
 
+    /// Ceiling for each tab's width in `tab_bar_uniform_width` mode,
+    /// measured in character cells. When the uniform share would be wider
+    /// than this, every tab stops at this width and the rest of the tab bar
+    /// stays empty instead of leaving a wide gap inside each tab. Zero means
+    /// no ceiling (each tab takes an equal share of the whole bar).
+    #[dynamic(default)]
+    pub tab_bar_uniform_max_width: usize,
+
     /// Fraction of the side status/button width reserved when splitting the
     /// fancy tab bar between tabs. Tune this when the tab titles overlap the
     /// status text or window buttons. Defaults to 0.6.
