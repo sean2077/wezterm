@@ -476,13 +476,23 @@ impl crate::TermWindow {
                             .min(uniform_cap);
                         remaining_width = (remaining_width - tab_width).max(0.);
                         remaining_tabs -= 1.;
-                        // min_width is a content width; subtract the tab's
-                        // horizontal padding (1 cell) and borders (2px) so
-                        // the rendered element matches tab_width exactly.
-                        elem.min_width = Some(Dimension::Pixels(
-                            (tab_width - metrics.cell_size.width as f32 - 2.).max(0.),
-                        ));
-                        elem.max_width = Some(Dimension::Pixels(tab_width));
+                        if self.config.tab_bar_uniform_fit_content {
+                            // The share is only a ceiling: leave min_width
+                            // unset so the tab shrinks to its title content
+                            // and the strip packs left instead of padding
+                            // every short title. Use the fixed share rather
+                            // than the running remainder so every tab has
+                            // the same ceiling.
+                            elem.max_width = Some(Dimension::Pixels(max_tab_width));
+                        } else {
+                            // min_width is a content width; subtract the tab's
+                            // horizontal padding (1 cell) and borders (2px) so
+                            // the rendered element matches tab_width exactly.
+                            elem.min_width = Some(Dimension::Pixels(
+                                (tab_width - metrics.cell_size.width as f32 - 2.).max(0.),
+                            ));
+                            elem.max_width = Some(Dimension::Pixels(tab_width));
+                        }
                     } else {
                         elem.max_width = Some(Dimension::Pixels(max_tab_width));
                     }

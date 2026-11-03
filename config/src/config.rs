@@ -531,6 +531,14 @@ pub struct Config {
     #[dynamic(default)]
     pub tab_bar_uniform_max_width: usize,
 
+    /// When set together with `tab_bar_uniform_width`, the uniform share is
+    /// only an upper bound: a tab shrinks to the width its title actually
+    /// needs instead of being padded to the share. Short titles therefore
+    /// produce narrow tabs and the tab strip packs to the left, leaving the
+    /// spare room at the end. The default is false.
+    #[dynamic(default)]
+    pub tab_bar_uniform_fit_content: bool,
+
     /// Fraction of the side status/button width reserved when splitting the
     /// fancy tab bar between tabs. Tune this when the tab titles overlap the
     /// status text or window buttons. Defaults to 0.6.
