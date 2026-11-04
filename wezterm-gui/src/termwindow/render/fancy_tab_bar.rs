@@ -409,14 +409,6 @@ impl crate::TermWindow {
             * (self.config.tab_bar_side_reserve_ratio as f32).clamp(0.0, 1.0);
         let uniform_width =
             (self.dimensions.pixel_width as f32 - reserved_side_width - new_tab_width).max(0.);
-        // Optional ceiling for the uniform share, so a few tabs don't stretch
-        // to fill the whole bar and leave a wide empty band on their right.
-        // Zero means "split the whole bar".
-        let uniform_cap = if self.config.tab_bar_uniform_max_width > 0 {
-            self.config.tab_bar_uniform_max_width as f32 * metrics.cell_size.width as f32
-        } else {
-            f32::INFINITY
-        };
         let max_tab_width = if self.config.tab_bar_uniform_width && tab_count > 0. {
             // Split the remaining bar between the tabs only. The new tab
             // button and the side status/buttons have fixed sizes, so they
@@ -424,7 +416,7 @@ impl crate::TermWindow {
             // rather than dimensions.pixel_width: the latter can be a
             // stale/window-frame value that is wider than the actual client
             // area and makes the first tab claim too much.
-            (uniform_width / tab_count).max(0.).min(uniform_cap)
+            (uniform_width / tab_count).max(0.)
         } else {
             ((self.dimensions.pixel_width as f32 / num_tabs)
                 - (1.5 * metrics.cell_size.width as f32))
@@ -471,28 +463,16 @@ impl crate::TermWindow {
                 TabBarItem::Tab { tab_idx, active } => {
                     let mut elem = item_to_elem(item);
                     if self.config.tab_bar_uniform_width && remaining_tabs > 0. {
-                        let tab_width = (remaining_width / remaining_tabs)
-                            .max(0.)
-                            .min(uniform_cap);
+                        let tab_width = (remaining_width / remaining_tabs).max(0.);
                         remaining_width = (remaining_width - tab_width).max(0.);
                         remaining_tabs -= 1.;
-                        if self.config.tab_bar_uniform_fit_content {
-                            // The share is only a ceiling: leave min_width
-                            // unset so the tab shrinks to its title content
-                            // and the strip packs left instead of padding
-                            // every short title. Use the fixed share rather
-                            // than the running remainder so every tab has
-                            // the same ceiling.
-                            elem.max_width = Some(Dimension::Pixels(max_tab_width));
-                        } else {
-                            // min_width is a content width; subtract the tab's
-                            // horizontal padding (1 cell) and borders (2px) so
-                            // the rendered element matches tab_width exactly.
-                            elem.min_width = Some(Dimension::Pixels(
-                                (tab_width - metrics.cell_size.width as f32 - 2.).max(0.),
-                            ));
-                            elem.max_width = Some(Dimension::Pixels(tab_width));
-                        }
+                        // min_width is a content width; subtract the tab's
+                        // horizontal padding (1 cell) and borders (2px) so
+                        // the rendered element matches tab_width exactly.
+                        elem.min_width = Some(Dimension::Pixels(
+                            (tab_width - metrics.cell_size.width as f32 - 2.).max(0.),
+                        ));
+                        elem.max_width = Some(Dimension::Pixels(tab_width));
                     } else {
                         elem.max_width = Some(Dimension::Pixels(max_tab_width));
                     }
