@@ -529,6 +529,18 @@ pub struct Config {
     #[dynamic(default = "default_tab_bar_side_reserve_ratio")]
     pub tab_bar_side_reserve_ratio: f64,
 
+    /// Width of the fancy tab bar tab borders. Upstream hardcodes 1px.
+    /// Only the right border of inactive tabs is visible; it uses
+    /// colors.tab_bar.inactive_tab_edge, while the other three borders use
+    /// the tab's own background color. Accepts dimension strings such as
+    /// "1px" or "1.5pt", so the divider can scale with the display DPI.
+    /// The default is 1px, which matches upstream.
+    #[dynamic(
+        try_from = "crate::units::PixelUnit",
+        default = "default_tab_bar_tab_border_width"
+    )]
+    pub tab_bar_tab_border_width: Dimension,
+
     /// If true, hide the tab bar if the window only has a single tab.
     #[dynamic(default)]
     pub hide_tab_bar_if_only_one_tab: bool,
@@ -1907,6 +1919,10 @@ fn default_tab_max_width() -> usize {
 
 fn default_tab_bar_side_reserve_ratio() -> f64 {
     0.6
+}
+
+fn default_tab_bar_tab_border_width() -> Dimension {
+    Dimension::Pixels(1.)
 }
 
 fn default_update_interval() -> u64 {

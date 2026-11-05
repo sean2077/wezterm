@@ -93,6 +93,17 @@ impl crate::TermWindow {
         } else {
             VerticalAlign::Bottom
         };
+        // Upstream hardcodes a 1px tab border. Make it configurable so the
+        // inactive-tab divider can be made heavier (and scale with DPI) to
+        // keep adjacent tabs visually distinct.
+        let border_width = self
+            .config
+            .tab_bar_tab_border_width
+            .evaluate_as_pixels(DimensionContext {
+                dpi: self.dimensions.dpi as f32,
+                pixel_max: self.dimensions.pixel_width as f32,
+                pixel_cell: metrics.cell_size.width as f32,
+            });
 
         let item_to_elem = |item: &TabEntry| -> Element {
             let element = Element::with_line(&font, &item.title, palette);
@@ -195,7 +206,7 @@ impl crate::TermWindow {
                         top: Dimension::Cells(0.25),
                         bottom: Dimension::Cells(0.25),
                     })
-                    .border(BoxDimension::new(Dimension::Pixels(1.)))
+                    .border(BoxDimension::new(Dimension::Pixels(border_width)))
                     .border_corners(Some(if is_bottom {
                         Corners {
                             top_left: SizedPoly::none(),
@@ -266,7 +277,7 @@ impl crate::TermWindow {
                         top: Dimension::Cells(0.25),
                         bottom: Dimension::Cells(0.25),
                     })
-                    .border(BoxDimension::new(Dimension::Pixels(1.)))
+                    .border(BoxDimension::new(Dimension::Pixels(border_width)))
                     .border_corners(Some(if is_bottom {
                         Corners {
                             top_left: SizedPoly {
@@ -336,16 +347,22 @@ impl crate::TermWindow {
                     })
                     .hover_colors({
                         let inactive_tab_hover = colors.inactive_tab_hover();
+                        let hover_bg = bg_color
+                            .unwrap_or_else(|| inactive_tab_hover.bg_color.into())
+                            .to_linear();
                         Some(ElementColors {
-                            border: BorderColor::new(
-                                bg_color
-                                    .unwrap_or_else(|| inactive_tab_hover.bg_color.into())
-                                    .to_linear(),
-                            ),
-                            bg: bg_color
-                                .unwrap_or_else(|| inactive_tab_hover.bg_color.into())
-                                .to_linear()
-                                .into(),
+                            // Keep the inactive divider visible while the
+                            // pointer is over the tab; upstream replaced all
+                            // four borders with the hover background and the
+                            // line disappeared. inactive_tab_edge_hover was
+                            // previously defined but never read.
+                            border: BorderColor {
+                                left: hover_bg,
+                                right: colors.inactive_tab_edge_hover().to_linear(),
+                                top: hover_bg,
+                                bottom: hover_bg,
+                            },
+                            bg: hover_bg.into(),
                             text: fg_color
                                 .unwrap_or_else(|| inactive_tab_hover.fg_color.into())
                                 .to_linear()
@@ -467,10 +484,13 @@ impl crate::TermWindow {
                         remaining_width = (remaining_width - tab_width).max(0.);
                         remaining_tabs -= 1.;
                         // min_width is a content width; subtract the tab's
-                        // horizontal padding (1 cell) and borders (2px) so
-                        // the rendered element matches tab_width exactly.
+                        // horizontal padding (1 cell) and borders (2 × width)
+                        // so the rendered element matches tab_width exactly.
                         elem.min_width = Some(Dimension::Pixels(
-                            (tab_width - metrics.cell_size.width as f32 - 2.).max(0.),
+                            (tab_width
+                                - metrics.cell_size.width as f32
+                                - 2. * border_width)
+                                .max(0.),
                         ));
                         elem.max_width = Some(Dimension::Pixels(tab_width));
                     } else {
