@@ -23,6 +23,7 @@
 | gui: add an opt-in uniform fancy tab bar width | 自用 | — | 上游提供等价的标签栏布局选项后可删 |
 | gui: make the fancy tab bar border width configurable | 自用 | — | 上游提供等价的标签栏边框宽度选项后可删 |
 | cli: report tab/window indices and focus the owning GUI window | 自用 | — | 上游的 `list` 输出索引且 `activate-*` 会前台化窗口后可删 |
+| mux: generic workspace save/restore and agent user vars | 自用 | — | 上游提供等价的 session persistence/CLI 后可删 |
 | gui: expose tab budgets, mergeable overrides, CWD links and status coalescing | 自用 | — | 上游提供等价 API 后可删 |
 
 #4456 的影响：Windows 上 GUI 只把 `gui-sock-<pid>` 这个文件名发布到共享内存，新启动的 `wezterm-gui` 和 `wezterm cli` 按自己的工作目录去解析，于是任务栏、开始菜单、右键菜单每次启动都会新开一个进程（每个进程有几百 MB 的基础开销），在 WezTerm 外运行 `wezterm cli` 也会连不上。
@@ -48,6 +49,23 @@
 `wezterm cli list` 增加 `tab_index`、`window_index`、`is_active_tab`（表格末尾的 `ACTIVE` 列）；新增 `wezterm cli activate-window --window-id <WINID>`，通过 `SetFocusedPane` 切到该窗口的活动 tab 并前台化。`ListPanesResponse` 增加了 `active_tab_ids` 字段，因此 `CODEC_VERSION` 升到 47；升级后需要重启所有 GUI 进程，避免新旧 codec 混用。
 
 该功能仅 Windows 有实现；上游目前没有全局热键/quake 模式。补丁同时在 `window/Cargo.toml` 显式声明了 `winapi/shellapi` feature：窗口代码原本就使用 `DragAcceptFiles`，此前只是靠其他 crate 的 feature 合并才编过，单独构建 `window` crate 会失败。
+
+## 通用工作区持久化（自用）
+
+`mux` 新增通用 `SessionState`，保存窗口/tab/活动 pane、cwd、原始 spawn argv、标题和 user vars；不保存分屏树、颜色、zoom、窗口几何。每个 tab 只恢复活动 pane。新增 CLI：
+
+```text
+wezterm cli save-workspace [--path FILE]
+wezterm cli restore-workspace --path FILE [--window-id ID] [--replace] [--legacy-claude-pending]
+wezterm cli close-agent-sessions [--timeout-seconds N] [--force]
+wezterm cli set-user-var --pane-id ID --name NAME [--value VALUE | --unset]
+```
+
+Agent 集成通过通用 user vars 完成：`agent.resume_args`（JSON argv 追加片段）、`agent.shutdown`（非空表示参与优雅关闭）、`agent.session_id`（诊断用）。`close-agent-sessions` 只处理带 `agent.shutdown` 的 pane，发送 Esc → Ctrl+C → `/exit\r`，不识别具体 agent 名称。`restore-workspace` 只把 `agent.resume_args` 追加到原始 argv；mux/CLI 不包含 Claude 专用字段。
+
+`--legacy-claude-pending` 是首次迁移用的一次性适配器，读取旧 `pending.json` 并转换成新格式；它位于 CLI 层，不进入 mux 核心。
+
+该改动修改了 `codec`，`CODEC_VERSION` 升到 48；安装后必须重启所有 GUI/mux 进程。首次从 47 升级时，新 CLI 不能连接旧 GUI，需要保留旧 tabs 脚本完成一次保存/优雅关闭，再用新 GUI 的 `restore-workspace --legacy-claude-pending` 恢复；确认后即可删除旧脚本。
 
 ## 日常维护入口
 

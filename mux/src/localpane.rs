@@ -4,6 +4,7 @@ use crate::pane::{
     SearchResult, WithPaneLines,
 };
 use crate::renderable::*;
+use crate::session::SpawnInfo;
 use crate::tmux::{TmuxDomain, TmuxDomainState};
 use crate::{Domain, Mux, MuxNotification};
 use anyhow::Error;
@@ -133,6 +134,7 @@ pub struct LocalPane {
     #[cfg(unix)]
     leader: Arc<Mutex<Option<CachedLeaderInfo>>>,
     command_description: String,
+    spawn_info: Option<SpawnInfo>,
 }
 
 #[async_trait(?Send)]
@@ -221,6 +223,14 @@ impl Pane for LocalPane {
 
     fn copy_user_vars(&self) -> HashMap<String, String> {
         self.terminal.lock().user_vars().clone()
+    }
+
+    fn get_spawn_info(&self) -> Option<SpawnInfo> {
+        self.spawn_info.clone()
+    }
+
+    fn set_user_var(&self, name: &str, value: Option<&str>) {
+        self.terminal.lock().set_user_var(name, value);
     }
 
     fn exit_behavior(&self) -> Option<ExitBehavior> {
@@ -1011,6 +1021,7 @@ impl LocalPane {
         writer: Box<dyn Write + Send>,
         domain_id: DomainId,
         command_description: String,
+        spawn_info: Option<SpawnInfo>,
     ) -> Self {
         let (process, signaller, pid) = split_child(process);
 
@@ -1037,6 +1048,7 @@ impl LocalPane {
             #[cfg(unix)]
             leader: Arc::new(Mutex::new(None)),
             command_description,
+            spawn_info,
         }
     }
 

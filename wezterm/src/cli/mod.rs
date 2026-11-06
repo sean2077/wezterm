@@ -8,6 +8,7 @@ mod activate_pane_direction;
 mod activate_tab;
 mod activate_window;
 mod adjust_pane_size;
+mod close_agent_sessions;
 mod get_pane_direction;
 mod get_text;
 mod kill_pane;
@@ -16,8 +17,11 @@ mod list_clients;
 mod move_pane_to_new_tab;
 mod proxy;
 mod rename_workspace;
+mod restore_workspace;
+mod save_workspace;
 mod send_text;
 mod set_tab_title;
+mod set_user_var;
 mod set_window_title;
 mod spawn_command;
 mod split_pane;
@@ -168,6 +172,22 @@ Outputs the pane-id for the newly created pane on success"
     /// Zoom, unzoom, or toggle zoom state
     #[command(name = "zoom-pane", rename_all = "kebab")]
     ZoomPane(zoom_pane::ZoomPane),
+
+    /// Save windows/tabs/panes and their original spawn commands
+    #[command(name = "save-workspace", rename_all = "kebab")]
+    SaveWorkspace(save_workspace::SaveWorkspaceCommand),
+
+    /// Restore a previously saved workspace
+    #[command(name = "restore-workspace", rename_all = "kebab")]
+    RestoreWorkspace(restore_workspace::RestoreWorkspaceCommand),
+
+    /// Send the generic shutdown sequence to panes marked with agent.shutdown
+    #[command(name = "close-agent-sessions", rename_all = "kebab")]
+    CloseAgentSessions(close_agent_sessions::CloseAgentSessionsCommand),
+
+    /// Set or clear a pane user var
+    #[command(name = "set-user-var", rename_all = "kebab")]
+    SetUserVar(set_user_var::SetUserVarCommand),
 }
 
 async fn run_cli_async(opts: &crate::Opt, cli: CliCommand) -> anyhow::Result<()> {
@@ -205,6 +225,10 @@ async fn run_cli_async(opts: &crate::Opt, cli: CliCommand) -> anyhow::Result<()>
         CliSubCommand::SetWindowTitle(cmd) => cmd.run(client).await,
         CliSubCommand::RenameWorkspace(cmd) => cmd.run(client).await,
         CliSubCommand::ZoomPane(cmd) => cmd.run(client).await,
+        CliSubCommand::SaveWorkspace(cmd) => cmd.run(client).await,
+        CliSubCommand::RestoreWorkspace(cmd) => cmd.run(client).await,
+        CliSubCommand::CloseAgentSessions(cmd) => cmd.run(client).await,
+        CliSubCommand::SetUserVar(cmd) => cmd.run(client).await,
     }
 }
 

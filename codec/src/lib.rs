@@ -442,7 +442,7 @@ macro_rules! pdu {
 /// The overall version of the codec.
 /// This must be bumped when backwards incompatible changes
 /// are made to the types and protocol.
-pub const CODEC_VERSION: usize = 47;
+pub const CODEC_VERSION: usize = 48;
 
 // Defines the Pdu enum.
 // Each struct has an explicit identifying number.
@@ -503,6 +503,13 @@ pdu! {
     GetPaneDirection: 60,
     GetPaneDirectionResponse: 61,
     AdjustPaneSize: 62,
+    SaveWorkspace: 63,
+    SaveWorkspaceResponse: 64,
+    RestoreWorkspace: 65,
+    RestoreWorkspaceResponse: 66,
+    CloseAgentSessions: 67,
+    CloseAgentSessionsResponse: 68,
+    SetUserVar: 69,
 }
 
 impl Pdu {
@@ -604,6 +611,51 @@ impl Pdu {
 
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
 pub struct UnitResponse {}
+
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct SaveWorkspace {
+    pub path: Option<String>,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct SaveWorkspaceResponse {
+    pub path: String,
+    pub windows: usize,
+    pub tabs: usize,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct RestoreWorkspace {
+    pub path: String,
+    pub window_id: Option<WindowId>,
+    pub replace: bool,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct RestoreWorkspaceResponse {
+    pub windows: usize,
+    pub tabs: usize,
+    pub failed: usize,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct CloseAgentSessions {
+    pub timeout_seconds: u64,
+    pub force: bool,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct CloseAgentSessionsResponse {
+    pub closed: usize,
+    pub remaining: usize,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct SetUserVar {
+    pub pane_id: PaneId,
+    pub name: String,
+    pub value: Option<String>,
+}
 
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
 pub struct ErrorResponse {

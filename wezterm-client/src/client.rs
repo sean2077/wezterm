@@ -1389,4 +1389,16 @@ impl Client {
         GetPaneDirectionResponse
     );
     rpc!(adjust_pane_size, AdjustPaneSize, UnitResponse);
+    rpc!(save_workspace, SaveWorkspace, SaveWorkspaceResponse);
+    rpc!(
+        restore_workspace,
+        RestoreWorkspace,
+        RestoreWorkspaceResponse
+    );
+    rpc!(
+        close_agent_sessions,
+        CloseAgentSessions,
+        CloseAgentSessionsResponse
+    );
+    rpc!(set_user_var, SetUserVar, UnitResponse);
 }
