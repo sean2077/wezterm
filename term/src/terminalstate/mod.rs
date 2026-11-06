@@ -1085,6 +1085,19 @@ impl TerminalState {
         &self.user_vars
     }
 
+    /// Set or clear a user var from the host side (for example a CLI
+    /// integration) rather than parsing an OSC 1337 sequence.
+    pub fn set_user_var(&mut self, name: &str, value: Option<&str>) {
+        match value {
+            Some(value) => {
+                self.user_vars.insert(name.to_string(), value.to_string());
+            }
+            None => {
+                self.user_vars.remove(name);
+            }
+        }
+    }
+
     fn clear_semantic_attribute_due_to_movement(&mut self) {
         if self.clear_semantic_attribute_on_newline {
             self.clear_semantic_attribute_on_newline = false;

@@ -7,6 +7,7 @@
 
 use crate::localpane::LocalPane;
 use crate::pane::{alloc_pane_id, Pane, PaneId};
+use crate::session::SpawnInfo;
 use crate::tab::{SplitRequest, Tab, TabId};
 use crate::window::WindowId;
 use crate::Mux;
@@ -615,6 +616,15 @@ impl Domain for LocalDomain {
             },
             self.name
         );
+        let spawn_info = Some(SpawnInfo {
+            argv: cmd
+                .get_argv()
+                .iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect(),
+            cwd: cmd.get_cwd().map(|cwd| cwd.to_string_lossy().into_owned()),
+            env: Default::default(),
+        });
         let child_result = pair.slave.spawn_command(cmd);
         let mut writer = WriterWrapper::new(pair.master.take_writer()?);
 
@@ -638,6 +648,7 @@ impl Domain for LocalDomain {
                 Box::new(writer),
                 self.id,
                 command_description,
+                spawn_info.clone(),
             )),
             Err(err) => {
                 // Show the error to the user in the new pane
@@ -654,6 +665,7 @@ impl Domain for LocalDomain {
                     Box::new(writer),
                     self.id,
                     command_description,
+                    spawn_info,
                 ))
             }
         };

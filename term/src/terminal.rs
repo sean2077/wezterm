@@ -183,4 +183,9 @@ impl Terminal {
         }
         self.trigger_unseen_output_notif();
     }
+
+    /// Set or clear a user var from the host side.
+    pub fn set_user_var(&mut self, name: &str, value: Option<&str>) {
+        self.state.set_user_var(name, value);
+    }
 }

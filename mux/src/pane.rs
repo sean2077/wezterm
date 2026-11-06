@@ -271,6 +271,15 @@ pub trait Pane: Downcast + Send + Sync {
         HashMap::new()
     }
 
+    /// Original spawn command for workspace persistence.  Remote/client
+    /// panes do not expose this.
+    fn get_spawn_info(&self) -> Option<crate::session::SpawnInfo> {
+        None
+    }
+
+    /// Set or clear a user var from a host-side integration.
+    fn set_user_var(&self, _name: &str, _value: Option<&str>) {}
+
     fn erase_scrollback(&self, _erase_mode: ScrollbackEraseMode) {}
 
     /// Called to advise on whether this pane has focus

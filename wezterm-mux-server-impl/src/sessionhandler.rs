@@ -1001,6 +1001,88 @@ impl SessionHandler {
                 .detach();
             }
 
+            Pdu::SaveWorkspace(SaveWorkspace { path }) => {
+                spawn_into_main_thread(async move {
+                    catch(
+                        move || {
+                            let mux = Mux::get();
+                            let path = path
+                                .map(std::path::PathBuf::from)
+                                .unwrap_or_else(mux::session::default_workspace_path);
+                            let summary = mux.save_workspace(&path)?;
+                            Ok(Pdu::SaveWorkspaceResponse(SaveWorkspaceResponse {
+                                path: summary.path.to_string_lossy().to_string(),
+                                windows: summary.windows,
+                                tabs: summary.tabs,
+                            }))
+                        },
+                        send_response,
+                    )
+                })
+                .detach();
+            }
+
+            Pdu::RestoreWorkspace(RestoreWorkspace {
+                path,
+                window_id,
+                replace,
+            }) => {
+                promise::spawn::spawn(async move {
+                    let mux = Mux::get();
+                    let result = mux
+                        .restore_workspace(std::path::Path::new(&path), window_id, replace)
+                        .await;
+                    send_response(result.map(|summary| {
+                        Pdu::RestoreWorkspaceResponse(RestoreWorkspaceResponse {
+                            windows: summary.windows,
+                            tabs: summary.tabs,
+                            failed: summary.failed,
+                        })
+                    }));
+                })
+                .detach();
+            }
+
+            Pdu::CloseAgentSessions(CloseAgentSessions {
+                timeout_seconds,
+                force,
+            }) => {
+                promise::spawn::spawn(async move {
+                    let mux = Mux::get();
+                    let result = mux
+                        .close_agent_sessions(
+                            std::time::Duration::from_secs(timeout_seconds),
+                            force,
+                        )
+                        .await;
+                    send_response(result.map(|summary| {
+                        Pdu::CloseAgentSessionsResponse(CloseAgentSessionsResponse {
+                            closed: summary.closed,
+                            remaining: summary.remaining,
+                        })
+                    }));
+                })
+                .detach();
+            }
+
+            Pdu::SetUserVar(SetUserVar {
+                pane_id,
+                name,
+                value,
+            }) => {
+                spawn_into_main_thread(async move {
+                    catch(
+                        move || {
+                            let mux = Mux::get();
+                            mux.set_user_var(pane_id, &name, value.as_deref())?;
+                            Ok(Pdu::UnitResponse(UnitResponse {}))
+                        },
+                        send_response,
+                    )
+                })
+                .detach();
+            }
+
             Pdu::Invalid { .. } => send_response(Err(anyhow!("invalid PDU {:?}", decoded.pdu))),
             Pdu::Pong { .. }
             | Pdu::ListPanesResponse { .. }
@@ -1017,6 +1099,9 @@ impl SessionHandler {
             | Pdu::WindowWorkspaceChanged { .. }
             | Pdu::GetTlsCredsResponse { .. }
             | Pdu::GetClientListResponse { .. }
+            | Pdu::SaveWorkspaceResponse { .. }
+            | Pdu::RestoreWorkspaceResponse { .. }
+            | Pdu::CloseAgentSessionsResponse { .. }
             | Pdu::PaneRemoved { .. }
             | Pdu::PaneFocused { .. }
             | Pdu::TabResized { .. }
