@@ -15,7 +15,7 @@ use crate::scripting::guiwin::GuiWin;
 use crate::scrollbar::*;
 use crate::selection::Selection;
 use crate::shapecache::*;
-use crate::tabbar::{TabBarItem, TabBarState};
+use crate::tabbar::{agent_state_is_waiting, TabBarItem, TabBarState};
 use crate::termwindow::background::{
     load_background_image, reload_background_image, LoadedBackgroundLayer,
 };
@@ -224,6 +224,8 @@ pub struct TabInformation {
     pub active_pane: Option<PaneInformation>,
     pub window_id: MuxWindowId,
     pub tab_title: String,
+    /// True when any pane in this tab has agent_state == "waiting[:epoch]".
+    pub agent_waiting: bool,
 }
 
 impl UserData for TabInformation {
@@ -3491,6 +3493,13 @@ impl TermWindow {
         }
     }
 
+    fn pane_is_waiting_for_input(pane: &Arc<dyn Pane>) -> bool {
+        pane.copy_user_vars()
+            .get("agent_state")
+            .map(|value| agent_state_is_waiting(value))
+            .unwrap_or(false)
+    }
+
     fn pos_pane_to_pane_info(pos: &PositionedPane) -> PaneInformation {
         PaneInformation {
             pane_id: pos.pane.pane_id(),
@@ -3524,6 +3533,14 @@ impl TermWindow {
             .map(|(idx, tab)| {
                 let panes = self.get_pos_panes_for_tab(tab);
 
+                // Match the Lua badge aggregation (tab:panes() uses
+                // iter_panes_ignoring_zoom): inspect the real panes of the
+                // mux tab, not the overlay-substituted PositionedPane list.
+                let agent_waiting = tab
+                    .iter_panes_ignoring_zoom()
+                    .into_iter()
+                    .any(|p| Self::pane_is_waiting_for_input(&p.pane));
+
                 TabInformation {
                     tab_index: idx,
                     tab_id: tab.tab_id(),
@@ -3538,6 +3555,7 @@ impl TermWindow {
                         .iter()
                         .find(|p| p.is_active)
                         .map(Self::pos_pane_to_pane_info),
+                    agent_waiting,
                 }
             })
             .collect()

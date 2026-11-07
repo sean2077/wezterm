@@ -104,6 +104,7 @@ impl crate::TermWindow {
                 pixel_max: self.dimensions.pixel_width as f32,
                 pixel_cell: metrics.cell_size.width as f32,
             });
+        let waiting_edge = colors.waiting_tab_edge().to_linear();
 
         let item_to_elem = |item: &TabEntry| -> Element {
             let element = Element::with_line(&font, &item.title, palette);
@@ -239,11 +240,15 @@ impl crate::TermWindow {
                         }
                     }))
                     .colors(ElementColors {
-                        border: BorderColor::new(
-                            bg_color
-                                .unwrap_or_else(|| active_tab.bg_color.into())
-                                .to_linear(),
-                        ),
+                        border: if item.agent_waiting {
+                            BorderColor::new(waiting_edge)
+                        } else {
+                            BorderColor::new(
+                                bg_color
+                                    .unwrap_or_else(|| active_tab.bg_color.into())
+                                    .to_linear(),
+                            )
+                        },
                         bg: bg_color
                             .unwrap_or_else(|| active_tab.bg_color.into())
                             .to_linear()
@@ -332,11 +337,15 @@ impl crate::TermWindow {
                             .to_linear();
                         let edge = colors.inactive_tab_edge().to_linear();
                         ElementColors {
-                            border: BorderColor {
-                                left: bg,
-                                right: edge,
-                                top: bg,
-                                bottom: bg,
+                            border: if item.agent_waiting {
+                                BorderColor::new(waiting_edge)
+                            } else {
+                                BorderColor {
+                                    left: bg,
+                                    right: edge,
+                                    top: bg,
+                                    bottom: bg,
+                                }
                             },
                             bg: bg.into(),
                             text: fg_color
@@ -356,11 +365,15 @@ impl crate::TermWindow {
                             // four borders with the hover background and the
                             // line disappeared. inactive_tab_edge_hover was
                             // previously defined but never read.
-                            border: BorderColor {
-                                left: hover_bg,
-                                right: colors.inactive_tab_edge_hover().to_linear(),
-                                top: hover_bg,
-                                bottom: hover_bg,
+                            border: if item.agent_waiting {
+                                BorderColor::new(waiting_edge)
+                            } else {
+                                BorderColor {
+                                    left: hover_bg,
+                                    right: colors.inactive_tab_edge_hover().to_linear(),
+                                    top: hover_bg,
+                                    bottom: hover_bg,
+                                }
                             },
                             bg: hover_bg.into(),
                             text: fg_color

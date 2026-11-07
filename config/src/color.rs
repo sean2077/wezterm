@@ -390,6 +390,12 @@ pub struct TabBarColors {
 
     #[dynamic(default)]
     pub inactive_tab_edge_hover: Option<RgbaColor>,
+
+    /// Border color for a tab that contains a pane waiting for user input.
+    /// The whole border ring uses this color; the tab fill and border width
+    /// are unchanged. Defaults to #ff9500.
+    #[dynamic(default)]
+    pub waiting_tab_edge: Option<RgbaColor>,
 }
 
 impl TabBarColors {
@@ -433,6 +439,11 @@ impl TabBarColors {
             .unwrap_or_else(default_inactive_tab_edge_hover)
     }
 
+    pub fn waiting_tab_edge(&self) -> RgbaColor {
+        self.waiting_tab_edge
+            .unwrap_or_else(default_waiting_tab_edge)
+    }
+
     pub fn overlay_with(&self, other: &Self) -> Self {
         macro_rules! overlay {
             ($name:ident) => {
@@ -450,6 +461,7 @@ impl TabBarColors {
             inactive_tab_hover: overlay!(inactive_tab_hover),
             inactive_tab_edge: overlay!(inactive_tab_edge),
             inactive_tab_edge_hover: overlay!(inactive_tab_edge_hover),
+            waiting_tab_edge: overlay!(waiting_tab_edge),
             new_tab: overlay!(new_tab),
             new_tab_hover: overlay!(new_tab_hover),
         }
@@ -495,6 +507,10 @@ fn default_inactive_tab_edge() -> RgbaColor {
 
 fn default_inactive_tab_edge_hover() -> RgbaColor {
     RgbColor::new_8bpc(0x36, 0x36, 0x36).into()
+}
+
+fn default_waiting_tab_edge() -> RgbaColor {
+    RgbColor::new_8bpc(0xff, 0x95, 0x00).into()
 }
 
 fn default_inactive_tab() -> TabBarColor {
@@ -808,5 +824,14 @@ brights = [ "#8ca6a6" ,"#e5164a" ,"#00b368" ,"#b3694d" ,"#0094f0" ,"#ff5792" ,"#
     assert_eq!(
         scheme.colors.indexed.get(&52),
         Some(&RgbColor::new_8bpc(0xfb, 0xda, 0xda).into())
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn test_waiting_tab_edge_default() {
+    assert_eq!(
+        TabBarColors::default().waiting_tab_edge(),
+        RgbColor::new_8bpc(0xff, 0x95, 0x00).into()
     );
 }

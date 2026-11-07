@@ -39,6 +39,8 @@ pub struct TabEntry {
     pub item: TabBarItem,
     pub title: Line,
     pub right_title: Option<Line>,
+    /// Drives the full waiting-border ring in the fancy tab bar.
+    pub agent_waiting: bool,
     x: usize,
     width: usize,
 }
@@ -380,6 +382,28 @@ fn is_tab_hover(mouse_x: Option<usize>, x: usize, tab_title_len: usize) -> bool 
         .unwrap_or(false);
 }
 
+/// `agent_state` is written as `state` or `state:<unix-epoch>` by the
+/// notification helpers. Only the state prefix matters for the tab ring.
+pub(crate) fn agent_state_is_waiting(value: &str) -> bool {
+    value.split(':').next() == Some("waiting")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::agent_state_is_waiting;
+
+    #[test]
+    fn detects_waiting_agent_state() {
+        assert!(agent_state_is_waiting("waiting"));
+        assert!(agent_state_is_waiting("waiting:1762500000"));
+        assert!(!agent_state_is_waiting("running:1762500000"));
+        assert!(!agent_state_is_waiting("done:1762500000"));
+        assert!(!agent_state_is_waiting("error:1762500000"));
+        assert!(!agent_state_is_waiting("waiting-room"));
+        assert!(!agent_state_is_waiting(""));
+    }
+}
+
 impl TabBarState {
     pub fn default() -> Self {
         Self {
@@ -388,6 +412,7 @@ impl TabBarState {
                 item: TabBarItem::None,
                 title: Line::from_text(" ", &CellAttributes::blank(), 1, None),
                 right_title: None,
+                agent_waiting: false,
                 x: 1,
                 width: 1,
             }],
@@ -487,6 +512,7 @@ impl TabBarState {
                 item: TabBarItem::WindowButton(*button),
                 title: title.to_owned(),
                 right_title: None,
+                agent_waiting: false,
                 x: *x,
                 width,
             });
@@ -653,6 +679,7 @@ impl TabBarState {
                 item: TabBarItem::LeftStatus,
                 title: left_status_line.clone(),
                 right_title: None,
+                agent_waiting: false,
                 x,
                 width: left_status_line.len(),
             });
@@ -720,6 +747,7 @@ impl TabBarState {
                 item: TabBarItem::Tab { tab_idx, active },
                 title,
                 right_title: tab_title.right.clone(),
+                agent_waiting: tab_info[tab_idx].agent_waiting,
                 x: tab_start_idx,
                 width,
             });
@@ -743,6 +771,7 @@ impl TabBarState {
                 item: TabBarItem::NewTabButton,
                 title: new_tab_button.clone(),
                 right_title: None,
+                agent_waiting: false,
                 x: button_start,
                 width,
             });
@@ -806,6 +835,7 @@ impl TabBarState {
             item: TabBarItem::RightStatus,
             title: right_status_line.clone(),
             right_title: None,
+            agent_waiting: false,
             x,
             width: status_space_available,
         });
