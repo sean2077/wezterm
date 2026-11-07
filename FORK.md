@@ -22,6 +22,7 @@
 | windows: toggle quake bounds from the native fullscreen action | 自用 | — | 上游提供等价的 quake 模式后可删 |
 | gui: add an opt-in uniform fancy tab bar width | 自用 | — | 上游提供等价的标签栏布局选项后可删 |
 | gui: make the fancy tab bar border width configurable | 自用 | — | 上游提供等价的标签栏边框宽度选项后可删 |
+| gui: ring tabs whose panes are waiting for input | 自用 | — | 上游提供按 user var 高亮标签栏边框的能力后可删 |
 | cli: report tab/window indices and focus the owning GUI window | 自用 | — | 上游的 `list` 输出索引且 `activate-*` 会前台化窗口后可删 |
 | mux: generic workspace save/restore and agent user vars | 自用 | — | 上游提供等价的 session persistence/CLI 后可删 |
 | gui: expose tab budgets, mergeable overrides, CWD links and status coalescing | 自用 | — | 上游提供等价 API 后可删 |
@@ -41,6 +42,8 @@
 `config.tab_bar_uniform_width = true` 让 fancy 标签栏的每个 tab 等宽，并把 `+` 按钮从均分分母中拿出来、按固定宽度布局；标题短于份额时补齐、超出时截断，标签栏几何不再随标题长度变化。均分预算优先使用 `terminal_size.pixel_width`，并扣除右侧状态栏和集成窗口按钮的占用。`config.tab_bar_side_reserve_ratio`（默认 0.6）控制这部分预留的比例，调参不需要重新编译。
 
 `config.tab_bar_tab_border_width` 控制 fancy 标签栏每个 tab 的四边边框宽度，默认 `1px`（与上游一致），支持 `"2px"`、`"1.5pt"` 等 Dimension 写法，`pt` 会按显示 DPI 缩放。上游只有非活动 tab 的右边框可见（颜色取 `colors.tab_bar.inactive_tab_edge`），其余三边使用 tab 自身背景色；调大后该分隔线随之加粗。hover 时这条边线现在也会保留，颜色改用此前已定义但从未被渲染读取的 `colors.tab_bar.inactive_tab_edge_hover`。改宽度只需改配置，不需要重新编译。
+
+`colors.tab_bar.waiting_tab_edge`（默认 `#ff9500`）让任意 pane 的 `agent_state` user var 为 `waiting`（可带 `:epoch` 后缀）的 tab 显示整圈橙色边框；只改边框颜色，不改填充色，也不改 `tab_bar_tab_border_width`，因此 `tab_bar_uniform_width` 等布局不受影响。活动、非活动和 hover 三种状态都生效，`running`/`done`/`error` 不触发。判定与 Lua 徽章一致：遍历 mux tab 的真实 pane（`iter_panes_ignoring_zoom`，忽略 zoom 和 GUI overlay），任一 waiting 即高亮。状态变化会进入 `TabEntry` 并参与缓存比较，user var 更新后立即触发重绘。
 
 `format-tab-title` 的第 6 个参数（`max_width`）在 fancy bar 下现在按标题字体宽度和 tab 数换算成真实预算，不再是恒定的 `tab_max_width`；第二遍渲染在 uniform 模式下会扣掉回调声明的左块和右浮动后缀/关闭按钮，把剩下的宽度当作标题块预算。回调可以用 U+001E 标记左块（索引/徽章）与标题块的分界。`window:set_config_override(key, value)` / `clear_config_override(key)` 用于增量修改 per-window override；hyperlink URI 中的 `$CWD` 在点击时展开为当前 pane 的工作目录；`update-status` / `update-right-status` 统一按 `status_update_interval` 调度，不再随高频标题变化每帧触发。
 
