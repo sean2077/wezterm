@@ -24,6 +24,7 @@
 | gui: make the fancy tab bar border width configurable | 自用 | — | 上游提供等价的标签栏边框宽度选项后可删 |
 | gui: ring tabs whose panes are waiting for input | 自用 | — | 上游提供按 user var 高亮标签栏边框的能力后可删 |
 | gui: outline the active tab and light up waiting tabs | 自用 | — | 上游提供活动 tab 门框/标签栏分隔线与按状态高亮的能力后可删 |
+| gui: color the tab bar separator with the active tab's accent | 自用 | — | 同上（依赖上一条） |
 | cli: report tab/window indices and focus the owning GUI window | 自用 | — | 上游的 `list` 输出索引且 `activate-*` 会前台化窗口后可删 |
 | mux: generic workspace save/restore and agent user vars | 自用 | — | 上游提供等价的 session persistence/CLI 后可删 |
 | gui: expose tab budgets, mergeable overrides, CWD links and status coalescing | 自用 | — | 上游提供等价 API 后可删 |
@@ -47,6 +48,8 @@
 `colors.tab_bar.waiting_tab_edge`（默认 `#ff9500`）让任意 pane 的 `agent_state` user var 为 `waiting`（可带 `:epoch` 后缀）的 tab 显示一圈细边框（线宽同 `tab_bar_tab_border_width`）；远离终端内容的一侧（顶部标签栏为上边）在两个圆角之间加一条约 3 逻辑像素的指示灯条，框外再画最多 3 层逐渐变淡的光晕（不透明度 0.5/0.26/0.12，每层约 1 逻辑像素，层数受 tab 与标签栏边缘之间的空间限制）。灯条和光晕的颜色由 `colors.tab_bar.waiting_tab_glow` 控制，默认与 `waiting_tab_edge` 相同。活动、非活动和 hover 三种状态都生效，`running`/`done`/`error` 不触发。判定与 Lua 徽章一致：遍历 mux tab 的真实 pane（`iter_panes_ignoring_zoom`，忽略 zoom 和 GUI overlay），任一 waiting 即高亮。状态变化会进入 `TabEntry` 并参与缓存比较，user var 更新后立即触发重绘。
 
 `colors.tab_bar.active_tab_edge`（默认不设置，即保持上游外观）设置后，标签栏靠近终端内容的一侧画一条贯穿整个窗口的分隔线，并在活动 tab 处折成左、上、右三边的门框（Chrome 式）；底边断开，活动 tab 与内容区连在一起。活动 tab 同时处于 waiting 时，门框改用 `waiting_tab_edge` 的颜色，并加上灯条和光晕。`tab_bar_at_bottom = true` 时上下镜像。
+
+分隔线和门框的颜色可以按 tab 指定：`format-tab-title` 返回值中，U+001D 标记处生效的前景色就是该 tab 的强调色，写法为 `{ Foreground = { Color = '#rrggbb' } }, { Text = '\x1d' }`。标记本身会被剥掉，不占列宽，只有显式 RGB 颜色才算。tab 处于活动状态时，用它的强调色画整条分隔线和门框，所以切换 tab 时边界线跟着换色。没有声明强调色时，用 `active_tab_edge`。活动且 waiting 的 tab，门框仍为橙色，分隔线仍用强调色。强调色随 `TabEntry` 参与缓存比较，变化后立即重绘。`config.tab_bar_active_edge_width`（Dimension，默认 0，表示跟随 `tab_bar_tab_border_width`）单独设置分隔线和门框的线宽，可以比 tab 之间的分隔线和等待环更粗；`pt` 随 DPI 缩放。
 
 这些线条都画在 zindex 20 的叠加层上（标签栏之上、模态浮层之下），不参与布局，`tab_bar_uniform_width` 的几何不变。tab 元素自身的边框保持填充色：box model 的圆角是用边框色填充的实心四分之一圆，边框一旦换色，圆角就会变成色块。所以门框和等待环的圆角不改边框色，而是叠两层实心四分之一圆：外层是线条色，内层是 tab 当前的填充色（悬停时取悬停色），同圆心、半径小一个线宽。两条边缘都是抗锯齿填充，弧线和直线的粗细、亮度一致。1px 的描边弧线在实测中又淡又断，所以不用。填充色不是纯色时退回描边。光晕的弧线是半透明的，仍然用描边。tab 圆角改为宽高相同的像素半径（标题字体格高的 0.4 倍）：上游用 0.5 格宽 × 0.5 格高，格子高于宽，实际是椭圆，描边后看起来像斜切。几何计算在纯函数 `tab_bar_decorations` 中完成，单测位于 `fancy_tab_bar.rs` 的 `decoration_tests`。
 
