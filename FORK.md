@@ -29,6 +29,7 @@
 | gui: hover symbols on traffic lights, hover-only close buttons, waiting separator | 自用 | — | 依赖上面两条；上游提供悬停显示关闭按钮的选项后可删其中对应部分 |
 | cli: report tab/window indices and focus the owning GUI window | 自用 | — | 上游的 `list` 输出索引且 `activate-*` 会前台化窗口后可删 |
 | mux: generic workspace save/restore and agent user vars | 自用 | — | 上游提供等价的 session persistence/CLI 后可删 |
+| mux: persist per-tab split layouts (session v2) | 自用 | — | 上游提供等价的分屏持久化后可删；与上一行一起删 |
 | mux: restore agent commands from agent.restore_argv | 自用 | — | 与上一行一起删；替代已废弃的 `agent.resume_args` 追加语义，`agent.*` 由宿主保留 |
 | gui: foreground only explicit window activations | 自用 | — | 上游 `activate-*` 默认遮挡窗口的前台化行为等价后可删 |
 | gui: expose tab budgets, mergeable overrides, CWD links and status coalescing | 自用 | — | 上游提供等价 API 后可删 |
@@ -45,7 +46,7 @@
 
 用法：用 `--config-file` 指定一个 `quake.lua`，并用 `--class` 给专用实例一个独立类名。`quake.lua` 应设置 `config.quake`、`window_decorations = "NONE"`（外框与客户区一致，几何才准确）、`tab_bar_at_bottom = true`。热键注册失败时窗口会回落为可见状态，而不是留下隐形实例；`WM_CLOSE` 在 quake 模式下只收起窗口，显式退出仍用 `QuitApplication`。全屏状态由 `QuakeState` 在窗口进程内维护：quake 模式下原生的 `ToggleFullScreen` 动作改为在“配置的下拉矩形”和“整个显示器”之间切换，F3 收起再呼出后保持当前状态；Lua 只需绑定 `wezterm.action.ToggleFullScreen`，不需要计算几何或写 per-window override。
 
-`config.tab_bar_uniform_width = true` 让 fancy 标签栏的每个 tab 等宽，并把 `+` 按钮从均分分母中拿出来、按固定宽度布局；标题短于份额时补齐、超出时截断，标签栏几何不再随标题长度变化。均分预算优先使用 `terminal_size.pixel_width`，并扣除右侧状态栏和集成窗口按钮的占用。`config.tab_bar_side_reserve_ratio`（默认 0.6）控制这部分预留的比例，调参不需要重新编译。
+`config.tab_bar_uniform_width = true` 让 fancy 标签栏的每个 tab 等宽，并把 `+` 按钮从均分分母中拿出来、按固定宽度布局；标题短于份额时补齐、超出时截断，标签栏几何不再随标题长度变化。均分预算优先使用 `terminal_size.pixel_width`，并扣除左右两侧状态栏和集成窗口按钮的占用。这些固定元素的实际宽度由 `fancy_side_widths` 统一计算，布局与标题预算共用同一份数字：状态栏文字按列宽加 0.5 格左内边距；左侧还有 0.5 格组内边距；自绘红绿灯按元素真实总宽（直径 + 3 个间距，含右边距）；Windows 字形按钮按 DPI 换算实际宽度（10pt 图标 + 17/18pt 左内边距 + 18pt 右内边距），不再按 3 列估算。`config.tab_bar_side_reserve_ratio`（默认 0.6）只缩放状态栏文字那部分预留，不再影响按钮宽度。
 
 `config.tab_bar_tab_border_width` 控制 fancy 标签栏每个 tab 的四边边框宽度，默认 `1px`（与上游一致），支持 `"2px"`、`"1.5pt"` 等 Dimension 写法，`pt` 会按显示 DPI 缩放。上游只有非活动 tab 的右边框可见（颜色取 `colors.tab_bar.inactive_tab_edge`），其余三边使用 tab 自身背景色；调大后该分隔线随之加粗。hover 时这条边线现在也会保留，颜色改用此前已定义但从未被渲染读取的 `colors.tab_bar.inactive_tab_edge_hover`。改宽度只需改配置，不需要重新编译。
 
@@ -57,7 +58,9 @@
 
 这些线条都画在 zindex 20 的叠加层上（标签栏之上、模态浮层之下），不参与布局，`tab_bar_uniform_width` 的几何不变。tab 元素自身的边框保持填充色：box model 的圆角是用边框色填充的实心四分之一圆，边框一旦换色，圆角就会变成色块。所以门框和等待环的圆角不改边框色，而是叠两层实心四分之一圆：外层是线条色，内层是 tab 当前的填充色（悬停时取悬停色），同圆心、半径小一个线宽。圆角 glyph 的圆心在靠 tab 内侧的那个角（`TOP_LEFT_ROUNDED_CORNER` 在右下），内层方块必须锚在这个角上；锚错到外侧角时内层圆会把外层弧整个盖住，圆角看起来成了一个台阶缺口（`decoration_tests` 里断言了 glyph 圆心）。两条边缘都是抗锯齿填充，弧线和直线的粗细、亮度一致。1px 的描边弧线在实测中又淡又断，所以不用。填充色不是纯色时退回描边。光晕的弧线是半透明的，仍然用描边。tab 圆角改为宽高相同的像素半径（标题字体格高的 0.4 倍）：上游用 0.5 格宽 × 0.5 格高，格子高于宽，实际是椭圆，描边后看起来像斜切。几何计算在纯函数 `tab_bar_decorations` 中完成，单测位于 `fancy_tab_bar.rs` 的 `decoration_tests`。
 
-`format-tab-title` 的第 6 个参数（`max_width`）在 fancy bar 下现在按标题字体宽度和 tab 数换算成真实预算，不再是恒定的 `tab_max_width`；第二遍渲染在 uniform 模式下会扣掉回调声明的左块和右浮动后缀/关闭按钮，把剩下的宽度当作标题块预算。回调可以用 U+001E 标记左块（索引/徽章）与标题块的分界。`window:set_config_override(key, value)` / `clear_config_override(key)` 用于增量修改 per-window override；hyperlink URI 中的 `$CWD` 在点击时展开为当前 pane 的工作目录；`update-status` / `update-right-status` 统一按 `status_update_interval` 调度，不再随高频标题变化每帧触发。
+`format-tab-title` 的第 6 个参数（`max_width`）在 fancy bar 下现在按标题字体宽度和 tab 数换算成真实预算，不再是恒定的 `tab_max_width`；uniform 模式下第二遍渲染按像素计算精确预算：tab 份额减去 1 格水平内边距和两侧边框，再减去关闭按钮（格高的一半）与右浮动后缀的实际像素，剩下的按标题字体列宽向下取整，就是标题块能用的列数（回调声明的左块 U+001E 另计）。渲染时的行截断也用同一份列数，不会再用更小的估算值把省略号裁掉。非 uniform 模式保持原来的按列估算。回调可以用 U+001E 标记左块（索引/徽章）与标题块的分界。`window:set_config_override(key, value)` / `clear_config_override(key)` 用于增量修改 per-window override；hyperlink URI 中的 `$CWD` 在点击时展开为当前 pane 的工作目录；`update-status` / `update-right-status` 统一按 `status_update_interval` 调度，不再随高频标题变化每帧触发。
+
+uniform 模式下 tab 的 hover 判定也改用像素：按同样的份额累计每个 tab 的像素区间，用鼠标在标签栏内的原始像素坐标比较（非 uniform 仍按标题列数）。短标题 tab 右侧的空白因此也能正确触发 hover 配色。
 
 `format-tab-title` 的返回值可以用 U+001F 分成左右两段：右段作为右浮动元素渲染在关闭按钮左侧。比例字体下标题文字的实际 advance 小于单元格预算，靠空格/EM SPACE 填充无法精确对齐；右浮动后缀不依赖字体宽度。
 
@@ -71,7 +74,7 @@
 
 ## 通用工作区持久化（自用）
 
-`mux` 新增通用 `SessionState`，保存窗口/tab/活动 tab、cwd、原始 spawn argv、标题和 user vars；不保存分屏树、颜色、zoom、窗口几何。每个 tab 只恢复活动 pane。新增 CLI：
+`mux` 新增通用 `SessionState`，保存窗口/tab/活动 tab、每个 tab 的 pane 列表与分屏树（方向、两侧尺寸）、活动 pane、zoom 状态、每个 pane 的 cwd、原始 spawn argv、标题和 user vars；不保存颜色、标题栏样式或窗口几何。新增 CLI：
 
 ```text
 wezterm cli save-workspace [--path FILE]
@@ -81,13 +84,15 @@ wezterm cli set-user-var [--pane-id ID] --var NAME=VALUE [--var ...] [--unset NA
 wezterm cli set-user-var [--pane-id ID] --name NAME [--value VALUE | --unset]
 ```
 
-`--path` 的相对路径按 CLI 的当前目录解析，不按 mux server 的工作目录。`restore-workspace --replace` 在没有恢复出任何 tab 时会保留目标窗口；未给 `--window-id` 且存在多个窗口时报错。恢复后激活 `WindowState.active_tab` 对应的 tab。
+`--path` 的相对路径按 CLI 的当前目录解析，不按 mux server 的工作目录。`restore-workspace --replace` 在没有恢复出任何 tab 时会保留目标窗口；未给 `--window-id` 且存在多个窗口时报错；`scripts/wezterm-fork.ps1` 现在总是在恢复前从新 GUI 的 `cli list --format json` 选目标窗口并显式传 `--window-id`（只有一个窗口用它，多个时选包含最小 pane id 的窗口）。恢复后激活 `WindowState.active_tab` 对应的 tab。
+
+会话文件 version 2 为每个 tab 保存 `panes`（前序：左/上先于右/下）和 `layout` 树；单 pane tab 的 `layout` 省略。分屏节点复用 mux 内部的 `SplitDirectionAndSize`（方向 + 两侧 `TerminalSize`），叶子用 `panes` 下标。保存时递归遍历 `TabInner.pane` 的 `bintree`（不受 zoom 影响），并剪掉没有本地 spawn 命令的叶子（ssh/tmux）：一侧为空时把另一侧提到父位置，全空则丢弃该 tab；活动 tab 下标在剪枝后按“原活动 tab 是否仍在”重算，活动 pane 与 zoom 下标按剪枝后的前序下标映射。恢复时先由最左/上叶子 spawn 出 tab 的初始 pane，再自顶向下用 `Mux::split_pane`（`target_is_second`、非 top-level）重建：节点尺寸仍等于保存值时用 `Cells`，窗口尺寸变了按比例用 `Percent`；节点不足 3 格、任一侧不足 1 格或单个 split 失败时只回退该子树（anchor 保持占据节点区域），不增加 `failed` 计数（`failed` 只统计整个 tab 创建失败，否则 CLI 非零退出会让重启 worker 在恢复后中止）。每个叶子都走 `command_for`（`agent.restore_argv` 替换、空 argv 默认 shell）并记录原始 spawn argv。全部 pane 建好后按保存的 `active_pane` 设活动 pane，再恢复 zoom。version 1 快照继续可读，按单 pane tab 处理；version 2 文件不被旧构建读取（预期）。
 
 Agent 集成通过通用 user vars 完成：`agent.restore_argv`（JSON argv，**整条替换** pane 的启动命令）、`agent.shutdown`（非空表示参与优雅关闭）、`agent.session_id`（诊断用）。mux/CLI 不包含 Claude 专用字段。恢复命令由白名单重建：保留 argv[0] 与 `--settings`/`--effort`/`--model`/`--permission-mode`/`--dangerously-skip-permissions`/`--add-dir`（含 `=` 写法），最后追加 `--resume <id>`；`-c`、`--continue`、`--resume`、`--session-id`、`--fork-session`、位置 prompt 和未知 flag 一律丢弃，避免重复重启时累积 `--resume` 或重放首条 prompt。命令词是裸 `claude` 且未带权限 flag 时不加引号，交给交互式 zsh 的 `claude` alias 补上 `--dangerously-skip-permissions`（yolo 会话因此保持 yolo）；完整路径或已带权限 flag 的 argv 会加引号，避免 alias 再补一次造成重复。
 
 `agent.*` 是宿主保留命名空间：OSC 1337 `SetUserVar` 对 `agent.` 前缀的名字直接丢弃，防止不可信终端输出注入恢复命令；只有 `set-user-var`（mux PDU）能写。`agent_state` 不受影响。恢复时不再把 user vars 写回新 pane，新进程自己的 SessionStart 会重新发布。用 `agent.restore_argv` 启动的 pane，其 `SpawnInfo` 记录保存时的基础 argv，避免重复 save/restore 累积参数。
 
-`agent.resume_args` 已废弃：restore 忽略并记 warning。`--legacy-claude-pending` 一次性适配器已删除；旧 hook 记录的会话由 `session-tabs.sh republish` 在重启前转换成 `agent.restore_argv`（republish 只写这一个变量：旧 hook 已经写过 name/session_id/shutdown，给崩溃后的普通 shell 补 shutdown 会让 close-agent-sessions 空等超时）。
+`agent.resume_args` 已废弃：restore 忽略并记日志（同时存在 `agent.restore_argv` 时降为 debug，只有它单独存在时才 warning，因为那时会话无法恢复）。`--legacy-claude-pending` 一次性适配器已删除；旧 hook 记录的会话由 `session-tabs.sh republish` 在重启前转换成 `agent.restore_argv`（republish 只写这一个变量：旧 hook 已经写过 name/session_id/shutdown，给崩溃后的普通 shell 补 shutdown 会让 close-agent-sessions 空等超时）。
 
 `close-agent-sessions` 只处理带 `agent.shutdown` 的 pane，发送 Esc（全部 pane）→ 等待 → Ctrl+C（全部）→ 等待 → `/exit\r`（全部），不识别具体 agent 名称；`--timeout-seconds` 限制在 1..=3600，`--force` 只是超时后允许调用方继续，不会杀 pane。
 
