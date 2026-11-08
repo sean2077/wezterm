@@ -680,6 +680,8 @@ impl crate::TermWindow {
                 text: InheritableColor::Inherited,
             },
             hover_colors: None,
+            hover_overlay: None,
+            reveal_on_parent_hover: false,
             padding: background_rect,
             content_rect,
             baseline: 1.0,

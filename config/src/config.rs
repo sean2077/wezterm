@@ -552,6 +552,12 @@ pub struct Config {
     )]
     pub tab_bar_active_edge_width: Dimension,
 
+    /// Show the close button of an inactive tab only while the pointer is
+    /// over that tab (the active tab always shows it), as Chrome does. Needs
+    /// show_close_tab_button_in_tabs.
+    #[dynamic(default)]
+    pub tab_bar_close_button_on_hover: bool,
+
     /// If true, hide the tab bar if the window only has a single tab.
     #[dynamic(default)]
     pub hide_tab_bar_if_only_one_tab: bool,

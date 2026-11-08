@@ -26,6 +26,7 @@
 | gui: outline the active tab and light up waiting tabs | 自用 | — | 上游提供活动 tab 门框/标签栏分隔线与按状态高亮的能力后可删 |
 | gui: color the tab bar separator with the active tab's accent | 自用 | — | 同上（依赖上一条） |
 | gui: draw macOS-style traffic light window buttons | 自用 | — | 上游在非 macOS 平台支持 `integrated_title_button_style = "MacOsNative"` 时可删 |
+| gui: hover symbols on traffic lights, hover-only close buttons, waiting separator | 自用 | — | 依赖上面两条；上游提供悬停显示关闭按钮的选项后可删其中对应部分 |
 | cli: report tab/window indices and focus the owning GUI window | 自用 | — | 上游的 `list` 输出索引且 `activate-*` 会前台化窗口后可删 |
 | mux: generic workspace save/restore and agent user vars | 自用 | — | 上游提供等价的 session persistence/CLI 后可删 |
 | gui: expose tab budgets, mergeable overrides, CWD links and status coalescing | 自用 | — | 上游提供等价 API 后可删 |
@@ -48,7 +49,7 @@
 
 `colors.tab_bar.waiting_tab_edge`（默认 `#ff9500`）让任意 pane 的 `agent_state` user var 为 `waiting`（可带 `:epoch` 后缀）的 tab 显示一圈细边框（线宽同 `tab_bar_tab_border_width`）；远离终端内容的一侧（顶部标签栏为上边）在两个圆角之间加一条约 3 逻辑像素的指示灯条，框外再画最多 3 层逐渐变淡的光晕（不透明度 0.5/0.26/0.12，每层约 1 逻辑像素，层数受 tab 与标签栏边缘之间的空间限制）。灯条和光晕的颜色由 `colors.tab_bar.waiting_tab_glow` 控制，默认与 `waiting_tab_edge` 相同。活动、非活动和 hover 三种状态都生效，`running`/`done`/`error` 不触发。判定与 Lua 徽章一致：遍历 mux tab 的真实 pane（`iter_panes_ignoring_zoom`，忽略 zoom 和 GUI overlay），任一 waiting 即高亮。状态变化会进入 `TabEntry` 并参与缓存比较，user var 更新后立即触发重绘。
 
-`colors.tab_bar.active_tab_edge`（默认不设置，即保持上游外观）设置后，标签栏靠近终端内容的一侧画一条贯穿整个窗口的分隔线，并在活动 tab 处折成左、上、右三边的门框（Chrome 式）；底边断开，活动 tab 与内容区连在一起。活动 tab 同时处于 waiting 时，门框改用 `waiting_tab_edge` 的颜色，并加上灯条和光晕。门框两侧与分隔线相接处向外张开（Chrome 式）：tab 外侧各放一个边长为「半径 + 线宽」的方块，里面画一段等宽描边的四分之一圆环，圆心在 tab 外侧、远离内容的一角，分隔线的内沿沿弧线上弯，接到门柱外沿；分隔线和门柱都在切点截断。半径为标题字体格高的 0.3 倍，按线宽描边，不画任何背景色块，所以压在相邻 tab 的底角上也不会留下缺口。方块放不进标签栏的一侧（贴窗口边的 tab）退回直角。早先两版失败的做法：把 tab 自身底角切圆（方向反了）；用强调色方块叠一个标签栏背景色的四分之一圆挖空（圆心放错，只剩发丝，还在 tab 缝隙留下深色缺口）。`tab_bar_at_bottom = true` 时上下镜像。
+`colors.tab_bar.active_tab_edge`（默认不设置，即保持上游外观）设置后，标签栏靠近终端内容的一侧画一条贯穿整个窗口的分隔线，并在活动 tab 处折成左、上、右三边的门框（Chrome 式）；底边断开，活动 tab 与内容区连在一起。活动 tab 同时处于 waiting 时，门框和整条分隔线都改用 `waiting_tab_edge` 的颜色（分隔线跟着门框变色，外张弧处没有色差），并加上灯条和光晕。门框两侧与分隔线相接处向外张开（Chrome 式）：tab 外侧各放一个边长为「半径 + 线宽」的方块，里面画一段等宽描边的四分之一圆环，圆心在 tab 外侧、远离内容的一角，分隔线的内沿沿弧线上弯，接到门柱外沿；分隔线和门柱都在切点截断。半径为标题字体格高的 0.3 倍，按线宽描边，不画任何背景色块，所以压在相邻 tab 的底角上也不会留下缺口。方块放不进标签栏的一侧（贴窗口边的 tab）退回直角。早先两版失败的做法：把 tab 自身底角切圆（方向反了）；用强调色方块叠一个标签栏背景色的四分之一圆挖空（圆心放错，只剩发丝，还在 tab 缝隙留下深色缺口）。`tab_bar_at_bottom = true` 时上下镜像。
 
 分隔线和门框的颜色可以按 tab 指定：`format-tab-title` 返回值中，U+001D 标记处生效的前景色就是该 tab 的强调色，写法为 `{ Foreground = { Color = '#rrggbb' } }, { Text = '\x1d' }`。标记本身会被剥掉，不占列宽，只有显式 RGB 颜色才算。tab 处于活动状态时，用它的强调色画整条分隔线和门框，所以切换 tab 时边界线跟着换色。没有声明强调色时，用 `active_tab_edge`。活动且 waiting 的 tab，门框仍为橙色，分隔线仍用强调色。强调色随 `TabEntry` 参与缓存比较，变化后立即重绘。`config.tab_bar_active_edge_width`（Dimension，默认 0，表示跟随 `tab_bar_tab_border_width`）单独设置分隔线和门框的线宽，可以比 tab 之间的分隔线和等待环更粗；`pt` 随 DPI 缩放。
 
@@ -58,7 +59,9 @@
 
 `format-tab-title` 的返回值可以用 U+001F 分成左右两段：右段作为右浮动元素渲染在关闭按钮左侧。比例字体下标题文字的实际 advance 小于单元格预算，靠空格/EM SPACE 填充无法精确对齐；右浮动后缀不依赖字体宽度。
 
-`config.integrated_title_button_style = "MacOsNative"` 原本只在 macOS 生效（按钮由系统绘制），现在任何平台都接受该值：macOS 仍由系统绘制，其他平台由 fork 自绘三个圆点（关=红 `#ff5f57`、最小化=黄 `#febc2e`、最大化=绿 `#28c840`），顺序按 `integrated_title_buttons`，位置按 `integrated_title_button_alignment`（默认右侧），悬停时同色相提亮。圆点直径约为标题字体格高的 0.7 倍（本机约 19px，接近 macOS 的 12pt 圆点），间距为直径的 0.4 倍，三个合计约 95px，仍明显窄于 Windows 字形按钮（每个约 46px，合计约 140px），右侧状态栏因此多出约 45px。fancy 标签栏按实际像素宽度为它们预留空间（`reserved_side_width`），均分 tab 不会压到按钮下面。`window_buttons_at_left` 的「macOS 按钮总在左边」逻辑、以及标签栏最左侧为原生按钮预留的 4 格边距，都只对真正的 macOS 生效；否则 tab 会被无谓地往右推。
+`config.integrated_title_button_style = "MacOsNative"` 原本只在 macOS 生效（按钮由系统绘制），现在任何平台都接受该值：macOS 仍由系统绘制，其他平台由 fork 自绘三个圆点（关=红 `#ff5f57`、最小化=黄 `#febc2e`、最大化=绿 `#28c840`），顺序按 `integrated_title_buttons`，位置按 `integrated_title_button_alignment`（默认右侧），悬停时同色相略提亮，并在圆点中央画出 macOS 式的深色符号（最小化 −、最大化 +、关闭 ×，墨色取各自色相的暗色），只看颜色认不出功能时可以悬停确认。符号通过 box model 新增的 `hover_overlay` 绘制：Poly 元素悬停时在同一位置叠画第二个 glyph。圆点直径约为标题字体格高的 0.7 倍（本机约 19px，接近 macOS 的 12pt 圆点），间距为直径的 0.4 倍，三个合计约 95px，仍明显窄于 Windows 字形按钮（每个约 46px，合计约 140px），右侧状态栏因此多出约 45px。fancy 标签栏按实际像素宽度为它们预留空间（`reserved_side_width`），均分 tab 不会压到按钮下面。`window_buttons_at_left` 的「macOS 按钮总在左边」逻辑、以及标签栏最左侧为原生按钮预留的 4 格边距，都只对真正的 macOS 生效；否则 tab 会被无谓地往右推。
+
+`tab_bar_close_button_on_hover = true`（默认 false）时，非活动 tab 的关闭按钮 × 只在鼠标悬停该 tab 时显示（Chrome 式），活动 tab 始终显示。实现是 box model 新增的 `reveal_on_parent_hover`：子元素只在父元素处于悬停态（父元素需有 `hover_colors`）时渲染。点击 × 必然先悬停，所以 UI 命中区域照常注册。悬停判定统一走 `is_element_hovered`，`tab_fill` 与 `render_element` 共用。
 
 `wezterm cli list` 增加 `tab_index`、`window_index`、`is_active_tab`（表格末尾的 `ACTIVE` 列）；新增 `wezterm cli activate-window --window-id <WINID>`，通过 `SetFocusedPane` 切到该窗口的活动 tab 并前台化。`ListPanesResponse` 增加了 `active_tab_ids` 字段，因此 `CODEC_VERSION` 升到 47；升级后需要重启所有 GUI 进程，避免新旧 codec 混用。
 

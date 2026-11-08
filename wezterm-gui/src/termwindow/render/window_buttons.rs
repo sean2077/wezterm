@@ -21,6 +21,63 @@ const CIRCLE: &[Poly] = &[Poly {
     style: PolyStyle::Fill,
 }];
 
+/// Symbols shown inside a traffic light while it is hovered, as on macOS.
+/// Strokes span the middle 40% of the dot.
+const LO: BlockCoord = BlockCoord::Frac(3, 10);
+const HI: BlockCoord = BlockCoord::Frac(7, 10);
+const MID: BlockCoord = BlockCoord::Frac(1, 2);
+
+const CLOSE_SYMBOL: &[Poly] = &[
+    Poly {
+        path: &[PolyCommand::MoveTo(LO, LO), PolyCommand::LineTo(HI, HI)],
+        intensity: BlockAlpha::Full,
+        style: PolyStyle::Outline,
+    },
+    Poly {
+        path: &[PolyCommand::MoveTo(HI, LO), PolyCommand::LineTo(LO, HI)],
+        intensity: BlockAlpha::Full,
+        style: PolyStyle::Outline,
+    },
+];
+
+const MINIMIZE_SYMBOL: &[Poly] = &[Poly {
+    path: &[
+        PolyCommand::MoveTo(BlockCoord::Frac(1, 4), MID),
+        PolyCommand::LineTo(BlockCoord::Frac(3, 4), MID),
+    ],
+    intensity: BlockAlpha::Full,
+    style: PolyStyle::Outline,
+}];
+
+const MAXIMIZE_SYMBOL: &[Poly] = &[
+    Poly {
+        path: &[
+            PolyCommand::MoveTo(BlockCoord::Frac(1, 4), MID),
+            PolyCommand::LineTo(BlockCoord::Frac(3, 4), MID),
+        ],
+        intensity: BlockAlpha::Full,
+        style: PolyStyle::Outline,
+    },
+    Poly {
+        path: &[
+            PolyCommand::MoveTo(MID, BlockCoord::Frac(1, 4)),
+            PolyCommand::LineTo(MID, BlockCoord::Frac(3, 4)),
+        ],
+        intensity: BlockAlpha::Full,
+        style: PolyStyle::Outline,
+    },
+];
+
+/// The hover symbol of a traffic light and its dark ink (macOS darkens the
+/// dot's own hue).
+fn traffic_light_symbol(button: IntegratedTitleButton) -> (&'static [Poly], (u8, u8, u8)) {
+    match button {
+        IntegratedTitleButton::Close => (CLOSE_SYMBOL, (0x4d, 0x00, 0x00)),
+        IntegratedTitleButton::Hide => (MINIMIZE_SYMBOL, (0x99, 0x57, 0x00)),
+        IntegratedTitleButton::Maximize => (MAXIMIZE_SYMBOL, (0x00, 0x65, 0x00)),
+    }
+}
+
 /// Diameter of a traffic light and the gap on each side of it.
 pub fn traffic_light_metrics(metrics: &RenderMetrics) -> (f32, f32) {
     // macOS uses 12pt dots; at this DPI that is about 0.7 of the title cell
@@ -87,8 +144,17 @@ fn traffic_light_element(
     })
     .colors(colors.clone())
     .hover_colors(Some(ElementColors {
-        text: color(0.35).into(),
+        text: color(0.15).into(),
         ..colors
+    }))
+    .hover_overlay(Some({
+        let (poly, (r, g, b)) = traffic_light_symbol(window_button);
+        HoverOverlay {
+            poly,
+            line_width: (diameter / 10.).round().max(1.) as isize,
+            color: window::color::SrgbaTuple(r as f32 / 255., g as f32 / 255., b as f32 / 255., 1.)
+                .to_linear(),
+        }
     }))
 }
 

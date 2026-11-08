@@ -433,8 +433,13 @@ fn tab_bar_decorations(bar: RectF, tabs: &[TabGeom], style: &DecoStyle) -> Vec<D
         let line = style.edge_line;
         let active = tabs.iter().find(|t| t.active);
         // The active tab's accent colors the whole separator, tying the
-        // content area to the selected tab.
-        let edge = active.and_then(|a| a.accent).unwrap_or(default_edge);
+        // content area to the selected tab. While that tab waits for input
+        // the separator takes the waiting color with the door, so the line
+        // has no seam where it bends into the door.
+        let edge = match active {
+            Some(a) if a.waiting => style.waiting_edge,
+            _ => active.and_then(|a| a.accent).unwrap_or(default_edge),
+        };
         let y = if at_bottom {
             bar.min_y()
         } else {
@@ -1122,7 +1127,12 @@ impl crate::TermWindow {
                         ElementContent::Poly { .. } => unreachable!(),
                         ElementContent::Children(mut kids) => {
                             if self.config.show_close_tab_button_in_tabs {
-                                kids.push(make_x_button(&font, &metrics, &colors, tab_idx, active));
+                                kids.push(
+                                    make_x_button(&font, &metrics, &colors, tab_idx, active)
+                                        .reveal_on_parent_hover(
+                                            !active && self.config.tab_bar_close_button_on_hover,
+                                        ),
+                                );
                             }
                             if let Some(right) = &item.right_title {
                                 // Float the callback's right-hand suffix before
@@ -1397,22 +1407,7 @@ impl crate::TermWindow {
     /// while the pointer is over it (same test as `render_element`), when
     /// that fill is a plain color.
     fn tab_fill(&self, element: &ComputedElement) -> Option<LinearRgba> {
-        let hovering = element.hover_colors.is_some()
-            && match &self.current_mouse_event {
-                Some(event) => {
-                    let x = event.coords.x as f32;
-                    let y = event.coords.y as f32;
-                    x >= element.bounds.min_x()
-                        && x <= element.bounds.max_x()
-                        && y >= element.bounds.min_y()
-                        && y <= element.bounds.max_y()
-                }
-                None => false,
-            }
-            && matches!(
-                self.current_mouse_capture,
-                None | Some(crate::termwindow::MouseCapture::UI)
-            );
+        let hovering = element.hover_colors.is_some() && self.is_element_hovered(element);
         let colors = match (&element.hover_colors, hovering) {
             (Some(hover), true) => hover,
             _ => &element.colors,
@@ -1633,7 +1628,10 @@ mod decoration_tests {
         let decos = tab_bar_decorations(bar(), &tabs, &style(false));
         let orange = rects(&decos, ORANGE);
         assert!(orange.contains(&euclid::rect(15., 4., 90., 1.)));
-        assert!(!orange.iter().any(|r| r.min_y() >= 29.));
+        // Open towards the content: the separator stops at the posts.
+        assert!(!orange
+            .iter()
+            .any(|r| r.min_y() >= 29. && r.max_x() > 11. && r.min_x() < 109.));
         assert_eq!(
             arcs(&decos, ORANGE),
             vec![DecoCorner::TopLeft, DecoCorner::TopRight]
@@ -1748,11 +1746,11 @@ mod decoration_tests {
         );
         assert!(rects(&decos, BLUE).is_empty());
 
-        // A waiting active tab keeps the orange door; the separator keeps
-        // the accent.
+        // A waiting active tab turns the door and the separator orange.
         active.waiting = true;
         let decos = tab_bar_decorations(bar(), &[active], &style(false));
-        assert!(rects(&decos, ACCENT).contains(&euclid::rect(0., 29., 111., 1.)));
+        assert!(rects(&decos, ACCENT).is_empty());
+        assert!(rects(&decos, ORANGE).contains(&euclid::rect(0., 29., 111., 1.)));
         assert!(rects(&decos, ORANGE).contains(&euclid::rect(115., 4., 90., 1.)));
     }
 
@@ -1878,8 +1876,9 @@ mod decoration_tests {
         let decos = tab_bar_decorations(bar(), &[tab(110., true, true)], &flare_style(false));
         assert_eq!(arc_rects(&decos, ORANGE).len(), 2);
         assert!(arc_rects(&decos, BLUE).is_empty());
-        // The separator keeps the edge color.
-        assert!(rects(&decos, BLUE).contains(&euclid::rect(0., 27., 104., 3.)));
+        // The separator follows the door, so the flare has no color seam.
+        assert!(rects(&decos, BLUE).is_empty());
+        assert!(rects(&decos, ORANGE).contains(&euclid::rect(0., 27., 104., 3.)));
     }
 
     #[test]

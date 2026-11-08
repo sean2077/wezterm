@@ -220,6 +220,15 @@ impl From<LinearRgba> for ResolvedColor {
     }
 }
 
+/// A glyph painted on top of a Poly element while it is hovered, at the
+/// same size and position (e.g. the symbol inside a traffic light button).
+#[derive(Debug, Clone, Copy)]
+pub struct HoverOverlay {
+    pub poly: &'static [Poly],
+    pub line_width: isize,
+    pub color: LinearRgba,
+}
+
 #[derive(Debug, Clone)]
 pub struct Element {
     pub item_type: Option<UIItemType>,
@@ -233,6 +242,11 @@ pub struct Element {
     pub border_corners: Option<Corners>,
     pub colors: ElementColors,
     pub hover_colors: Option<ElementColors>,
+    /// Drawn over a Poly element's content while the pointer is over it.
+    pub hover_overlay: Option<HoverOverlay>,
+    /// Only render this element while its parent is hovered (the parent
+    /// needs hover_colors for its hover state to be known).
+    pub reveal_on_parent_hover: bool,
     pub font: Rc<LoadedFont>,
     pub content: ElementContent,
     pub presentation: Option<Presentation>,
@@ -256,6 +270,8 @@ impl Element {
             vertical_align: VerticalAlign::default(),
             colors: ElementColors::default(),
             hover_colors: None,
+            hover_overlay: None,
+            reveal_on_parent_hover: false,
             font: Rc::clone(font),
             content,
             presentation: None,
@@ -344,6 +360,16 @@ impl Element {
         self
     }
 
+    pub fn hover_overlay(mut self, overlay: Option<HoverOverlay>) -> Self {
+        self.hover_overlay = overlay;
+        self
+    }
+
+    pub fn reveal_on_parent_hover(mut self, reveal: bool) -> Self {
+        self.reveal_on_parent_hover = reveal;
+        self
+    }
+
     pub fn line_height(mut self, line_height: Option<f64>) -> Self {
         self.line_height = line_height;
         self
@@ -418,6 +444,8 @@ pub struct ComputedElement {
     pub border_corners: Option<PixelCorners>,
     pub colors: ElementColors,
     pub hover_colors: Option<ElementColors>,
+    pub hover_overlay: Option<HoverOverlay>,
+    pub reveal_on_parent_hover: bool,
     /// The outer bounds of the area enclosed by the padding
     pub padding: RectF,
     /// The outer bounds of the content
@@ -678,6 +706,8 @@ impl super::TermWindow {
                     border_corners,
                     colors: element.colors.clone(),
                     hover_colors: element.hover_colors.clone(),
+                    hover_overlay: element.hover_overlay,
+                    reveal_on_parent_hover: element.reveal_on_parent_hover,
                     bounds: rects.bounds,
                     border_rect: rects.border_rect,
                     padding: rects.padding,
@@ -791,6 +821,8 @@ impl super::TermWindow {
                     border_corners,
                     colors: element.colors.clone(),
                     hover_colors: element.hover_colors.clone(),
+                    hover_overlay: element.hover_overlay,
+                    reveal_on_parent_hover: element.reveal_on_parent_hover,
                     bounds: rects.bounds,
                     border_rect: rects.border_rect,
                     padding: rects.padding,
@@ -811,6 +843,8 @@ impl super::TermWindow {
                     border_corners,
                     colors: element.colors.clone(),
                     hover_colors: element.hover_colors.clone(),
+                    hover_overlay: element.hover_overlay,
+                    reveal_on_parent_hover: element.reveal_on_parent_hover,
                     bounds: rects.bounds,
                     border_rect: rects.border_rect,
                     padding: rects.padding,
@@ -833,27 +867,10 @@ impl super::TermWindow {
         let layer = gl_state.layer_for_zindex(element.zindex)?;
         let mut layers = layer.quad_allocator();
 
+        let hovering = self.is_element_hovered(element);
         let colors = match &element.hover_colors {
-            Some(hc) => {
-                let hovering =
-                    match &self.current_mouse_event {
-                        Some(event) => {
-                            let mouse_x = event.coords.x as f32;
-                            let mouse_y = event.coords.y as f32;
-                            mouse_x >= element.bounds.min_x()
-                                && mouse_x <= element.bounds.max_x()
-                                && mouse_y >= element.bounds.min_y()
-                                && mouse_y <= element.bounds.max_y()
-                        }
-                        None => false,
-                    } && matches!(self.current_mouse_capture, None | Some(MouseCapture::UI));
-                if hovering {
-                    hc
-                } else {
-                    &element.colors
-                }
-            }
-            None => &element.colors,
+            Some(hc) if hovering => hc,
+            _ => &element.colors,
         };
 
         self.render_element_background(element, colors, &mut layers, inherited_colors)?;
@@ -923,7 +940,11 @@ impl super::TermWindow {
             ComputedElementContent::Children(kids) => {
                 drop(layers);
 
+                let parent_hovered = element.hover_colors.is_some() && hovering;
                 for kid in kids {
+                    if kid.reveal_on_parent_hover && !parent_hovered {
+                        continue;
+                    }
                     self.render_element(kid, gl_state, Some(colors))?;
                 }
             }
@@ -939,11 +960,39 @@ impl super::TermWindow {
                         LinearRgba::TRANSPARENT,
                     )?;
                     self.resolve_text(colors, inherited_colors).apply(&mut quad);
+                    if let (Some(overlay), true) = (&element.hover_overlay, hovering) {
+                        // Layer 2 sits above the poly's layer 1.
+                        self.poly_quad(
+                            &mut layers,
+                            2,
+                            element.content_rect.origin,
+                            overlay.poly,
+                            overlay.line_width,
+                            euclid::size2(poly.width, poly.height),
+                            overlay.color,
+                        )?;
+                    }
                 }
             }
         }
 
         Ok(())
+    }
+
+    /// Whether the pointer is over `element` and the UI owns the mouse.
+    pub fn is_element_hovered(&self, element: &ComputedElement) -> bool {
+        let over = match &self.current_mouse_event {
+            Some(event) => {
+                let mouse_x = event.coords.x as f32;
+                let mouse_y = event.coords.y as f32;
+                mouse_x >= element.bounds.min_x()
+                    && mouse_x <= element.bounds.max_x()
+                    && mouse_y >= element.bounds.min_y()
+                    && mouse_y <= element.bounds.max_y()
+            }
+            None => false,
+        };
+        over && matches!(self.current_mouse_capture, None | Some(MouseCapture::UI))
     }
 
     fn resolve_text(
