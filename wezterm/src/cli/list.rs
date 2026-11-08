@@ -25,7 +25,16 @@ impl ListCommand {
         // window and tab iteration. Number them here rather than exposing the
         // internal mux ids as the only ordinal, so callers can line the output
         // up with the GUI's tab bar.
-        let mut window_index: HashMap<mux::window::WindowId, usize> = HashMap::new();
+        // Number windows by their stable WindowId order rather than by
+        // first-encounter order: the mux iterates windows from a HashMap, so
+        // first-encounter order can change between calls.
+        let mut window_ids: Vec<_> = panes.window_titles.keys().copied().collect();
+        window_ids.sort();
+        let window_index: HashMap<mux::window::WindowId, usize> = window_ids
+            .into_iter()
+            .enumerate()
+            .map(|(index, id)| (id, index))
+            .collect();
         let mut tab_index: HashMap<mux::window::WindowId, HashMap<mux::tab::TabId, usize>> =
             HashMap::new();
 
@@ -39,8 +48,7 @@ impl ListCommand {
                         .get(&entry.window_id)
                         .map(|s| s.as_str())
                         .unwrap_or("");
-                    let next_win = window_index.len();
-                    let win_idx = *window_index.entry(entry.window_id).or_insert(next_win);
+                    let win_idx = window_index.get(&entry.window_id).copied().unwrap_or(0);
                     let tabs = tab_index.entry(entry.window_id).or_default();
                     let next_tab = tabs.len();
                     let tab_idx = *tabs.entry(entry.tab_id).or_insert(next_tab);
