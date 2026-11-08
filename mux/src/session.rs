@@ -188,6 +188,14 @@ mod tests {
     }
 
     #[test]
+    fn restore_records_an_empty_base_argv() {
+        let info = restored_spawn_info(true, Vec::new(), Some("/tmp".to_string())).unwrap();
+        assert!(info.argv.is_empty());
+        assert_eq!(info.cwd.as_deref(), Some("/tmp"));
+        assert!(restored_spawn_info(false, vec!["sh".to_string()], None).is_none());
+    }
+
+    #[test]
     fn session_state_round_trips() {
         let state = SessionState {
             version: 1,
@@ -314,6 +322,22 @@ fn command_for(pane: &PaneState) -> Option<RestoreCommand> {
         command,
         base_argv: pane.argv.clone(),
         used_restore_argv,
+    })
+}
+
+/// Spawn info to record after restoring a pane.  When the pane was started
+/// from `agent.restore_argv`, the original spawn argv is recorded even when it
+/// is empty (the default-shell case): recording the replacement command would
+/// make the next save restore the old agent session again.
+fn restored_spawn_info(
+    used_restore_argv: bool,
+    base_argv: Vec<String>,
+    cwd: Option<String>,
+) -> Option<SpawnInfo> {
+    used_restore_argv.then(|| SpawnInfo {
+        argv: base_argv,
+        cwd,
+        env: BTreeMap::new(),
     })
 }
 
@@ -481,15 +505,18 @@ impl Mux {
                 match result {
                     Ok((tab, pane, window_id)) => {
                         tab.set_title(&saved_tab.title);
-                        if used_restore_argv && !base_argv.is_empty() {
-                            // Remember the pane's original spawn command, not
-                            // the replacement command, so repeated restore
-                            // cycles never accumulate arguments.
-                            pane.set_spawn_info(Some(SpawnInfo {
-                                argv: base_argv,
-                                cwd: saved_tab.pane.cwd.clone(),
-                                env: BTreeMap::new(),
-                            }));
+                        // Remember the pane's original spawn command, not the
+                        // replacement command, so repeated restore cycles
+                        // never accumulate arguments.  An empty base argv is
+                        // recorded as-is: it means "default shell", and
+                        // recording the replacement command would resurrect
+                        // the old session on the next save.
+                        if let Some(info) = restored_spawn_info(
+                            used_restore_argv,
+                            base_argv,
+                            saved_tab.pane.cwd.clone(),
+                        ) {
+                            pane.set_spawn_info(Some(info));
                         }
                         if current_window.is_none() {
                             current_window = Some(window_id);
