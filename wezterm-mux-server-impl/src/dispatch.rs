@@ -172,6 +172,9 @@ where
                     .await?;
                 stream.flush().await.context("flushing PDU to client")?;
             }
+            // Process-local: a remote GUI client has no PDU for this and is
+            // not expected to raise its OS window from a mux notification.
+            Ok(Item::Notif(MuxNotification::WindowActivationRequested(_))) => {}
             Ok(Item::Notif(MuxNotification::TabResized(tab_id))) => {
                 Pdu::TabResized(codec::TabResized { tab_id })
                     .encode_async(&mut stream, 0)

@@ -836,6 +836,12 @@ impl WindowOps for Window {
             // We only call this function in the window creation, so it should be fine.
             // See : https://stackoverflow.com/questions/10740346/setforegroundwindow-only-working-while-visual-studio-is-open
             unsafe {
+                // The synthetic Alt below is disruptive when the window already
+                // has focus (for example a CLI activation targeting the active
+                // window), so only do it when we actually need to raise it.
+                if GetForegroundWindow() == handle {
+                    return;
+                }
                 let alt_sc = MapVirtualKeyW(VK_MENU as u32, MAPVK_VK_TO_VSC);
 
                 let mut inputs: [INPUT; 2] = [

@@ -83,6 +83,10 @@ pub enum MuxNotification {
         window_id: WindowId,
     },
     PaneFocused(PaneId),
+    /// A client explicitly asked to activate a window (CLI activate-pane /
+    /// activate-tab / activate-window).  Unlike PaneFocused, this should raise
+    /// the GUI window that owns it.
+    WindowActivationRequested(WindowId),
     TabResized(TabId),
     TabTitleChanged {
         tab_id: TabId,

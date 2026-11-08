@@ -371,6 +371,11 @@ impl SessionHandler {
 
                             mux.record_focus_for_current_identity(pane_id);
                             mux.notify(mux::MuxNotification::PaneFocused(pane_id));
+                            // A CLI activation should also raise the owning
+                            // GUI window.  Ordinary in-app focus changes stay
+                            // local to the window and must not steal focus
+                            // from other applications.
+                            mux.notify(mux::MuxNotification::WindowActivationRequested(window_id));
 
                             Ok(Pdu::UnitResponse(UnitResponse {}))
                         },

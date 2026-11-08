@@ -1338,6 +1338,9 @@ impl TermWindow {
                     // Also handled by clientpane
                     self.update_title_post_status();
                 }
+                MuxNotification::WindowActivationRequested(_) => {
+                    // Handled by the frontend; nothing to do per window.
+                }
                 MuxNotification::TabResized(_) => {
                     // Also handled by wezterm-client
                     self.update_title_post_status();
@@ -1558,6 +1561,7 @@ impl TermWindow {
             | MuxNotification::WindowCreated(_)
             | MuxNotification::ActiveWorkspaceChanged(_)
             | MuxNotification::WorkspaceRenamed { .. }
+            | MuxNotification::WindowActivationRequested(_)
             | MuxNotification::Empty
             | MuxNotification::WindowWorkspaceChanged(_) => return true,
             MuxNotification::Alert {

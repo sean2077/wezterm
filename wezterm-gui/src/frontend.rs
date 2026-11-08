@@ -83,22 +83,20 @@ impl GuiFrontEnd {
                         if let Err(err) = mux.focus_pane_and_containing_tab(pane_id) {
                             log::error!("Error reconciling PaneFocused notification: {err:#}");
                         }
-                        // A CLI `activate-tab`/`activate-pane` only changes
-                        // the mux's active tab; bring the owning GUI window
-                        // to the foreground so the requested pane is actually
-                        // visible. Window focus is idempotent when the pane
-                        // was already focused from this window.
-                        if let Some((_, window_id, _)) = mux.resolve_pane_id(pane_id) {
-                            let fe = crate::frontend::front_end();
-                            let gui_window = fe
-                                .known_windows
-                                .borrow()
-                                .iter()
-                                .find(|(_, id)| **id == window_id)
-                                .map(|(window, _)| window.clone());
-                            if let Some(window) = gui_window {
-                                window.focus();
-                            }
+                    })
+                    .detach();
+                }
+                MuxNotification::WindowActivationRequested(window_id) => {
+                    promise::spawn::spawn_into_main_thread(async move {
+                        let fe = crate::frontend::front_end();
+                        let gui_window = fe
+                            .known_windows
+                            .borrow()
+                            .iter()
+                            .find(|(_, id)| **id == window_id)
+                            .map(|(window, _)| window.clone());
+                        if let Some(window) = gui_window {
+                            window.focus();
                         }
                     })
                     .detach();
