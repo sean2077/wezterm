@@ -9,6 +9,87 @@ use wezterm_font::LoadedFont;
 use window::color::LinearRgba;
 use window::{IntegratedTitleButton, IntegratedTitleButtonStyle as Style};
 
+/// A filled circle, used for the macOS-style traffic light buttons. The
+/// oval is given as a box whose center sits at `BlockCoord::One`, which the
+/// glyph rasterizer maps to the middle of the cell (`One - full + radius`).
+const CIRCLE: &[Poly] = &[Poly {
+    path: &[PolyCommand::Oval {
+        center: (BlockCoord::One, BlockCoord::One),
+        radiuses: (BlockCoord::Frac(1, 2), BlockCoord::Frac(1, 2)),
+    }],
+    intensity: BlockAlpha::Full,
+    style: PolyStyle::Fill,
+}];
+
+/// Diameter of a traffic light and the gap on each side of it.
+pub fn traffic_light_metrics(metrics: &RenderMetrics) -> (f32, f32) {
+    let diameter = (metrics.cell_size.height as f32 * 0.5).round().max(8.);
+    (diameter, (diameter * 0.45).round().max(2.))
+}
+
+/// Width a traffic light button element occupies.
+pub fn traffic_light_width(metrics: &RenderMetrics) -> f32 {
+    let (diameter, gap) = traffic_light_metrics(metrics);
+    diameter + 2. * gap
+}
+
+fn traffic_light_element(
+    window_button: IntegratedTitleButton,
+    font: &Rc<LoadedFont>,
+    metrics: &RenderMetrics,
+) -> Element {
+    let (diameter, gap) = traffic_light_metrics(metrics);
+    // macOS order and colors; hover brightens the same hue.
+    let (r, g, b) = match window_button {
+        IntegratedTitleButton::Close => (0xff, 0x5f, 0x57),
+        IntegratedTitleButton::Hide => (0xfe, 0xbc, 0x2e),
+        IntegratedTitleButton::Maximize => (0x28, 0xc8, 0x40),
+    };
+    let color = |boost: f32| -> LinearRgba {
+        let f = |c: u8| -> f32 {
+            let v = c as f32 / 255.;
+            (v + (1. - v) * boost).clamp(0., 1.)
+        };
+        window::color::SrgbaTuple(f(r), f(g), f(b), 1.).to_linear()
+    };
+    let colors = ElementColors {
+        border: BorderColor::default(),
+        bg: LinearRgba::TRANSPARENT.into(),
+        text: color(0.).into(),
+    };
+    Element::new(
+        font,
+        ElementContent::Poly {
+            line_width: 1,
+            poly: SizedPoly {
+                poly: CIRCLE,
+                width: Dimension::Pixels(diameter),
+                height: Dimension::Pixels(diameter),
+            },
+        },
+    )
+    .zindex(1)
+    .vertical_align(VerticalAlign::Middle)
+    .item_type(UIItemType::TabBar(TabBarItem::WindowButton(window_button)))
+    .padding(BoxDimension {
+        left: Dimension::Pixels(gap),
+        right: Dimension::Pixels(gap),
+        top: Dimension::Pixels(0.),
+        bottom: Dimension::Pixels(0.),
+    })
+    .margin(BoxDimension {
+        left: Dimension::Pixels(0.),
+        right: Dimension::Pixels(gap),
+        top: Dimension::Pixels(0.),
+        bottom: Dimension::Pixels(0.),
+    })
+    .colors(colors.clone())
+    .hover_colors(Some(ElementColors {
+        text: color(0.35).into(),
+        ..colors
+    }))
+}
+
 pub struct WindowButtonColors {
     pub colors: ElementColors,
     pub hover_colors: ElementColors,
@@ -224,7 +305,13 @@ pub fn window_button_element(
     let style = config.integrated_title_button_style;
 
     if style == Style::MacOsNative {
-        return Element::new(font, ElementContent::Text(String::new()));
+        // macOS draws real traffic lights in the window frame; elsewhere the
+        // fork draws its own so the buttons cost far less width than the
+        // Windows glyphs.
+        if cfg!(target_os = "macos") {
+            return Element::new(font, ElementContent::Text(String::new()));
+        }
+        return traffic_light_element(window_button, font, metrics);
     }
 
     let poly = {

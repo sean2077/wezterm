@@ -953,8 +953,11 @@ impl crate::TermWindow {
             .contains(window::WindowDecorations::INTEGRATED_BUTTONS)
             && (self.config.integrated_title_button_alignment
                 == IntegratedTitleButtonAlignment::Left
-                || self.config.integrated_title_button_style
-                    == IntegratedTitleButtonStyle::MacOsNative);
+                // macOS reserves space for its native traffic lights; the
+                // fork-drawn ones follow the configured alignment instead.
+                || (self.config.integrated_title_button_style
+                    == IntegratedTitleButtonStyle::MacOsNative
+                    && cfg!(target_os = "macos")));
         // The right status and the integrated window buttons float over the
         // tab strip, so the uniform tab share must leave room for them.
         let reserved_side_width: f32 = items
@@ -966,7 +969,16 @@ impl crate::TermWindow {
                     TabBarItem::WindowButton(_) => true,
                     _ => false,
                 };
-                occupies_side.then(|| item.title.len() as f32 * metrics.cell_size.width as f32)
+                occupies_side.then(|| match item.item {
+                    // Fork-drawn traffic lights are circles, not glyphs.
+                    TabBarItem::WindowButton(_)
+                        if self.config.integrated_title_button_style
+                            == IntegratedTitleButtonStyle::MacOsNative =>
+                    {
+                        crate::termwindow::render::window_buttons::traffic_light_width(&metrics)
+                    }
+                    _ => item.title.len() as f32 * metrics.cell_size.width as f32,
+                })
             })
             .sum::<f32>()
             // The status text and buttons render more compactly than a

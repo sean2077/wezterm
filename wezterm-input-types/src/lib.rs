@@ -2171,7 +2171,8 @@ impl FromDynamic for IntegratedTitleButtonStyle {
             let style = match string.as_str() {
                 "Windows" => Self::Windows,
                 "Gnome" => Self::Gnome,
-                "MacOsNative" if cfg!(target_os = "macos") => Self::MacOsNative,
+                // The fork paints its own traffic lights where the OS does not.
+                "MacOsNative" => Self::MacOsNative,
                 _ => {
                     return Err(wezterm_dynamic::Error::InvalidVariantForType {
                         variant_name: string.to_string(),

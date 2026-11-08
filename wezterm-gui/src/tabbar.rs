@@ -109,10 +109,7 @@ fn take_accent(items: Vec<FormatItem>) -> (Vec<FormatItem>, Option<SrgbaTuple>) 
 
 /// Split a FormatItem list at the first occurrence of `marker`, returning the
 /// items before it, the items after it, and whether the marker was present.
-fn split_marker(
-    items: Vec<FormatItem>,
-    marker: char,
-) -> (Vec<FormatItem>, Vec<FormatItem>, bool) {
+fn split_marker(items: Vec<FormatItem>, marker: char) -> (Vec<FormatItem>, Vec<FormatItem>, bool) {
     for (idx, item) in items.iter().enumerate() {
         if let FormatItem::Text(s) = item {
             if let Some(pos) = s.find(marker) {
@@ -136,7 +133,14 @@ fn split_marker(
 
 fn split_right(items: Vec<FormatItem>) -> (Vec<FormatItem>, Option<Vec<FormatItem>>) {
     let (left, right, found) = split_marker(items, RIGHT_MARKER);
-    (left, if found && !right.is_empty() { Some(right) } else { None })
+    (
+        left,
+        if found && !right.is_empty() {
+            Some(right)
+        } else {
+            None
+        },
+    )
 }
 
 fn call_format_tab_title(
@@ -752,8 +756,14 @@ impl TabBarState {
                 .clone(),
         );
 
+        // macOS draws the traffic lights itself; elsewhere the fork renders
+        // them, so the buttons go through the regular item path below.
+        let native_macos_buttons = config.integrated_title_button_style
+            == IntegratedTitleButtonStyle::MacOsNative
+            && cfg!(target_os = "macos");
+
         if use_integrated_title_buttons
-            && config.integrated_title_button_style == IntegratedTitleButtonStyle::MacOsNative
+            && native_macos_buttons
             && config.use_fancy_tab_bar == false
             && config.tab_bar_at_bottom == false
         {
@@ -764,7 +774,7 @@ impl TabBarState {
         }
 
         if use_integrated_title_buttons
-            && config.integrated_title_button_style != IntegratedTitleButtonStyle::MacOsNative
+            && !native_macos_buttons
             && config.integrated_title_button_alignment == IntegratedTitleButtonAlignment::Left
         {
             Self::integrated_title_buttons(mouse_x, &mut x, config, &mut items, &mut line, &colors);
@@ -881,7 +891,7 @@ impl TabBarState {
 
         // Reserve place for integrated title buttons
         let title_width = if use_integrated_title_buttons
-            && config.integrated_title_button_style != IntegratedTitleButtonStyle::MacOsNative
+            && !native_macos_buttons
             && config.integrated_title_button_alignment == IntegratedTitleButtonAlignment::Right
         {
             let window_hide =
@@ -951,7 +961,7 @@ impl TabBarState {
         }
 
         if use_integrated_title_buttons
-            && config.integrated_title_button_style != IntegratedTitleButtonStyle::MacOsNative
+            && !native_macos_buttons
             && config.integrated_title_button_alignment == IntegratedTitleButtonAlignment::Right
         {
             x = title_width;
