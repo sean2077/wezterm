@@ -13,6 +13,9 @@ impl crate::TermWindow {
         // when this is the soonest pending animation and rebuilds the tab bar
         // to advance the frame.
         self.update_next_frame_time(self.tab_bar.next_progress_frame_due());
+        // A waiting agent's TTL expiry has no event of its own; rebuild the
+        // bar then so the ring disappears even when nothing else changes.
+        self.update_next_frame_time(self.tab_bar.next_waiting_expiry());
 
         if self.config.use_fancy_tab_bar {
             if self.fancy_tab_bar.is_none() {

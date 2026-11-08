@@ -541,6 +541,14 @@ pub struct Config {
     )]
     pub tab_bar_tab_border_width: Dimension,
 
+    /// Seconds after which an `agent_state` value of the form
+    /// `waiting:<unix-epoch>` no longer lights the waiting ring, so a state
+    /// that was never cleared (for example a turn interrupted with Esc, which
+    /// fires no Stop hook) does not keep the ring up forever. Zero, the
+    /// default, disables the expiry; values without an epoch never expire.
+    #[dynamic(default)]
+    pub tab_bar_waiting_ttl_seconds: u64,
+
     /// Stroke width of the separator between the fancy tab bar and the
     /// terminal, and of the door it folds into around the active tab
     /// (drawn when colors.tab_bar.active_tab_edge is set). Zero, the

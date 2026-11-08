@@ -24,6 +24,11 @@ pub struct TabBarState {
     /// at which the tab bar should be rebuilt to advance to the next frame;
     /// None when no spinner is visible.
     next_progress_frame_due: Option<Instant>,
+    /// When a waiting agent's `agent_state` epoch reaches
+    /// `tab_bar_waiting_ttl_seconds`, the instant at which the tab bar should
+    /// be rebuilt so the waiting ring disappears even when nothing else
+    /// triggers a repaint. None when no waiting state is scheduled to expire.
+    next_waiting_expiry: Option<Instant>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -593,23 +598,60 @@ pub(crate) fn fancy_tab_metrics(
 
 /// `agent_state` is written as `state` or `state:<unix-epoch>` by the
 /// notification helpers. Only the state prefix matters for the tab ring.
-pub(crate) fn agent_state_is_waiting(value: &str) -> bool {
-    value.split(':').next() == Some("waiting")
+/// Epoch carried by an `agent_state` value such as `waiting:1762500000`.
+pub(crate) fn agent_state_epoch(value: &str) -> Option<u64> {
+    value
+        .split_once(':')
+        .and_then(|(_, epoch)| epoch.parse::<u64>().ok())
+}
+
+/// True when the value says the pane is waiting for input and its optional
+/// `:epoch` timestamp has not exceeded `ttl_seconds`.  A zero TTL disables the
+/// expiry (upstream behavior); a value without a numeric epoch never expires.
+pub(crate) fn agent_state_is_waiting(value: &str, now_epoch: u64, ttl_seconds: u64) -> bool {
+    let Some((state, epoch)) = value.split_once(':') else {
+        return value == "waiting";
+    };
+    if state != "waiting" {
+        return false;
+    }
+    let Ok(epoch) = epoch.parse::<u64>() else {
+        return true;
+    };
+    if ttl_seconds == 0 {
+        return true;
+    }
+    now_epoch < epoch.saturating_add(ttl_seconds)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{agent_state_is_waiting, take_accent, FormatColor, FormatItem, SrgbaTuple};
+    use super::{
+        agent_state_epoch, agent_state_is_waiting, take_accent, FormatColor, FormatItem, SrgbaTuple,
+    };
 
     #[test]
     fn detects_waiting_agent_state() {
-        assert!(agent_state_is_waiting("waiting"));
-        assert!(agent_state_is_waiting("waiting:1762500000"));
-        assert!(!agent_state_is_waiting("running:1762500000"));
-        assert!(!agent_state_is_waiting("done:1762500000"));
-        assert!(!agent_state_is_waiting("error:1762500000"));
-        assert!(!agent_state_is_waiting("waiting-room"));
-        assert!(!agent_state_is_waiting(""));
+        assert!(agent_state_is_waiting("waiting", 100, 0));
+        assert!(agent_state_is_waiting("waiting:1762500000", 100, 0));
+        assert!(agent_state_is_waiting("waiting:100", 100, 10));
+        assert!(agent_state_is_waiting("waiting:100", 109, 10));
+        assert!(!agent_state_is_waiting("waiting:100", 110, 10));
+        // A non-numeric epoch cannot be aged out.
+        assert!(agent_state_is_waiting("waiting:soon", 1000, 10));
+        assert!(agent_state_is_waiting("waiting:", 1000, 10));
+        assert!(!agent_state_is_waiting("running:1762500000", 100, 0));
+        assert!(!agent_state_is_waiting("done:1762500000", 100, 0));
+        assert!(!agent_state_is_waiting("error:1762500000", 100, 0));
+        assert!(!agent_state_is_waiting("waiting-room", 100, 0));
+        assert!(!agent_state_is_waiting("", 100, 0));
+    }
+
+    #[test]
+    fn extracts_the_agent_state_epoch() {
+        assert_eq!(agent_state_epoch("waiting:1762500000"), Some(1762500000));
+        assert_eq!(agent_state_epoch("waiting"), None);
+        assert_eq!(agent_state_epoch("waiting:soon"), None);
     }
 
     fn fg(s: &str) -> FormatItem {
@@ -675,6 +717,7 @@ impl TabBarState {
                 width: 1,
             }],
             next_progress_frame_due: None,
+            next_waiting_expiry: None,
         }
     }
 
@@ -688,6 +731,10 @@ impl TabBarState {
 
     pub fn next_progress_frame_due(&self) -> Option<Instant> {
         self.next_progress_frame_due
+    }
+
+    pub fn next_waiting_expiry(&self) -> Option<Instant> {
+        self.next_waiting_expiry
     }
 
     fn integrated_title_buttons(
@@ -795,6 +842,7 @@ impl TabBarState {
         right_status: &str,
         fancy_title_width: Option<usize>,
         fancy_tab: Option<&FancyTabMetrics>,
+        next_waiting_expiry: Option<Instant>,
     ) -> Self {
         let colors = colors.cloned().unwrap_or_else(TabBarColors::default);
 
@@ -1170,6 +1218,7 @@ impl TabBarState {
             line,
             items,
             next_progress_frame_due: has_indeterminate_progress.then(next_spinner_frame_due),
+            next_waiting_expiry,
         }
     }
 

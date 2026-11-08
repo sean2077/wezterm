@@ -15,7 +15,7 @@ use crate::scripting::guiwin::GuiWin;
 use crate::scrollbar::*;
 use crate::selection::Selection;
 use crate::shapecache::*;
-use crate::tabbar::{agent_state_is_waiting, TabBarItem, TabBarState};
+use crate::tabbar::{agent_state_epoch, agent_state_is_waiting, TabBarItem, TabBarState};
 use crate::termwindow::background::{
     load_background_image, reload_background_image, LoadedBackgroundLayer,
 };
@@ -2003,7 +2003,7 @@ impl TermWindow {
             Some(window) => window,
             _ => return,
         };
-        let tabs = self.get_tab_information();
+        let (tabs, next_waiting_expiry) = self.get_tab_information();
         let panes = self.get_pane_information();
         let active_tab = tabs.iter().find(|t| t.is_active).cloned();
         let active_pane = panes.iter().find(|p| p.is_active).cloned();
@@ -2081,6 +2081,7 @@ impl TermWindow {
             &self.right_status,
             fancy_title_width,
             fancy_tab_metrics.as_ref(),
+            next_waiting_expiry,
         );
         if new_tab_bar != self.tab_bar {
             self.tab_bar = new_tab_bar;
@@ -3526,11 +3527,19 @@ impl TermWindow {
         }
     }
 
-    fn pane_is_waiting_for_input(pane: &Arc<dyn Pane>) -> bool {
-        pane.copy_user_vars()
-            .get("agent_state")
-            .map(|value| agent_state_is_waiting(value))
-            .unwrap_or(false)
+    fn pane_waiting_state(
+        pane: &Arc<dyn Pane>,
+        now_epoch: u64,
+        ttl_seconds: u64,
+    ) -> (bool, Option<u64>) {
+        let vars = pane.copy_user_vars();
+        let Some(value) = vars.get("agent_state") else {
+            return (false, None);
+        };
+        (
+            agent_state_is_waiting(value, now_epoch, ttl_seconds),
+            agent_state_epoch(value),
+        )
     }
 
     fn pos_pane_to_pane_info(pos: &PositionedPane) -> PaneInformation {
@@ -3552,15 +3561,21 @@ impl TermWindow {
         }
     }
 
-    fn get_tab_information(&mut self) -> Vec<TabInformation> {
+    fn get_tab_information(&mut self) -> (Vec<TabInformation>, Option<Instant>) {
         let mux = Mux::get();
         let window = match mux.get_window(self.mux_window_id) {
             Some(window) => window,
-            _ => return vec![],
+            _ => return (vec![], None),
         };
         let tab_index = window.get_active_tab_idx();
+        let now_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+        let ttl_seconds = self.config.tab_bar_waiting_ttl_seconds;
+        let mut next_waiting_expiry: Option<Instant> = None;
 
-        window
+        let tabs = window
             .iter_tabs()
             .enumerate()
             .map(|(idx, tab)| {
@@ -3571,10 +3586,30 @@ impl TermWindow {
                 // `tab.panes` field respects zoom, so a waiting pane that is
                 // zoomed away lights the ring without changing the badge; the
                 // ring is meant to catch exactly that hidden case.
-                let agent_waiting = tab
-                    .iter_panes_ignoring_zoom()
-                    .into_iter()
-                    .any(|p| Self::pane_is_waiting_for_input(&p.pane));
+                let mut agent_waiting = false;
+                for positioned in tab.iter_panes_ignoring_zoom() {
+                    let (waiting, epoch) =
+                        Self::pane_waiting_state(&positioned.pane, now_epoch, ttl_seconds);
+                    if !waiting {
+                        continue;
+                    }
+                    agent_waiting = true;
+                    // Schedule a rebuild at the TTL boundary so the ring goes
+                    // away even when no other event repaints the bar.
+                    if ttl_seconds > 0 {
+                        if let Some(epoch) = epoch {
+                            let expiry = std::time::UNIX_EPOCH
+                                + std::time::Duration::from_secs(epoch.saturating_add(ttl_seconds));
+                            if let Ok(remaining) =
+                                expiry.duration_since(std::time::SystemTime::now())
+                            {
+                                let due = Instant::now() + remaining;
+                                next_waiting_expiry =
+                                    Some(next_waiting_expiry.map_or(due, |cur| cur.min(due)));
+                            }
+                        }
+                    }
+                }
 
                 TabInformation {
                     tab_index: idx,
@@ -3593,7 +3628,8 @@ impl TermWindow {
                     agent_waiting,
                 }
             })
-            .collect()
+            .collect();
+        (tabs, next_waiting_expiry)
     }
 
     fn get_pane_information(&self) -> Vec<PaneInformation> {
