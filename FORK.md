@@ -25,6 +25,7 @@
 | gui: ring tabs whose panes are waiting for input | 自用 | — | 上游提供按 user var 高亮标签栏边框的能力后可删 |
 | gui: outline the active tab and light up waiting tabs | 自用 | — | 上游提供活动 tab 门框/标签栏分隔线与按状态高亮的能力后可删 |
 | gui: color the tab bar separator with the active tab's accent | 自用 | — | 同上（依赖上一条） |
+| gui: draw macOS-style traffic light window buttons | 自用 | — | 上游在非 macOS 平台支持 `integrated_title_button_style = "MacOsNative"` 时可删 |
 | cli: report tab/window indices and focus the owning GUI window | 自用 | — | 上游的 `list` 输出索引且 `activate-*` 会前台化窗口后可删 |
 | mux: generic workspace save/restore and agent user vars | 自用 | — | 上游提供等价的 session persistence/CLI 后可删 |
 | gui: expose tab budgets, mergeable overrides, CWD links and status coalescing | 自用 | — | 上游提供等价 API 后可删 |
@@ -56,6 +57,8 @@
 `format-tab-title` 的第 6 个参数（`max_width`）在 fancy bar 下现在按标题字体宽度和 tab 数换算成真实预算，不再是恒定的 `tab_max_width`；第二遍渲染在 uniform 模式下会扣掉回调声明的左块和右浮动后缀/关闭按钮，把剩下的宽度当作标题块预算。回调可以用 U+001E 标记左块（索引/徽章）与标题块的分界。`window:set_config_override(key, value)` / `clear_config_override(key)` 用于增量修改 per-window override；hyperlink URI 中的 `$CWD` 在点击时展开为当前 pane 的工作目录；`update-status` / `update-right-status` 统一按 `status_update_interval` 调度，不再随高频标题变化每帧触发。
 
 `format-tab-title` 的返回值可以用 U+001F 分成左右两段：右段作为右浮动元素渲染在关闭按钮左侧。比例字体下标题文字的实际 advance 小于单元格预算，靠空格/EM SPACE 填充无法精确对齐；右浮动后缀不依赖字体宽度。
+
+`config.integrated_title_button_style = "MacOsNative"` 原本只在 macOS 生效（按钮由系统绘制），现在任何平台都接受该值：macOS 仍由系统绘制，其他平台由 fork 自绘三个圆点（关=红 `#ff5f57`、最小化=黄 `#febc2e`、最大化=绿 `#28c840`），顺序按 `integrated_title_buttons`，位置按 `integrated_title_button_alignment`（默认右侧），悬停时同色相提亮。圆点直径约为标题字体格高的一半（本机约 13px），三个合计约 60px，比 Windows 字形按钮（每个约 46px）窄一半以上，右侧状态栏因此多出约 70px。fancy 标签栏按实际像素宽度为它们预留空间（`reserved_side_width`），均分 tab 不会压到按钮下面。`window_buttons_at_left` 的「macOS 按钮总在左边」逻辑仍只对真正的 macOS 生效。
 
 `wezterm cli list` 增加 `tab_index`、`window_index`、`is_active_tab`（表格末尾的 `ACTIVE` 列）；新增 `wezterm cli activate-window --window-id <WINID>`，通过 `SetFocusedPane` 切到该窗口的活动 tab 并前台化。`ListPanesResponse` 增加了 `active_tab_ids` 字段，因此 `CODEC_VERSION` 升到 47；升级后需要重启所有 GUI 进程，避免新旧 codec 混用。
 
