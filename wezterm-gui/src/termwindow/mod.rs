@@ -2027,17 +2027,45 @@ impl TermWindow {
             None => false,
         };
 
-        let fancy_title_width = self.fonts.title_font().ok().map(|font| {
+        let title_metrics = self.fonts.title_font().ok().map(|font| {
             // Use the same metrics as build_fancy_tab_bar. font.metrics()
             // .cell_width is not the rendered title cell width for a
             // proportional font such as Segoe UI, and made the budget far too
             // small.
-            let metrics = crate::utilsprites::RenderMetrics::with_font_metrics(&font.metrics());
+            crate::utilsprites::RenderMetrics::with_font_metrics(&font.metrics())
+        });
+        let fancy_title_width = title_metrics.as_ref().map(|metrics| {
             let cell_width = (metrics.cell_size.width as f32).max(1.0);
             // dimensions.pixel_width is the physical tab-bar width used by the
             // layout; terminal_size.pixel_width is a logical/scaled value.
             (self.dimensions.pixel_width as f32 / cell_width) as usize
         });
+        let fancy_tab_metrics =
+            if self.config.use_fancy_tab_bar && self.config.tab_bar_uniform_width {
+                title_metrics.as_ref().map(|metrics| {
+                    let mouse_px = if hovering_in_tab_bar {
+                        self.current_mouse_event.as_ref().map(|event| {
+                            // The tab bar spans the client area inside the OS
+                            // border; coords are window pixels.
+                            (event.coords.x - border.left.get() as isize).max(0) as f32
+                        })
+                    } else {
+                        None
+                    };
+                    crate::tabbar::fancy_tab_metrics(
+                        &self.config,
+                        metrics,
+                        self.dimensions.dpi as f32,
+                        self.dimensions.pixel_width as f32,
+                        &self.left_status,
+                        &self.right_status,
+                        tabs.len(),
+                        mouse_px,
+                    )
+                })
+            } else {
+                None
+            };
         let new_tab_bar = TabBarState::new(
             self.dimensions.pixel_width / self.render_metrics.cell_size.width as usize,
             if hovering_in_tab_bar {
@@ -2052,6 +2080,7 @@ impl TermWindow {
             &self.left_status,
             &self.right_status,
             fancy_title_width,
+            fancy_tab_metrics.as_ref(),
         );
         if new_tab_bar != self.tab_bar {
             self.tab_bar = new_tab_bar;

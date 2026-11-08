@@ -86,10 +86,11 @@ pub fn traffic_light_metrics(metrics: &RenderMetrics) -> (f32, f32) {
     (diameter, (diameter * 0.40).round().max(2.))
 }
 
-/// Width a traffic light button element occupies.
+/// Width a traffic light button element occupies: the dot plus its left/right
+/// padding and the right margin set by `traffic_light_element`.
 pub fn traffic_light_width(metrics: &RenderMetrics) -> f32 {
     let (diameter, gap) = traffic_light_metrics(metrics);
-    diameter + 2. * gap
+    diameter + 3. * gap
 }
 
 fn traffic_light_element(

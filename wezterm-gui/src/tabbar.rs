@@ -1,5 +1,7 @@
+use crate::termwindow::render::window_buttons::traffic_light_width;
 use crate::termwindow::{PaneInformation, TabInformation, UIItem, UIItemType};
-use config::{ConfigHandle, TabBarColors};
+use crate::utilsprites::RenderMetrics;
+use config::{ConfigHandle, DimensionContext, TabBarColors};
 use finl_unicode::grapheme_clusters::Graphemes;
 use mlua::FromLua;
 use std::sync::LazyLock;
@@ -433,6 +435,162 @@ fn is_tab_hover(mouse_x: Option<usize>, x: usize, tab_title_len: usize) -> bool 
         .unwrap_or(false);
 }
 
+/// Width of the integrated window buttons drawn inside the tab bar, in
+/// pixels.  These are real elements, not characters, so they cannot be
+/// estimated in cells: a Windows glyph button is about four cells wide at
+/// 96 DPI and scales with the DPI.
+fn window_buttons_width(config: &ConfigHandle, metrics: &RenderMetrics, dpi: f32) -> f32 {
+    let count = config.integrated_title_buttons.len() as f32;
+    if count == 0. {
+        return 0.;
+    }
+    match config.integrated_title_button_style {
+        IntegratedTitleButtonStyle::MacOsNative => {
+            if cfg!(target_os = "macos") {
+                // Drawn in the native titlebar frame, outside the bar.
+                0.
+            } else {
+                count * traffic_light_width(metrics)
+            }
+        }
+        IntegratedTitleButtonStyle::Windows => {
+            // Matches window_buttons::windows::window_button_element:
+            // 10pt glyph, 17pt/18pt left padding, 18pt right padding, all
+            // scaled by 72/96 and then converted at the window DPI.
+            let scale = 72.0 / 96.0;
+            let px = |pt: f32| (pt * scale * dpi / 72.0).floor();
+            let glyph = px(10.);
+            let right = px(18.);
+            config
+                .integrated_title_buttons
+                .iter()
+                .map(|button| match button {
+                    IntegratedTitleButton::Hide => glyph + px(17.) + right,
+                    _ => glyph + px(18.) + right,
+                })
+                .sum()
+        }
+        IntegratedTitleButtonStyle::Gnome => {
+            // 8px glyph + 7px padding + 1px border + 7px margin on each side.
+            count * 38.
+        }
+    }
+}
+
+/// Widths of the fixed elements that share the fancy tab bar with the tabs.
+/// The tab layout (build_fancy_tab_bar) and the title budget / hover pass use
+/// the same numbers, so the callback's budget matches what is rendered.
+pub(crate) struct FancySideWidths {
+    /// Left group: leading padding, left status text and left-aligned window
+    /// buttons.  The tabs start after this.
+    pub left_px: f32,
+    /// Right status text and right-floated window buttons.
+    pub right_px: f32,
+    /// The new-tab (`+`) button, which also consumes bar space.
+    pub new_tab_px: f32,
+}
+
+pub(crate) fn fancy_side_widths(
+    config: &ConfigHandle,
+    metrics: &RenderMetrics,
+    dpi: f32,
+    left_status: &str,
+    right_status: &str,
+) -> FancySideWidths {
+    let cell = metrics.cell_size.width as f32;
+    let cell_h = metrics.cell_size.height as f32;
+    let ratio = (config.tab_bar_side_reserve_ratio as f32).clamp(0.0, 1.0);
+    // Status elements render as a text run with 0.5 cell of left padding.
+    let status_px = |text: &str| {
+        if text.is_empty() {
+            0.
+        } else {
+            (parse_status_text(text, CellAttributes::default()).len() as f32 * cell + 0.5 * cell)
+                * ratio
+        }
+    };
+    let integrated = config
+        .window_decorations
+        .contains(window::WindowDecorations::INTEGRATED_BUTTONS);
+    let buttons_px = if integrated {
+        window_buttons_width(config, metrics, dpi)
+    } else {
+        0.
+    };
+    let buttons_at_left = integrated
+        && config.integrated_title_button_alignment == IntegratedTitleButtonAlignment::Left
+        && !(config.integrated_title_button_style == IntegratedTitleButtonStyle::MacOsNative
+            && cfg!(target_os = "macos"));
+    // The left group always carries 0.5 cell of leading padding, except when
+    // the window buttons occupy that spot.
+    let leading = if buttons_at_left { 0. } else { 0.5 * cell };
+    let new_tab_px = if config.show_new_tab_button_in_tab_bar {
+        // Poly height/2 + 1 cell of horizontal padding + 2px border + 0.5 cell
+        // left margin, matching the NewTabButton element.
+        0.5 * cell_h + 1.5 * cell + 2.
+    } else {
+        0.
+    };
+    FancySideWidths {
+        left_px: leading + status_px(left_status) + if buttons_at_left { buttons_px } else { 0. },
+        right_px: status_px(right_status) + if buttons_at_left { 0. } else { buttons_px },
+        new_tab_px,
+    }
+}
+
+/// Everything the tab builder needs to compute exact budgets and hover ranges
+/// for uniform tabs.  All widths are pixels measured from the left edge of
+/// the tab bar.
+pub(crate) struct FancyTabMetrics {
+    /// Outer width each tab receives in uniform mode.
+    pub share_px: f32,
+    /// Title-font cell width.
+    pub cell_px: f32,
+    /// Tab border width in pixels.
+    pub border_px: f32,
+    /// Close-button element width when shown.
+    pub close_px: f32,
+    /// Where the first tab starts (the left group's width).
+    pub left_px: f32,
+    /// Mouse x in tab-bar pixels, when the pointer is on the bar row.
+    pub mouse_px: Option<f32>,
+}
+
+pub(crate) fn fancy_tab_metrics(
+    config: &ConfigHandle,
+    metrics: &RenderMetrics,
+    dpi: f32,
+    window_px: f32,
+    left_status: &str,
+    right_status: &str,
+    tab_count: usize,
+    mouse_px: Option<f32>,
+) -> FancyTabMetrics {
+    let cell_px = (metrics.cell_size.width as f32).max(1.);
+    let side = fancy_side_widths(config, metrics, dpi, left_status, right_status);
+    let uniform = (window_px - side.left_px - side.right_px - side.new_tab_px).max(0.);
+    let share_px = if tab_count > 0 {
+        (uniform / tab_count as f32).max(0.)
+    } else {
+        0.
+    };
+    let border_px = config
+        .tab_bar_tab_border_width
+        .evaluate_as_pixels(DimensionContext {
+            dpi,
+            pixel_max: window_px,
+            pixel_cell: cell_px,
+        });
+    FancyTabMetrics {
+        share_px,
+        cell_px,
+        border_px,
+        close_px: metrics.cell_size.height as f32 / 2.,
+        left_px: side.left_px,
+        mouse_px,
+    }
+}
+
 /// `agent_state` is written as `state` or `state:<unix-epoch>` by the
 /// notification helpers. Only the state prefix matters for the tab ring.
 pub(crate) fn agent_state_is_waiting(value: &str) -> bool {
@@ -636,6 +794,7 @@ impl TabBarState {
         left_status: &str,
         right_status: &str,
         fancy_title_width: Option<usize>,
+        fancy_tab: Option<&FancyTabMetrics>,
     ) -> Self {
         let colors = colors.cloned().unwrap_or_else(TabBarColors::default);
 
@@ -679,37 +838,45 @@ impl TabBarState {
         // window size; use the title font's cell width to turn the real window
         // width into a title-cell budget.
         let first_pass_max = if config.use_fancy_tab_bar {
-            // The title budget must exclude the left/right status text and
-            // the integrated window buttons; otherwise the padded title is
-            // wider than the actual tab and gets truncated.
-            let status_cells = parse_status_text(left_status, CellAttributes::default()).len()
-                + parse_status_text(right_status, CellAttributes::default()).len();
-            let window_buttons = if config
-                .window_decorations
-                .contains(window::WindowDecorations::INTEGRATED_BUTTONS)
-            {
-                3
+            if config.tab_bar_uniform_width {
+                if let Some(fancy) = fancy_tab {
+                    // Uniform tabs: the real per-tab share in title cells.
+                    // The second pass charges padding, borders, the close
+                    // button and the right suffix exactly.
+                    let share_cells = (fancy.share_px / fancy.cell_px).floor() as usize;
+                    share_cells.saturating_sub(2).max(1)
+                } else {
+                    fancy_title_width.unwrap_or(config.tab_max_width).max(1)
+                }
             } else {
-                0
-            };
-            let close_button = if config.show_close_tab_button_in_tabs {
-                3
-            } else {
-                0
-            };
-            // Match the 0.6 side-reserve factor used by the fancy layout, plus
-            // roughly the new-tab button. Under uniform tabs the close button
-            // floats on the right and is charged to the title budget by the
-            // second pass (which knows the real left/right block widths), so
-            // don't reserve it a second time here.
-            let uniform = config.tab_bar_uniform_width;
-            let reserved = (((status_cells + window_buttons) as f32)
-                * (config.tab_bar_side_reserve_ratio as f32).clamp(0.0, 1.0))
-                as usize
-                + 2
-                + if uniform { 0 } else { close_button };
-            let width = fancy_title_width.unwrap_or(config.tab_max_width);
-            (width.saturating_sub(reserved) / number_of_tabs.max(1)).max(1)
+                // The title budget must exclude the left/right status text and
+                // the integrated window buttons; otherwise the padded title is
+                // wider than the actual tab and gets truncated.
+                let status_cells = parse_status_text(left_status, CellAttributes::default()).len()
+                    + parse_status_text(right_status, CellAttributes::default()).len();
+                let window_buttons = if config
+                    .window_decorations
+                    .contains(window::WindowDecorations::INTEGRATED_BUTTONS)
+                {
+                    3
+                } else {
+                    0
+                };
+                let close_button = if config.show_close_tab_button_in_tabs {
+                    3
+                } else {
+                    0
+                };
+                // Match the 0.6 side-reserve factor used by the fancy layout,
+                // plus roughly the new-tab button.
+                let reserved = (((status_cells + window_buttons) as f32)
+                    * (config.tab_bar_side_reserve_ratio as f32).clamp(0.0, 1.0))
+                    as usize
+                    + 2
+                    + close_button;
+                let width = fancy_title_width.unwrap_or(config.tab_max_width);
+                (width.saturating_sub(reserved) / number_of_tabs.max(1)).max(1)
+            }
         } else {
             config.tab_max_width
         };
@@ -795,23 +962,49 @@ impl TabBarState {
             line.append_line(left_status_line, SEQ_ZERO);
         }
 
+        // Uniform tabs have a fixed pixel share; track their true on-screen range so
+        // hover does not rely on title-cell counts.
+        let mut tab_x_px = fancy_tab.map(|fancy| fancy.left_px).unwrap_or(0.);
+
         for (tab_idx, tab_title) in tab_titles.iter().enumerate() {
             let tab_title_len = tab_title.len.min(tab_width_max);
             let active = tab_idx == active_tab_no;
-            let hover = !active && is_tab_hover(mouse_x, x, tab_title_len);
+            let hover = !active
+                && match fancy_tab {
+                    Some(fancy) if config.use_fancy_tab_bar && config.tab_bar_uniform_width => {
+                        fancy.mouse_px.map_or(false, |mouse| {
+                            mouse >= tab_x_px && mouse < tab_x_px + fancy.share_px
+                        })
+                    }
+                    _ => is_tab_hover(mouse_x, x, tab_title_len),
+                };
 
             // Recompute the title so that it factors in both the hover state
             // and the adjusted maximum tab width based on available space.
             // Under uniform tabs the callback marks its fixed left block with
-            // U+001E; the rest of the share, minus that block and the
-            // right-floated suffix/close button, is the title's budget.
-            let second_pass_max = if config.use_fancy_tab_bar && config.tab_bar_uniform_width {
-                let right_cells = tab_title.right.as_ref().map(|r| r.len()).unwrap_or(0);
-                tab_width_max
-                    .saturating_sub(tab_title.left_len + right_cells + 2)
-                    .max(1)
-            } else {
-                tab_title_len
+            // U+001E; the share's content box, minus that block, the floated
+            // suffix and the close button, is the title's exact budget in
+            // title-font cells.  The same cells cap the rendered line, so the
+            // ellipsis is not clipped by a stricter cell count.
+            let (second_pass_max, line_cap) = match fancy_tab {
+                Some(fancy) if config.use_fancy_tab_bar && config.tab_bar_uniform_width => {
+                    let right_px = tab_title.right.as_ref().map(|r| r.len()).unwrap_or(0) as f32
+                        * fancy.cell_px;
+                    let close_px = if config.show_close_tab_button_in_tabs {
+                        fancy.close_px
+                    } else {
+                        0.
+                    };
+                    let content_px =
+                        (fancy.share_px - fancy.cell_px - 2. * fancy.border_px).max(0.);
+                    let inline_px = (content_px - close_px - right_px).max(0.);
+                    let inline_cells = (inline_px / fancy.cell_px).floor() as usize;
+                    (
+                        inline_cells.saturating_sub(tab_title.left_len).max(1),
+                        inline_cells.max(1),
+                    )
+                }
+                _ => (tab_title_len, tab_width_max),
             };
             let tab_title = compute_tab_title(
                 &tab_info[tab_idx],
@@ -845,8 +1038,8 @@ impl TabBarState {
             );
 
             let title = tab_line.clone();
-            if tab_line.len() > tab_width_max {
-                tab_line.resize(tab_width_max, SEQ_ZERO);
+            if tab_line.len() > line_cap {
+                tab_line.resize(line_cap, SEQ_ZERO);
             }
 
             let width = tab_line.len();
@@ -863,6 +1056,11 @@ impl TabBarState {
 
             line.append_line(tab_line, SEQ_ZERO);
             x += width;
+            if let Some(fancy) = fancy_tab {
+                if config.use_fancy_tab_bar && config.tab_bar_uniform_width {
+                    tab_x_px += fancy.share_px;
+                }
+            }
         }
 
         // New tab button

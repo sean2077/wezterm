@@ -996,13 +996,6 @@ impl crate::TermWindow {
             .iter()
             .filter(|item| matches!(item.item, TabBarItem::Tab { .. }))
             .count() as f32;
-        let new_tab_width = if self.config.show_new_tab_button_in_tab_bar {
-            // Mirror NewTabButton's poly width, horizontal padding
-            // (0.5 + 0.5 cells), 1px borders and left margin (0.5 cell).
-            metrics.cell_size.height as f32 * 0.5 + metrics.cell_size.width as f32 * 1.5 + 2.
-        } else {
-            0.
-        };
         let window_buttons_at_left = self
             .config
             .window_decorations
@@ -1015,33 +1008,18 @@ impl crate::TermWindow {
                     == IntegratedTitleButtonStyle::MacOsNative
                     && cfg!(target_os = "macos")));
         // The right status and the integrated window buttons float over the
-        // tab strip, so the uniform tab share must leave room for them.
-        let reserved_side_width: f32 = items
-            .iter()
-            .filter_map(|item| {
-                let occupies_side = match item.item {
-                    TabBarItem::LeftStatus => true,
-                    TabBarItem::RightStatus => true,
-                    TabBarItem::WindowButton(_) => true,
-                    _ => false,
-                };
-                occupies_side.then(|| match item.item {
-                    // Fork-drawn traffic lights are circles, not glyphs.
-                    TabBarItem::WindowButton(_)
-                        if self.config.integrated_title_button_style
-                            == IntegratedTitleButtonStyle::MacOsNative =>
-                    {
-                        crate::termwindow::render::window_buttons::traffic_light_width(&metrics)
-                    }
-                    _ => item.title.len() as f32 * metrics.cell_size.width as f32,
-                })
-            })
-            .sum::<f32>()
-            // The status text and buttons render more compactly than a
-            // character-cell estimate; reserving the full estimate leaves a
-            // visible gap. The ratio is configurable so it can be tuned
-            // without rebuilding the fork.
-            * (self.config.tab_bar_side_reserve_ratio as f32).clamp(0.0, 1.0);
+        // tab strip, so the uniform tab share must leave room for them.  The
+        // widths come from the same helper the title budget uses, so the
+        // reserved space and the callback's budget cannot disagree.
+        let side = crate::tabbar::fancy_side_widths(
+            &self.config,
+            &metrics,
+            self.dimensions.dpi as f32,
+            &self.left_status,
+            &self.right_status,
+        );
+        let new_tab_width = side.new_tab_px;
+        let reserved_side_width = side.left_px + side.right_px;
         let uniform_width =
             (self.dimensions.pixel_width as f32 - reserved_side_width - new_tab_width).max(0.);
         let max_tab_width = if self.config.tab_bar_uniform_width && tab_count > 0. {
@@ -1161,8 +1139,7 @@ impl crate::TermWindow {
         }
 
         let left_padding = if window_buttons_at_left {
-            if self.config.integrated_title_button_style
-                == IntegratedTitleButtonStyle::MacOsNative
+            if self.config.integrated_title_button_style == IntegratedTitleButtonStyle::MacOsNative
                 && cfg!(target_os = "macos")
             {
                 // Only macOS draws its traffic lights in the window frame at
