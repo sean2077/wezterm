@@ -17,16 +17,27 @@
 //! spawn-info env is not captured today, so it is always empty.
 //!
 //! This keeps the native implementation reusable for any terminal program.
+//!
+//! Session version 2 stores every pane of a tab together with the split tree
+//! (direction, per-child sizes, preorder pane list); version 1 snapshots are
+//! still read and are treated as single-pane tabs.  Restore rebuilds splits
+//! top-down through the normal mux split path, so no additional PDU or codec
+//! change is involved.
 
-use crate::pane::{CachePolicy, PaneId};
+use crate::domain::SplitSource;
+use crate::pane::{CachePolicy, Pane, PaneId};
+use crate::tab::{SplitDirection, SplitRequest, SplitSize, TabLayoutNode};
 use crate::Mux;
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use config::keyassignment::SpawnTabDomain;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use wezterm_term::TerminalSize;
 
 pub const AGENT_RESTORE_ARGV: &str = "agent.restore_argv";
 /// Obsolete append-style resume variable; ignored on restore.
@@ -53,11 +64,45 @@ pub struct PaneState {
     pub user_vars: BTreeMap<String, String>,
 }
 
+/// Pane layout for version 2 sessions.  `Leaf` indexes into `TabState.panes`,
+/// which is stored in preorder: the first/left/top subtree before the
+/// second/right/bottom one, matching the order in which restore spawns panes.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum LayoutNode {
+    Leaf(usize),
+    Split {
+        direction: SplitDirection,
+        first_size: TerminalSize,
+        second_size: TerminalSize,
+        first: Box<LayoutNode>,
+        second: Box<LayoutNode>,
+    },
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TabState {
     pub title: String,
-    pub active_tab: usize,
-    pub pane: PaneState,
+    /// Version 1's single-pane form.  Version 2 writes `panes` instead; the
+    /// field stays optional so old snapshots keep parsing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane: Option<PaneState>,
+    /// Every pane in the tab, in layout preorder.
+    #[serde(default)]
+    pub panes: Vec<PaneState>,
+    /// Absent for a single-pane tab.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout: Option<LayoutNode>,
+    /// Index into `panes` of the active pane.  When `zoomed` is set this is
+    /// the zoomed pane, because zoom is what the viewer sees.
+    #[serde(default)]
+    pub active_pane: usize,
+    /// Whether the active pane was zoomed when saved.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub zoomed: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -101,7 +146,7 @@ pub struct CloseSummary {
 impl SessionState {
     pub fn new() -> Self {
         Self {
-            version: 1,
+            version: 2,
             created_at: Utc::now().to_rfc3339(),
             windows: Vec::new(),
         }
@@ -142,7 +187,10 @@ mod tests {
     fn restore_argv_replaces_the_command() {
         let pane = pane_with_vars(
             &["zsh", "-i"],
-            &[(AGENT_RESTORE_ARGV, r#"["zsh","-i","-c","claude --resume 123"]"#)],
+            &[(
+                AGENT_RESTORE_ARGV,
+                r#"["zsh","-i","-c","claude --resume 123"]"#,
+            )],
         );
         let command = command_for(&pane).unwrap();
         assert!(command.used_restore_argv);
@@ -198,27 +246,189 @@ mod tests {
     #[test]
     fn session_state_round_trips() {
         let state = SessionState {
-            version: 1,
+            version: 2,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             windows: vec![WindowState {
                 workspace: "default".to_string(),
                 active_tab: 0,
                 tabs: vec![TabState {
                     title: "tab".to_string(),
-                    active_tab: 0,
-                    pane: PaneState {
+                    pane: None,
+                    panes: vec![PaneState {
                         cwd: Some("/tmp".to_string()),
                         argv: vec!["sh".to_string()],
                         env: BTreeMap::new(),
                         title: "sh".to_string(),
                         user_vars: BTreeMap::new(),
-                    },
+                    }],
+                    layout: None,
+                    active_pane: 0,
+                    zoomed: false,
                 }],
             }],
         };
         let encoded = serde_json::to_string(&state).unwrap();
+        // Version 2 writes `panes`, not the version 1 `pane` key.
+        assert!(encoded.contains("\"panes\""));
+        assert!(!encoded.contains("\"pane\""));
         let decoded: SessionState = serde_json::from_str(&encoded).unwrap();
         assert_eq!(state, decoded);
+    }
+
+    #[test]
+    fn layout_uses_the_documented_json_shape() {
+        let layout = LayoutNode::Split {
+            direction: SplitDirection::Vertical,
+            first_size: TerminalSize {
+                cols: 60,
+                rows: 40,
+                pixel_width: 0,
+                pixel_height: 0,
+                dpi: 0,
+            },
+            second_size: TerminalSize {
+                cols: 60,
+                rows: 10,
+                pixel_width: 0,
+                pixel_height: 0,
+                dpi: 0,
+            },
+            first: Box::new(LayoutNode::Leaf(0)),
+            second: Box::new(LayoutNode::Leaf(1)),
+        };
+        let value = serde_json::to_value(&layout).unwrap();
+        assert_eq!(value["Split"]["direction"], "Vertical");
+        assert_eq!(value["Split"]["first"], serde_json::json!({"Leaf": 0}));
+        assert_eq!(value["Split"]["second"], serde_json::json!({"Leaf": 1}));
+        assert_eq!(value["Split"]["first_size"]["cols"], 60);
+    }
+
+    #[test]
+    fn version_1_snapshot_normalizes_to_a_single_pane_tab() {
+        let dir = std::env::temp_dir().join(format!("wezterm-session-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("v1.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "version": 1,
+                "created_at": "2026-01-01T00:00:00Z",
+                "windows": [{
+                    "workspace": "default",
+                    "active_tab": 0,
+                    "tabs": [{
+                        "title": "old",
+                        "active_tab": 0,
+                        "pane": {"cwd": "/tmp", "argv": ["sh"], "title": "sh"}
+                    }]
+                }]
+            }"#,
+        )
+        .unwrap();
+        let state = read_json(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let tab = &state.windows[0].tabs[0];
+        assert_eq!(tab.panes.len(), 1);
+        assert_eq!(tab.panes[0].argv, vec!["sh".to_string()]);
+        assert!(tab.pane.is_none());
+        assert!(tab.layout.is_none());
+        assert_eq!(tab.active_pane, 0);
+        assert!(!tab.zoomed);
+    }
+
+    fn leaf(index: usize) -> LayoutNode {
+        LayoutNode::Leaf(index)
+    }
+
+    fn split(first: LayoutNode, second: LayoutNode) -> LayoutNode {
+        LayoutNode::Split {
+            direction: SplitDirection::Horizontal,
+            first_size: TerminalSize {
+                cols: 10,
+                rows: 5,
+                pixel_width: 0,
+                pixel_height: 0,
+                dpi: 0,
+            },
+            second_size: TerminalSize {
+                cols: 20,
+                rows: 5,
+                pixel_width: 0,
+                pixel_height: 0,
+                dpi: 0,
+            },
+            first: Box::new(first),
+            second: Box::new(second),
+        }
+    }
+
+    #[test]
+    fn pruning_collapses_a_split_with_one_remaining_side() {
+        let tree = split(leaf(0), split(leaf(1), leaf(2)));
+        let pruned = prune_layout(&tree, &|index| index != 1).unwrap();
+        // Leaf 1's split collapses to leaf 2, which takes its place.
+        match pruned {
+            LayoutNode::Split { second, .. } => {
+                assert_eq!(*second, leaf(2));
+            }
+            other => panic!("expected a split, got {:?}", other),
+        }
+        assert_eq!(prune_layout(&tree, &|_| false), None);
+        assert_eq!(
+            prune_layout(&tree, &|_| true).unwrap(),
+            tree,
+            "nothing pruned keeps the tree"
+        );
+    }
+
+    #[test]
+    fn compacting_renumbers_leaves_in_preorder() {
+        let tree = split(split(leaf(0), leaf(2)), leaf(3));
+        let slots = vec![
+            Some(pane_with_vars(&["a"], &[])),
+            None,
+            Some(pane_with_vars(&["b"], &[])),
+            Some(pane_with_vars(&["c"], &[])),
+        ];
+        let pruned = prune_layout(&tree, &|index| {
+            slots.get(index).is_some_and(|s| s.is_some())
+        })
+        .unwrap();
+        let mut mapping = HashMap::new();
+        let mut panes = Vec::new();
+        let compacted = compact_layout(&pruned, &slots, &mut mapping, &mut panes);
+        assert_eq!(panes.len(), 3);
+        assert_eq!(mapping.get(&0), Some(&0));
+        assert_eq!(mapping.get(&2), Some(&1));
+        assert_eq!(mapping.get(&3), Some(&2));
+        match compacted {
+            LayoutNode::Split { first, second, .. } => {
+                assert_eq!(*second, leaf(2));
+                match *first {
+                    LayoutNode::Split { first, second, .. } => {
+                        assert_eq!(*first, leaf(0));
+                        assert_eq!(*second, leaf(1));
+                    }
+                    other => panic!("expected a nested split, got {:?}", other),
+                }
+            }
+            other => panic!("expected a split, got {:?}", other),
+        }
+        assert_eq!(panes[0].argv, vec!["a".to_string()]);
+        assert_eq!(panes[1].argv, vec!["b".to_string()]);
+    }
+
+    #[test]
+    fn split_sizes_prefer_exact_cells_and_fall_back_to_percent() {
+        // Same node size: exact cell count.
+        assert_eq!(split_size_for(31, 10, 20), Some(SplitSize::Cells(20)));
+        // A shrunken node keeps the proportion.
+        assert_eq!(split_size_for(15, 10, 20), Some(SplitSize::Percent(65)));
+        // Too small on either side: collapse instead of a zero-size pane.
+        assert_eq!(split_size_for(2, 10, 20), None);
+        assert_eq!(split_size_for(10, 0, 9), None);
+        // A 3-cell node keeps one cell on each side.
+        assert_eq!(split_size_for(3, 10, 20), Some(SplitSize::Percent(65)));
     }
 }
 
@@ -253,17 +463,46 @@ fn write_json(path: &Path, state: &SessionState) -> Result<()> {
     Ok(())
 }
 
+fn normalize_state(state: &mut SessionState) {
+    for window in &mut state.windows {
+        for tab in &mut window.tabs {
+            if tab.panes.is_empty() {
+                // Version 1: exactly one pane in `pane`.
+                if let Some(pane) = tab.pane.take() {
+                    tab.panes.push(pane);
+                }
+                tab.layout = None;
+                tab.active_pane = 0;
+                tab.zoomed = false;
+            } else if tab.layout.is_none() && tab.panes.len() > 1 {
+                // A layout-less multi-pane tab cannot describe its
+                // arrangement; keep the first pane rather than silently
+                // opening every pane on top of each other.
+                log::warn!(
+                    "restore workspace: tab {:?} has {} panes but no layout; keeping the first",
+                    tab.title,
+                    tab.panes.len()
+                );
+                tab.panes.truncate(1);
+                tab.active_pane = 0;
+                tab.zoomed = false;
+            }
+        }
+    }
+}
+
 fn read_json(path: &Path) -> Result<SessionState> {
     let data = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-    let state: SessionState = serde_json::from_slice(&data)
+    let mut state: SessionState = serde_json::from_slice(&data)
         .with_context(|| format!("parsing workspace {}", path.display()))?;
-    if state.version != 1 {
+    if state.version != 1 && state.version != 2 {
         return Err(anyhow!(
             "unsupported workspace version {} in {}",
             state.version,
             path.display()
         ));
     }
+    normalize_state(&mut state);
     Ok(state)
 }
 
@@ -297,10 +536,21 @@ struct RestoreCommand {
 
 fn command_for(pane: &PaneState) -> Option<RestoreCommand> {
     if pane.user_vars.contains_key(AGENT_RESUME_ARGS) {
-        log::warn!(
-            "restore workspace: ignoring obsolete {AGENT_RESUME_ARGS} (use {AGENT_RESTORE_ARGV}): argv={:?}",
-            pane.argv
-        );
+        // Both vars are present on snapshots written during the transition:
+        // restore_argv wins, so the obsolete one is just debug noise. Warn
+        // only when it is the only metadata, because then the session cannot
+        // resume.
+        if pane.user_vars.contains_key(AGENT_RESTORE_ARGV) {
+            log::debug!(
+                "restore workspace: ignoring obsolete {AGENT_RESUME_ARGS}: argv={:?}",
+                pane.argv
+            );
+        } else {
+            log::warn!(
+                "restore workspace: ignoring obsolete {AGENT_RESUME_ARGS} (use {AGENT_RESTORE_ARGV}): argv={:?}",
+                pane.argv
+            );
+        }
     }
     let replacement = restore_argv(&pane.user_vars);
     let used_restore_argv = replacement.is_some();
@@ -341,6 +591,267 @@ fn restored_spawn_info(
     })
 }
 
+/// Serializable state for one pane, or `None` when the pane has no local
+/// spawn command (ssh/tmux); such panes are pruned instead of being silently
+/// replaced by the default shell.
+fn pane_state(pane: &Arc<dyn Pane>) -> Option<PaneState> {
+    let spawn = pane.get_spawn_info()?;
+    let cwd = pane
+        .get_current_working_dir(CachePolicy::AllowStale)
+        .as_ref()
+        .and_then(path_string)
+        .or_else(|| spawn.cwd.clone());
+    let user_vars = pane
+        .copy_user_vars()
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+    Some(PaneState {
+        cwd,
+        argv: spawn.argv.clone(),
+        env: spawn.env.clone(),
+        title: pane.get_title(),
+        user_vars,
+    })
+}
+
+/// Convert a tab's pane tree into a serializable layout.  Leaf indices are the
+/// tab's topological pane indices (the same ones `iter_panes_ignoring_zoom`
+/// reports), so active/zoom indices line up before pruning.
+fn layout_to_state(
+    node: &TabLayoutNode,
+    index_of: &HashMap<PaneId, usize>,
+    panes: &mut Vec<Option<PaneState>>,
+    skipped: &mut usize,
+) -> LayoutNode {
+    match node {
+        TabLayoutNode::Leaf { pane } => {
+            let index = *index_of
+                .get(&pane.pane_id())
+                .expect("a layout pane belongs to its tab");
+            let state = pane_state(pane);
+            if state.is_none() {
+                *skipped += 1;
+                log::warn!(
+                    "save workspace: skipping pane {}; it has no local spawn command",
+                    pane.pane_id()
+                );
+            }
+            if panes.len() <= index {
+                panes.resize(index + 1, None);
+            }
+            panes[index] = state;
+            LayoutNode::Leaf(index)
+        }
+        TabLayoutNode::Split {
+            direction,
+            first_size,
+            second_size,
+            first_node,
+            second_node,
+        } => {
+            let first = layout_to_state(first_node, index_of, panes, skipped);
+            let second = layout_to_state(second_node, index_of, panes, skipped);
+            LayoutNode::Split {
+                direction: *direction,
+                first_size: *first_size,
+                second_size: *second_size,
+                first: Box::new(first),
+                second: Box::new(second),
+            }
+        }
+    }
+}
+
+/// Drop leaves whose panes cannot be restored.  A split with one remaining
+/// side collapses to that side (which then fills the whole node area); a split
+/// with none is dropped.  This keeps every leaf in the saved file local.
+fn prune_layout<F>(node: &LayoutNode, keep: &F) -> Option<LayoutNode>
+where
+    F: Fn(usize) -> bool,
+{
+    match node {
+        LayoutNode::Leaf(index) => keep(*index).then_some(LayoutNode::Leaf(*index)),
+        LayoutNode::Split {
+            direction,
+            first_size,
+            second_size,
+            first,
+            second,
+        } => match (prune_layout(first, keep), prune_layout(second, keep)) {
+            (Some(first), Some(second)) => Some(LayoutNode::Split {
+                direction: *direction,
+                first_size: *first_size,
+                second_size: *second_size,
+                first: Box::new(first),
+                second: Box::new(second),
+            }),
+            (Some(node), None) | (None, Some(node)) => Some(node),
+            (None, None) => None,
+        },
+    }
+}
+
+/// Renumber surviving leaves to compact preorder indices and copy their pane
+/// states into `panes`.  `mapping` maps the old topological index to the new
+/// one for active/zoom lookup.
+fn compact_layout(
+    node: &LayoutNode,
+    slots: &[Option<PaneState>],
+    mapping: &mut HashMap<usize, usize>,
+    panes: &mut Vec<PaneState>,
+) -> LayoutNode {
+    match node {
+        LayoutNode::Leaf(index) => {
+            let state = slots
+                .get(*index)
+                .and_then(|slot| slot.clone())
+                .expect("a pruned leaf keeps its pane state");
+            let new_index = panes.len();
+            mapping.insert(*index, new_index);
+            panes.push(state);
+            LayoutNode::Leaf(new_index)
+        }
+        LayoutNode::Split {
+            direction,
+            first_size,
+            second_size,
+            first,
+            second,
+        } => LayoutNode::Split {
+            direction: *direction,
+            first_size: *first_size,
+            second_size: *second_size,
+            first: Box::new(compact_layout(first, slots, mapping, panes)),
+            second: Box::new(compact_layout(second, slots, mapping, panes)),
+        },
+    }
+}
+
+fn first_leaf(node: &LayoutNode) -> usize {
+    match node {
+        LayoutNode::Leaf(index) => *index,
+        LayoutNode::Split { first, .. } => first_leaf(first),
+    }
+}
+
+/// Size request that rebuilds a split inside a node of `axis_total` cells.
+/// Exact cells are used when the node still has its saved size; otherwise the
+/// saved proportion is used.  `None` means the node is too small to split,
+/// in which case restore collapses the split instead of producing a zero-size
+/// pane.
+fn split_size_for(axis_total: usize, first: usize, second: usize) -> Option<SplitSize> {
+    if axis_total < 3 || first == 0 || second == 0 {
+        return None;
+    }
+    let saved_total = first + second + 1;
+    if saved_total == axis_total {
+        return Some(SplitSize::Cells(second));
+    }
+    let percent = ((second as f64) * 100.0 / (saved_total as f64)).round() as i64;
+    let percent = percent.clamp(1, 99) as usize;
+    // Match compute_split_size's integer arithmetic: the new pane targets
+    // `axis_total * percent / 100` cells (at least one); the first side must
+    // still get at least one cell plus the separator.
+    let target = (axis_total * percent / 100).max(1);
+    if axis_total.saturating_sub(target + 1) < 1 {
+        return None;
+    }
+    Some(SplitSize::Percent(percent as u8))
+}
+
+/// Rebuild the splits below `anchor` top-down.  The anchor currently occupies
+/// the whole node area; the second subtree's first leaf is spawned into the
+/// new pane, then both subtrees recurse.  A failed split leaves the anchor in
+/// place and skips that subtree: the rest of the tab keeps working.
+fn build_layout_node<'a>(
+    mux: &'a Mux,
+    panes: &'a [PaneState],
+    node: &'a LayoutNode,
+    anchor: Arc<dyn Pane>,
+    leaf_pane_ids: &'a mut Vec<Option<PaneId>>,
+) -> Pin<Box<dyn std::future::Future<Output = ()> + 'a>> {
+    Box::pin(async move {
+        let LayoutNode::Split {
+            direction,
+            first_size,
+            second_size,
+            first,
+            second,
+        } = node
+        else {
+            return;
+        };
+        let dims = anchor.get_dimensions();
+        let (axis_total, first_axis, second_axis) = match direction {
+            SplitDirection::Horizontal => (
+                dims.cols,
+                first_size.cols as usize,
+                second_size.cols as usize,
+            ),
+            SplitDirection::Vertical => (
+                dims.viewport_rows,
+                first_size.rows as usize,
+                second_size.rows as usize,
+            ),
+        };
+        let Some(size) = split_size_for(axis_total, first_axis, second_axis) else {
+            log::warn!(
+                "restore workspace: collapsing a {direction:?} split that does not fit (axis={axis_total}, first={first_axis}, second={second_axis})"
+            );
+            return;
+        };
+        let second_leaf = first_leaf(second);
+        let Some(second_state) = panes.get(second_leaf) else {
+            log::warn!("restore workspace: split leaf {second_leaf} is out of range");
+            return;
+        };
+        let (command, used_restore_argv, base_argv) = match command_for(second_state) {
+            Some(restore) => (
+                Some(restore.command),
+                restore.used_restore_argv,
+                restore.base_argv,
+            ),
+            None => (None, false, Vec::new()),
+        };
+        let outcome = mux
+            .split_pane(
+                anchor.pane_id(),
+                SplitRequest {
+                    direction: *direction,
+                    target_is_second: true,
+                    top_level: false,
+                    size,
+                },
+                SplitSource::Spawn {
+                    command,
+                    command_dir: second_state.cwd.clone(),
+                },
+                SpawnTabDomain::DefaultDomain,
+            )
+            .await;
+        match outcome {
+            Ok((new_pane, _size)) => {
+                if let Some(info) =
+                    restored_spawn_info(used_restore_argv, base_argv, second_state.cwd.clone())
+                {
+                    new_pane.set_spawn_info(Some(info));
+                }
+                if let Some(slot) = leaf_pane_ids.get_mut(second_leaf) {
+                    *slot = Some(new_pane.pane_id());
+                }
+                build_layout_node(mux, panes, first, Arc::clone(&anchor), &mut *leaf_pane_ids)
+                    .await;
+                build_layout_node(mux, panes, second, new_pane, &mut *leaf_pane_ids).await;
+            }
+            Err(err) => {
+                log::warn!(
+                    "restore workspace: could not rebuild a {direction:?} split (first={first_axis}, second={second_axis}, node={axis_total}); keeping the anchor pane: {err:#}"
+                );
+            }
+        }
+    })
+}
+
 impl Mux {
     pub fn save_workspace(&self, path: &Path) -> Result<SaveSummary> {
         let mut state = SessionState::new();
@@ -352,44 +863,69 @@ impl Mux {
             let window = self
                 .get_window(window_id)
                 .ok_or_else(|| anyhow!("window {window_id} disappeared while saving"))?;
+            let active_tab_idx = window.get_active_tab_idx();
             let mut tabs = Vec::new();
-            for tab in window.iter_tabs() {
-                let Some(pane) = tab.get_active_pane() else {
+            let mut saved_active_tab = None;
+            for (tab_idx, tab) in window.iter_tabs().enumerate() {
+                let title = tab.get_title();
+                let Some(root) = tab.layout_node() else {
                     continue;
                 };
-                let Some(spawn) = pane.get_spawn_info() else {
-                    // A pane hosted by another domain (ssh, tmux, ...) has no
-                    // local spawn command.  Restoring it as the default shell
-                    // would silently replace the remote session, so skip it.
-                    skipped += 1;
+                let Some(active_pane) = tab.get_active_pane() else {
+                    continue;
+                };
+                let zoomed_pane = tab.get_zoomed_pane();
+                // The topological index is what active/zoom positions refer
+                // to; the saved preorder indices are recomputed after pruning.
+                let positioned = tab.iter_panes_ignoring_zoom();
+                let index_of: HashMap<PaneId, usize> = positioned
+                    .iter()
+                    .map(|pane| (pane.pane.pane_id(), pane.index))
+                    .collect();
+                let mut pane_slots: Vec<Option<PaneState>> = Vec::new();
+                let raw = layout_to_state(&root, &index_of, &mut pane_slots, &mut skipped);
+                let Some(pruned) = prune_layout(&raw, &|index| {
+                    pane_slots.get(index).is_some_and(|slot| slot.is_some())
+                }) else {
                     log::warn!(
-                        "save workspace: skipping pane {} ({:?}); it has no local spawn command",
-                        pane.pane_id(),
-                        tab.get_title()
+                        "save workspace: skipping tab {title:?}; no pane has a local spawn command"
                     );
                     continue;
                 };
-                let cwd = pane
-                    .get_current_working_dir(CachePolicy::AllowStale)
+                let mut mapping = HashMap::new();
+                let mut panes = Vec::new();
+                let layout = compact_layout(&pruned, &pane_slots, &mut mapping, &mut panes);
+                let layout = match layout {
+                    LayoutNode::Leaf(_) => None,
+                    other => Some(other),
+                };
+                let zoomed_index = zoomed_pane
                     .as_ref()
-                    .and_then(path_string)
-                    .or_else(|| spawn.cwd.clone());
-                let user_vars = pane
-                    .copy_user_vars()
-                    .into_iter()
-                    .collect::<BTreeMap<_, _>>();
+                    .and_then(|pane| index_of.get(&pane.pane_id()).copied());
+                let active_index =
+                    zoomed_index.or_else(|| index_of.get(&active_pane.pane_id()).copied());
+                let (active_pane, zoomed) = match zoomed_index.and_then(|index| mapping.get(&index))
+                {
+                    // Zoom shows the zoomed pane; make it the active pane.
+                    Some(index) => (*index, true),
+                    None => (
+                        active_index
+                            .and_then(|index| mapping.get(&index))
+                            .copied()
+                            .unwrap_or(0),
+                        false,
+                    ),
+                };
+                if tab_idx == active_tab_idx {
+                    saved_active_tab = Some(tabs.len());
+                }
                 tabs.push(TabState {
-                    title: tab.get_title(),
-                    // Kept for format compatibility; the active tab lives on
-                    // WindowState.  Per-tab split focus was never restored.
-                    active_tab: 0,
-                    pane: PaneState {
-                        cwd,
-                        argv: spawn.argv.clone(),
-                        env: spawn.env.clone(),
-                        title: pane.get_title(),
-                        user_vars,
-                    },
+                    title,
+                    pane: None,
+                    panes,
+                    layout,
+                    active_pane,
+                    zoomed,
                 });
             }
             if tabs.is_empty() {
@@ -397,7 +933,9 @@ impl Mux {
             }
             state.windows.push(WindowState {
                 workspace: window.get_workspace().to_string(),
-                active_tab: window.get_active_tab_idx(),
+                // Pruning can drop or reorder tabs; prefer the saved position
+                // of the active tab, then clamp into the surviving range.
+                active_tab: saved_active_tab.unwrap_or_else(|| active_tab_idx.min(tabs.len() - 1)),
                 tabs,
             });
         }
@@ -460,10 +998,29 @@ impl Mux {
             };
             let mut restored_tabs: Vec<(usize, crate::tab::TabId)> = Vec::new();
             for (tab_index, saved_tab) in saved_window.tabs.iter().enumerate() {
-                // No effective command at all (for example the GUI's default
-                // startup pane, whose spawn argv is empty) means the default
-                // shell; that is what the pane was running too.
-                let (command, used_restore_argv, base_argv) = match command_for(&saved_tab.pane) {
+                if saved_tab.panes.is_empty() {
+                    log::error!(
+                        "restore workspace: window {window_index} tab {tab_index} ({:?}) has no panes",
+                        saved_tab.title
+                    );
+                    summary.failed += 1;
+                    continue;
+                }
+                // The tab's initial pane is the first leaf of the layout
+                // (left/top-most).  Empty argv means the default shell.
+                let root_leaf = match &saved_tab.layout {
+                    Some(layout) => first_leaf(layout),
+                    None => 0,
+                };
+                let Some(root_state) = saved_tab.panes.get(root_leaf) else {
+                    log::error!(
+                        "restore workspace: window {window_index} tab {tab_index} ({:?}) references missing pane {root_leaf}",
+                        saved_tab.title
+                    );
+                    summary.failed += 1;
+                    continue;
+                };
+                let (command, used_restore_argv, base_argv) = match command_for(root_state) {
                     Some(restore) => (
                         Some(restore.command),
                         restore.used_restore_argv,
@@ -495,7 +1052,7 @@ impl Mux {
                         current_window,
                         SpawnTabDomain::DefaultDomain,
                         command,
-                        saved_tab.pane.cwd.clone(),
+                        root_state.cwd.clone(),
                         size,
                         None,
                         workspace,
@@ -514,9 +1071,41 @@ impl Mux {
                         if let Some(info) = restored_spawn_info(
                             used_restore_argv,
                             base_argv,
-                            saved_tab.pane.cwd.clone(),
+                            root_state.cwd.clone(),
                         ) {
                             pane.set_spawn_info(Some(info));
+                        }
+                        let mut leaf_pane_ids = vec![None; saved_tab.panes.len()];
+                        leaf_pane_ids[root_leaf] = Some(pane.pane_id());
+                        if let Some(layout) = &saved_tab.layout {
+                            build_layout_node(
+                                self,
+                                &saved_tab.panes,
+                                layout,
+                                Arc::clone(&pane),
+                                &mut leaf_pane_ids,
+                            )
+                            .await;
+                        }
+                        // A failed split collapses its subtree, so resolve
+                        // the saved active leaf through the panes that were
+                        // actually created.
+                        let target = leaf_pane_ids
+                            .get(saved_tab.active_pane)
+                            .copied()
+                            .flatten()
+                            .or_else(|| leaf_pane_ids.iter().copied().flatten().next());
+                        if let Some(pane_id) = target {
+                            if let Some(position) = tab
+                                .iter_panes_ignoring_zoom()
+                                .iter()
+                                .position(|positioned| positioned.pane.pane_id() == pane_id)
+                            {
+                                tab.set_active_idx(position);
+                            }
+                        }
+                        if saved_tab.zoomed && tab.get_zoomed_pane().is_none() {
+                            tab.toggle_zoom();
                         }
                         if current_window.is_none() {
                             current_window = Some(window_id);
@@ -558,9 +1147,7 @@ impl Mux {
         }
         for (window_id, tab_id) in active_targets {
             if let Some(mut window) = self.get_window_mut(window_id) {
-                let idx = window
-                    .iter_tabs()
-                    .position(|tab| tab.tab_id() == tab_id);
+                let idx = window.iter_tabs().position(|tab| tab.tab_id() == tab_id);
                 if let Some(idx) = idx {
                     window.remember_and_set_active_tab_idx(idx);
                 }

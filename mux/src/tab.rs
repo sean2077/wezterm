@@ -189,6 +189,44 @@ impl SplitDirectionAndSize {
     }
 }
 
+/// Snapshot of a tab's pane tree for the session format.  Leaves carry the
+/// pane so the caller can read its spawn info; nodes carry the split geometry
+/// needed to rebuild the layout.  The snapshot always describes the full tree,
+/// independent of zoom state.
+pub(crate) enum TabLayoutNode {
+    Leaf {
+        pane: Arc<dyn Pane>,
+    },
+    Split {
+        direction: SplitDirection,
+        first_size: TerminalSize,
+        second_size: TerminalSize,
+        first_node: Box<TabLayoutNode>,
+        second_node: Box<TabLayoutNode>,
+    },
+}
+
+fn layout_node_of(tree: &Tree) -> Option<TabLayoutNode> {
+    match tree {
+        Tree::Empty => None,
+        Tree::Leaf(pane) => Some(TabLayoutNode::Leaf {
+            pane: Arc::clone(pane),
+        }),
+        Tree::Node { left, right, data } => {
+            // Split nodes always carry geometry; an empty node cannot be
+            // described, so the caller treats the tab as unsaveable.
+            let data = data.as_ref()?;
+            Some(TabLayoutNode::Split {
+                direction: data.direction,
+                first_size: data.first,
+                second_size: data.second,
+                first_node: Box::new(layout_node_of(left)?),
+                second_node: Box::new(layout_node_of(right)?),
+            })
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct PositionedSplit {
     /// The topological node index that can be used to reference this split
@@ -579,6 +617,13 @@ impl Tab {
 
     pub fn iter_panes_ignoring_zoom(&self) -> Vec<PositionedPane> {
         self.inner.lock().iter_panes_ignoring_zoom()
+    }
+
+    /// Full pane tree, including panes hidden by zoom.  `None` means the tab
+    /// has no pane tree or a split node is missing its geometry.
+    pub(crate) fn layout_node(&self) -> Option<TabLayoutNode> {
+        let inner = self.inner.lock();
+        inner.pane.as_ref().and_then(layout_node_of)
     }
 
     pub fn rotate_counter_clockwise(&self) {
