@@ -29,11 +29,13 @@
 | gui: hover symbols on traffic lights, hover-only close buttons, waiting separator | 自用 | — | 依赖上面两条；上游提供悬停显示关闭按钮的选项后可删其中对应部分 |
 | cli: report tab/window indices and focus the owning GUI window | 自用 | — | 上游的 `list` 输出索引且 `activate-*` 会前台化窗口后可删 |
 | mux: generic workspace save/restore and agent user vars | 自用 | — | 上游提供等价的 session persistence/CLI 后可删 |
+| mux: restore agent commands from agent.restore_argv | 自用 | — | 与上一行一起删；替代已废弃的 `agent.resume_args` 追加语义，`agent.*` 由宿主保留 |
+| gui: foreground only explicit window activations | 自用 | — | 上游 `activate-*` 默认遮挡窗口的前台化行为等价后可删 |
 | gui: expose tab budgets, mergeable overrides, CWD links and status coalescing | 自用 | — | 上游提供等价 API 后可删 |
 
 #4456 的影响：Windows 上 GUI 只把 `gui-sock-<pid>` 这个文件名发布到共享内存，新启动的 `wezterm-gui` 和 `wezterm cli` 按自己的工作目录去解析，于是任务栏、开始菜单、右键菜单每次启动都会新开一个进程（每个进程有几百 MB 的基础开销），在 WezTerm 外运行 `wezterm cli` 也会连不上。
 
-自用清理补丁：GUI 正常退出会在 `listener.run()` 返回后删除自己的 `gui-sock-<pid>`（`wezterm-gui/src/main.rs`），但崩溃、强杀和隔离测试实例都不走这条路径；这些标记文件放在 `~/.local/share/wezterm`，重启电脑也不会清。上游只在自动更新路径调用 `discover_gui_socks()`，日常启动不调用，死文件会一直留着。补丁在 `async_run_terminal_gui` 开头调用一次 `discover_gui_socks()`；该函数只删除连接失败且超过 1 秒的 socket，正在启动的实例不受影响。`agent.<pid>`（SSH agent 符号链接）和旧命名 `sock` 不在清理范围。
+自用清理补丁：GUI 正常退出会在 `listener.run()` 返回后删除自己的 `gui-sock-<pid>`（`wezterm-gui/src/main.rs`），但崩溃、强杀和隔离测试实例都不走这条路径；这些标记文件放在 `~/.local/share/wezterm`，重启电脑也不会清。上游只在自动更新路径调用 `discover_gui_socks()`，日常启动不调用，死文件会一直留着。补丁在 `async_run_terminal_gui` 开头调用一次 `discover_gui_socks()`；该函数只删除连接失败且超过 1 秒的 socket，正在启动的实例不受影响。同一个启动路径还会删除目标已不存在的 `agent.*` 符号链接（SSH agent 转发按 pane 创建一个，崩溃/强杀后留下断链）；有效链接和普通文件不动。旧命名 `sock` 不在清理范围。
 
 #8166 的影响：Windows 上 `TermWindow::update_text_cursor` 在每帧绘制时都调用 `ImmSetCandidateWindow`（Builtin preedit）或 `ImmSetCompositionWindow`（System preedit），而 IME 每次收到调用都会销毁并重建候选窗，于是组合输入时候选窗每敲一键闪一次（Google 日语输入法、微软 IME、Rime/Weasel 都如此；Claude Code、Codex CLI 这类高频重绘的 TUI 更明显）。补丁缓存上次上报给 IME 的光标矩形，位置不变就跳过调用；在 `WM_SETFOCUS`、`WM_IME_SETCONTEXT`、`WM_IME_STARTCOMPOSITION`、`WM_IME_ENDCOMPOSITION` 以及配置变化时清缓存，保证重新获得焦点、每次组合开始时至少重新上报一次。
 
@@ -69,20 +71,29 @@
 
 ## 通用工作区持久化（自用）
 
-`mux` 新增通用 `SessionState`，保存窗口/tab/活动 pane、cwd、原始 spawn argv、标题和 user vars；不保存分屏树、颜色、zoom、窗口几何。每个 tab 只恢复活动 pane。新增 CLI：
+`mux` 新增通用 `SessionState`，保存窗口/tab/活动 tab、cwd、原始 spawn argv、标题和 user vars；不保存分屏树、颜色、zoom、窗口几何。每个 tab 只恢复活动 pane。新增 CLI：
 
 ```text
 wezterm cli save-workspace [--path FILE]
-wezterm cli restore-workspace --path FILE [--window-id ID] [--replace] [--legacy-claude-pending]
+wezterm cli restore-workspace --path FILE [--window-id ID] [--replace]
 wezterm cli close-agent-sessions [--timeout-seconds N] [--force]
-wezterm cli set-user-var --pane-id ID --name NAME [--value VALUE | --unset]
+wezterm cli set-user-var [--pane-id ID] --var NAME=VALUE [--var ...] [--unset NAME ...]
+wezterm cli set-user-var [--pane-id ID] --name NAME [--value VALUE | --unset]
 ```
 
-Agent 集成通过通用 user vars 完成：`agent.resume_args`（JSON argv 追加片段）、`agent.shutdown`（非空表示参与优雅关闭）、`agent.session_id`（诊断用）。`close-agent-sessions` 只处理带 `agent.shutdown` 的 pane，发送 Esc → Ctrl+C → `/exit\r`，不识别具体 agent 名称。`restore-workspace` 只把 `agent.resume_args` 追加到原始 argv；mux/CLI 不包含 Claude 专用字段。
+`--path` 的相对路径按 CLI 的当前目录解析，不按 mux server 的工作目录。`restore-workspace --replace` 在没有恢复出任何 tab 时会保留目标窗口；未给 `--window-id` 且存在多个窗口时报错。恢复后激活 `WindowState.active_tab` 对应的 tab。
 
-`--legacy-claude-pending` 是首次迁移用的一次性适配器，读取旧 `pending.json` 并转换成新格式；它位于 CLI 层，不进入 mux 核心。
+Agent 集成通过通用 user vars 完成：`agent.restore_argv`（JSON argv，**整条替换** pane 的启动命令）、`agent.shutdown`（非空表示参与优雅关闭）、`agent.session_id`（诊断用）。mux/CLI 不包含 Claude 专用字段。
 
-该改动修改了 `codec`，`CODEC_VERSION` 升到 48；安装后必须重启所有 GUI/mux 进程。首次从 47 升级时，新 CLI 不能连接旧 GUI，需要保留旧 tabs 脚本完成一次保存/优雅关闭，再用新 GUI 的 `restore-workspace --legacy-claude-pending` 恢复；确认后即可删除旧脚本。
+`agent.*` 是宿主保留命名空间：OSC 1337 `SetUserVar` 对 `agent.` 前缀的名字直接丢弃，防止不可信终端输出注入恢复命令；只有 `set-user-var`（mux PDU）能写。`agent_state` 不受影响。恢复时不再把 user vars 写回新 pane，新进程自己的 SessionStart 会重新发布。用 `agent.restore_argv` 启动的 pane，其 `SpawnInfo` 记录保存时的基础 argv，避免重复 save/restore 累积参数。
+
+`agent.resume_args` 已废弃：restore 忽略并记 warning。`--legacy-claude-pending` 一次性适配器已删除；旧 hook 记录的会话由 `session-tabs.sh republish` 在重启前转换成 `agent.restore_argv`。
+
+`close-agent-sessions` 只处理带 `agent.shutdown` 的 pane，发送 Esc（全部 pane）→ 等待 → Ctrl+C（全部）→ 等待 → `/exit\r`（全部），不识别具体 agent 名称；`--timeout-seconds` 限制在 1..=3600，`--force` 只是超时后允许调用方继续，不会杀 pane。
+
+本轮不改 `codec`（`CODEC_VERSION` 保持 48），新 CLI 仍可与正在运行的旧 GUI 通信；**下次修改 PDU 字段时必须升版本并重启所有实例**。`wezterm cli list` 的 `window_index` 按 `WindowId` 排序，`tab_index` 对应标签栏顺序。
+
+没有本地 spawn 命令的 pane（ssh/tmux 等）在保存时跳过并记 warning，不再静默恢复成本地 shell。
 
 ## 日常维护入口
 
@@ -96,11 +107,14 @@ Agent 集成通过通用 user vars 完成：`agent.resume_args`（JSON argv 追�
 git fetch upstream
 git switch main && git merge --ff-only upstream/main && git push origin main
 git switch patched && git merge --no-ff main
+# 上游会 bump deps/ 下的 gitlink；merge 只改 index，必须同步 submodule 工作树
+git submodule sync --recursive && git submodule update --init --recursive
 # 冲突时逐个解决后 git commit；补丁已被上游合并的话，确认后用 git revert 去掉它，并更新上面的补丁清单
+# 同时检查 codec/src/lib.rs 的 PDU 编号没有重复（pdu_discriminants_are_unique 单测会拦住）
 git push origin patched
 ```
 
-查看当前补丁（跳过 merge 提交和内容已与上游等价的提交）：`git log --oneline --no-merges --cherry-pick --right-only main...patched`。```
+查看当前补丁（跳过 merge 提交和内容已与上游等价的提交）：`git log --oneline --no-merges --cherry-pick --right-only main...patched`。
 
 ## 构建与安装（Windows）
 
