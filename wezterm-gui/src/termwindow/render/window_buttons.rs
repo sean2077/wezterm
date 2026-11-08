@@ -23,8 +23,10 @@ const CIRCLE: &[Poly] = &[Poly {
 
 /// Diameter of a traffic light and the gap on each side of it.
 pub fn traffic_light_metrics(metrics: &RenderMetrics) -> (f32, f32) {
-    let diameter = (metrics.cell_size.height as f32 * 0.5).round().max(8.);
-    (diameter, (diameter * 0.45).round().max(2.))
+    // macOS uses 12pt dots; at this DPI that is about 0.7 of the title cell
+    // height. The gaps stay tight so three of them cost well under 100px.
+    let diameter = (metrics.cell_size.height as f32 * 0.70).round().max(10.);
+    (diameter, (diameter * 0.40).round().max(2.))
 }
 
 /// Width a traffic light button element occupies.
