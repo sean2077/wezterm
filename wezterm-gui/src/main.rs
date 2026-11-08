@@ -415,6 +415,10 @@ async fn async_run_terminal_gui(
     // the helper only drops sockets that fail to connect and are older than a
     // second, so an instance still starting up is never mistaken for a dead one.
     let _ = wezterm_client::discovery::discover_gui_socks();
+    let pruned_agent_links = wezterm_client::discovery::prune_dead_agent_links();
+    if pruned_agent_links > 0 {
+        log::info!("pruned {pruned_agent_links} stale agent symlink(s)");
+    }
     let unix_socket_path =
         config::RUNTIME_DIR.join(format!("gui-sock-{}", unsafe { libc::getpid() }));
     std::env::set_var("WEZTERM_UNIX_SOCKET", unix_socket_path.clone());

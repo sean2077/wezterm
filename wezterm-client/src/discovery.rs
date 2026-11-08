@@ -403,3 +403,44 @@ pub fn discover_gui_socks() -> Vec<PathBuf> {
 fn is_sock_dead(sock: &std::path::Path) -> bool {
     UnixStream::connect(sock).is_err()
 }
+
+/// Remove `agent.*` symlinks whose target no longer exists.  SSH agent
+/// forwarding creates one symlink per pane; panes that go away without a clean
+/// shutdown leave the link behind and nothing else prunes them.  Only dangling
+/// symlinks are removed: live agent sockets and regular files are untouched.
+pub fn prune_dead_agent_links() -> usize {
+    prune_dead_agent_links_in(&config::RUNTIME_DIR)
+}
+
+fn prune_dead_agent_links_in(dir: &std::path::Path) -> usize {
+    let mut removed = 0;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        if !name.starts_with("agent.") {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !meta.file_type().is_symlink() {
+            continue;
+        }
+        match std::fs::metadata(&path) {
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                if std::fs::remove_file(&path).is_ok() {
+                    removed += 1;
+                }
+            }
+            Err(_) => {}
+        }
+    }
+    removed
+}
