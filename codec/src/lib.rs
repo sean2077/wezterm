@@ -1319,4 +1319,38 @@ mod test {
             Pdu::decode(encoded.as_slice()).unwrap()
         );
     }
+
+    /// The pdu! macro maps each discriminant to a match arm, but duplicate
+    /// numbers compile (the second arm is just unreachable) and silently
+    /// corrupt the protocol. Catch that here so an upstream merge that adds a
+    /// colliding number fails the build instead of shipping.
+    #[test]
+    fn pdu_discriminants_are_unique() {
+        let source = include_str!("lib.rs");
+        let start = source.find("pdu! {").expect("pdu! block");
+        let mut seen: std::collections::HashMap<u64, &str> = std::collections::HashMap::new();
+        for line in source[start..].lines().skip(1) {
+            let line = line.trim().trim_end_matches(',');
+            if line == "}" {
+                break;
+            }
+            if line.is_empty() || line.starts_with("//") {
+                continue;
+            }
+            let Some((name, value)) = line.split_once(':') else {
+                continue;
+            };
+            let Ok(value) = value.trim().parse::<u64>() else {
+                continue;
+            };
+            if let Some(previous) = seen.insert(value, name.trim()) {
+                panic!(
+                    "duplicate PDU discriminant {value}: {} and {}",
+                    previous,
+                    name.trim()
+                );
+            }
+        }
+        assert!(seen.len() > 50, "parsed only {} PDUs", seen.len());
+    }
 }
