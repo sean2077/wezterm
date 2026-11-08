@@ -83,11 +83,11 @@ wezterm cli set-user-var [--pane-id ID] --name NAME [--value VALUE | --unset]
 
 `--path` 的相对路径按 CLI 的当前目录解析，不按 mux server 的工作目录。`restore-workspace --replace` 在没有恢复出任何 tab 时会保留目标窗口；未给 `--window-id` 且存在多个窗口时报错。恢复后激活 `WindowState.active_tab` 对应的 tab。
 
-Agent 集成通过通用 user vars 完成：`agent.restore_argv`（JSON argv，**整条替换** pane 的启动命令）、`agent.shutdown`（非空表示参与优雅关闭）、`agent.session_id`（诊断用）。mux/CLI 不包含 Claude 专用字段。
+Agent 集成通过通用 user vars 完成：`agent.restore_argv`（JSON argv，**整条替换** pane 的启动命令）、`agent.shutdown`（非空表示参与优雅关闭）、`agent.session_id`（诊断用）。mux/CLI 不包含 Claude 专用字段。恢复命令由白名单重建：保留 argv[0] 与 `--settings`/`--effort`/`--model`/`--permission-mode`/`--dangerously-skip-permissions`/`--add-dir`（含 `=` 写法），最后追加 `--resume <id>`；`-c`、`--continue`、`--resume`、`--session-id`、`--fork-session`、位置 prompt 和未知 flag 一律丢弃，避免重复重启时累积 `--resume` 或重放首条 prompt。
 
 `agent.*` 是宿主保留命名空间：OSC 1337 `SetUserVar` 对 `agent.` 前缀的名字直接丢弃，防止不可信终端输出注入恢复命令；只有 `set-user-var`（mux PDU）能写。`agent_state` 不受影响。恢复时不再把 user vars 写回新 pane，新进程自己的 SessionStart 会重新发布。用 `agent.restore_argv` 启动的 pane，其 `SpawnInfo` 记录保存时的基础 argv，避免重复 save/restore 累积参数。
 
-`agent.resume_args` 已废弃：restore 忽略并记 warning。`--legacy-claude-pending` 一次性适配器已删除；旧 hook 记录的会话由 `session-tabs.sh republish` 在重启前转换成 `agent.restore_argv`。
+`agent.resume_args` 已废弃：restore 忽略并记 warning。`--legacy-claude-pending` 一次性适配器已删除；旧 hook 记录的会话由 `session-tabs.sh republish` 在重启前转换成 `agent.restore_argv`（republish 只写这一个变量：旧 hook 已经写过 name/session_id/shutdown，给崩溃后的普通 shell 补 shutdown 会让 close-agent-sessions 空等超时）。
 
 `close-agent-sessions` 只处理带 `agent.shutdown` 的 pane，发送 Esc（全部 pane）→ 等待 → Ctrl+C（全部）→ 等待 → `/exit\r`（全部），不识别具体 agent 名称；`--timeout-seconds` 限制在 1..=3600，`--force` 只是超时后允许调用方继续，不会杀 pane。
 
