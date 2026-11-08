@@ -426,15 +426,24 @@ impl Mux {
             } else {
                 None
             };
-            let mut restored_tab_ids = Vec::new();
+            let mut restored_tabs: Vec<(usize, crate::tab::TabId)> = Vec::new();
             for (tab_index, saved_tab) in saved_window.tabs.iter().enumerate() {
-                let Some(restore) = command_for(&saved_tab.pane) else {
-                    log::warn!(
-                        "restore workspace: window {window_index} tab {tab_index} ({:?}) has no command",
-                        saved_tab.title
-                    );
-                    summary.failed += 1;
-                    continue;
+                // No effective command at all (for example the GUI's default
+                // startup pane, whose spawn argv is empty) means the default
+                // shell; that is what the pane was running too.
+                let (command, used_restore_argv, base_argv) = match command_for(&saved_tab.pane) {
+                    Some(restore) => (
+                        Some(restore.command),
+                        restore.used_restore_argv,
+                        restore.base_argv,
+                    ),
+                    None => {
+                        log::debug!(
+                            "restore workspace: tab {tab_index} ({:?}) has no spawn argv; using the default shell",
+                            saved_tab.title
+                        );
+                        (None, false, Vec::new())
+                    }
                 };
                 // The tab bar size comes from the target window; only a brand
                 // new window needs the configured initial size.
@@ -453,7 +462,7 @@ impl Mux {
                     .spawn_tab_or_window(
                         current_window,
                         SpawnTabDomain::DefaultDomain,
-                        Some(restore.command),
+                        command,
                         saved_tab.pane.cwd.clone(),
                         size,
                         None,
@@ -464,12 +473,12 @@ impl Mux {
                 match result {
                     Ok((tab, pane, window_id)) => {
                         tab.set_title(&saved_tab.title);
-                        if restore.used_restore_argv && !restore.base_argv.is_empty() {
+                        if used_restore_argv && !base_argv.is_empty() {
                             // Remember the pane's original spawn command, not
                             // the replacement command, so repeated restore
                             // cycles never accumulate arguments.
                             pane.set_spawn_info(Some(SpawnInfo {
-                                argv: restore.base_argv,
+                                argv: base_argv,
                                 cwd: saved_tab.pane.cwd.clone(),
                                 env: BTreeMap::new(),
                             }));
@@ -477,7 +486,7 @@ impl Mux {
                         if current_window.is_none() {
                             current_window = Some(window_id);
                         }
-                        restored_tab_ids.push(tab.tab_id());
+                        restored_tabs.push((tab_index, tab.tab_id()));
                         summary.tabs += 1;
                         restored_any = true;
                     }
@@ -490,18 +499,17 @@ impl Mux {
                     }
                 }
             }
-            if !restored_tab_ids.is_empty() {
-                // Prefer the saved active tab; fall back to the last tab that
-                // was actually restored.
-                let saved_idx = saved_window
-                    .active_tab
-                    .min(restored_tab_ids.len().saturating_sub(1));
-                let desired = restored_tab_ids
-                    .get(saved_idx)
-                    .copied()
-                    .unwrap_or_else(|| *restored_tab_ids.last().unwrap());
-                if let Some(window_id) = current_window {
-                    active_targets.push((window_id, desired));
+            if !restored_tabs.is_empty() {
+                // Prefer the tab that was active when saved; tabs before it
+                // may have failed, so match by the original index and fall
+                // back to the last restored tab.
+                let desired = restored_tabs
+                    .iter()
+                    .find(|(saved_idx, _)| *saved_idx == saved_window.active_tab)
+                    .map(|(_, tab_id)| *tab_id)
+                    .or_else(|| restored_tabs.last().map(|(_, tab_id)| *tab_id));
+                if let (Some(window_id), Some(tab_id)) = (current_window, desired) {
+                    active_targets.push((window_id, tab_id));
                 }
                 summary.windows += 1;
             }
