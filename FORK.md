@@ -47,7 +47,7 @@
 
 `colors.tab_bar.waiting_tab_edge`（默认 `#ff9500`）让任意 pane 的 `agent_state` user var 为 `waiting`（可带 `:epoch` 后缀）的 tab 显示一圈细边框（线宽同 `tab_bar_tab_border_width`）；远离终端内容的一侧（顶部标签栏为上边）在两个圆角之间加一条约 3 逻辑像素的指示灯条，框外再画最多 3 层逐渐变淡的光晕（不透明度 0.5/0.26/0.12，每层约 1 逻辑像素，层数受 tab 与标签栏边缘之间的空间限制）。灯条和光晕的颜色由 `colors.tab_bar.waiting_tab_glow` 控制，默认与 `waiting_tab_edge` 相同。活动、非活动和 hover 三种状态都生效，`running`/`done`/`error` 不触发。判定与 Lua 徽章一致：遍历 mux tab 的真实 pane（`iter_panes_ignoring_zoom`，忽略 zoom 和 GUI overlay），任一 waiting 即高亮。状态变化会进入 `TabEntry` 并参与缓存比较，user var 更新后立即触发重绘。
 
-`colors.tab_bar.active_tab_edge`（默认不设置，即保持上游外观）设置后，标签栏靠近终端内容的一侧画一条贯穿整个窗口的分隔线，并在活动 tab 处折成左、上、右三边的门框（Chrome 式）；底边断开，活动 tab 与内容区连在一起。活动 tab 同时处于 waiting 时，门框改用 `waiting_tab_edge` 的颜色，并加上灯条和光晕。`tab_bar_at_bottom = true` 时上下镜像。
+`colors.tab_bar.active_tab_edge`（默认不设置，即保持上游外观）设置后，标签栏靠近终端内容的一侧画一条贯穿整个窗口的分隔线，并在活动 tab 处折成左、上、右三边的门框（Chrome 式）；底边断开，活动 tab 与内容区连在一起。活动 tab 同时处于 waiting 时，门框改用 `waiting_tab_edge` 的颜色，并加上灯条和光晕。门框两侧与分隔线相接处不是直角，而是一个向外张开的圆弧过渡（半径约为标题字体格高的 0.3 倍，且不小于线宽），分隔线在离门柱一个半径处停住，再用实心四分之一圆补上转角。`tab_bar_at_bottom = true` 时上下镜像。
 
 分隔线和门框的颜色可以按 tab 指定：`format-tab-title` 返回值中，U+001D 标记处生效的前景色就是该 tab 的强调色，写法为 `{ Foreground = { Color = '#rrggbb' } }, { Text = '\x1d' }`。标记本身会被剥掉，不占列宽，只有显式 RGB 颜色才算。tab 处于活动状态时，用它的强调色画整条分隔线和门框，所以切换 tab 时边界线跟着换色。没有声明强调色时，用 `active_tab_edge`。活动且 waiting 的 tab，门框仍为橙色，分隔线仍用强调色。强调色随 `TabEntry` 参与缓存比较，变化后立即重绘。`config.tab_bar_active_edge_width`（Dimension，默认 0，表示跟随 `tab_bar_tab_border_width`）单独设置分隔线和门框的线宽，可以比 tab 之间的分隔线和等待环更粗；`pt` 随 DPI 缩放。
 
