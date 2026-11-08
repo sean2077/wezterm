@@ -166,6 +166,9 @@ struct TabGeom {
     corners: CornerSizes,
     /// The tab's current fill (hover-aware), when it is a plain color.
     fill: Option<LinearRgba>,
+    /// Accent declared by format-tab-title (U+001D); colors the separator
+    /// and door while this tab is active.
+    accent: Option<LinearRgba>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -174,8 +177,10 @@ struct DecoStyle {
     active_edge: Option<LinearRgba>,
     waiting_edge: LinearRgba,
     glow: LinearRgba,
-    /// Stroke width of the separator, door and waiting ring.
+    /// Stroke width of the waiting ring.
     line: f32,
+    /// Stroke width of the separator and the active door.
+    edge_line: f32,
     /// Width of one glow ring.
     ring: f32,
     /// Height of the waiting indicator bar.
@@ -325,13 +330,18 @@ fn tab_bar_decorations(bar: RectF, tabs: &[TabGeom], style: &DecoStyle) -> Vec<D
         }
     }
 
-    if let Some(edge) = style.active_edge {
+    if let Some(default_edge) = style.active_edge {
+        let line = style.edge_line;
+        let active = tabs.iter().find(|t| t.active);
+        // The active tab's accent colors the whole separator, tying the
+        // content area to the selected tab.
+        let edge = active.and_then(|a| a.accent).unwrap_or(default_edge);
         let y = if at_bottom {
             bar.min_y()
         } else {
             bar.max_y() - line
         };
-        match tabs.iter().find(|t| t.active) {
+        match active {
             Some(a) => {
                 let r = a.rect;
                 push_rect(
@@ -370,13 +380,13 @@ fn tab_bar_decorations(bar: RectF, tabs: &[TabGeom], style: &DecoStyle) -> Vec<D
                 let color = if tab.waiting {
                     style.waiting_edge
                 } else {
-                    edge
+                    tab.accent.unwrap_or(edge)
                 };
                 push_outline(
                     &mut out,
                     tab.rect,
                     tab.corners,
-                    line,
+                    style.edge_line,
                     color,
                     tab.fill,
                     at_bottom,
@@ -423,25 +433,27 @@ fn tab_bar_decorations(bar: RectF, tabs: &[TabGeom], style: &DecoStyle) -> Vec<D
 
 fn collect_tab_geoms(
     element: &ComputedElement,
-    waiting: &[usize],
+    info: &dyn Fn(usize) -> (bool, Option<LinearRgba>),
     fill: &dyn Fn(&ComputedElement) -> Option<LinearRgba>,
     out: &mut Vec<TabGeom>,
 ) {
     if let Some(UIItemType::TabBar(TabBarItem::Tab { tab_idx, active })) = &element.item_type {
         // The first match is the tab itself; its right-floated suffix reuses
         // the same item type, so do not descend any further.
+        let (waiting, accent) = info(*tab_idx);
         out.push(TabGeom {
             active: *active,
-            waiting: waiting.contains(tab_idx),
+            waiting,
             rect: element.border_rect,
             corners: CornerSizes::from_pixel(element.border_corners.as_ref()),
             fill: fill(element),
+            accent,
         });
         return;
     }
     if let ComputedElementContent::Children(kids) = &element.content {
         for kid in kids {
-            collect_tab_geoms(kid, waiting, fill, out);
+            collect_tab_geoms(kid, info, fill, out);
         }
     }
 }
@@ -1115,40 +1127,44 @@ impl crate::TermWindow {
             .and_then(|c| c.tab_bar.as_ref())
             .cloned()
             .unwrap_or_else(TabBarColors::default);
-        let waiting: Vec<usize> = self
-            .tab_bar
-            .items()
-            .iter()
-            .filter_map(|item| match item.item {
-                TabBarItem::Tab { tab_idx, .. } if item.agent_waiting => Some(tab_idx),
-                _ => None,
-            })
-            .collect();
+        let tab_info = |idx: usize| -> (bool, Option<LinearRgba>) {
+            self.tab_bar
+                .items()
+                .iter()
+                .find(|item| matches!(item.item, TabBarItem::Tab { tab_idx, .. } if tab_idx == idx))
+                .map(|item| (item.agent_waiting, item.accent.map(|c| c.to_linear())))
+                .unwrap_or((false, None))
+        };
+        let any_waiting = self.tab_bar.items().iter().any(|item| item.agent_waiting);
         let active_edge = colors.active_tab_edge().map(|c| c.to_linear());
-        if active_edge.is_none() && waiting.is_empty() {
+        if active_edge.is_none() && !any_waiting {
             return Ok(());
         }
 
         let mut tabs = vec![];
-        collect_tab_geoms(computed, &waiting, &|e| self.tab_fill(e), &mut tabs);
+        collect_tab_geoms(computed, &tab_info, &|e| self.tab_fill(e), &mut tabs);
         let font = self.fonts.title_font()?;
         let metrics = RenderMetrics::with_font_metrics(&font.metrics());
-        let line = self
-            .config
-            .tab_bar_tab_border_width
-            .evaluate_as_pixels(DimensionContext {
+        let px = |d: Dimension| {
+            d.evaluate_as_pixels(DimensionContext {
                 dpi: self.dimensions.dpi as f32,
                 pixel_max: self.dimensions.pixel_width as f32,
                 pixel_cell: metrics.cell_size.width as f32,
             })
             .round()
-            .max(1.);
+        };
+        let line = px(self.config.tab_bar_tab_border_width).max(1.);
+        let edge_line = match px(self.config.tab_bar_active_edge_width) {
+            w if w >= 1. => w,
+            _ => line,
+        };
         let scale = (self.dimensions.dpi as f32 / 96.).max(1.);
         let style = DecoStyle {
             active_edge,
             waiting_edge: colors.waiting_tab_edge().to_linear(),
             glow: colors.waiting_tab_glow().to_linear(),
             line,
+            edge_line,
             ring: scale.round().max(1.),
             lamp: (3. * scale).round().max(2.),
             at_bottom: self.config.tab_bar_at_bottom,
@@ -1326,6 +1342,7 @@ mod decoration_tests {
             waiting_edge: ORANGE,
             glow: GLOW,
             line: 1.,
+            edge_line: 1.,
             ring: 1.,
             lamp: 3.,
             at_bottom,
@@ -1344,6 +1361,7 @@ mod decoration_tests {
                 ..CornerSizes::default()
             },
             fill: Some(FILL),
+            accent: None,
         }
     }
 
@@ -1489,6 +1507,7 @@ mod decoration_tests {
                 ..CornerSizes::default()
             },
             fill: Some(FILL),
+            accent: None,
         }];
         let decos = tab_bar_decorations(bar(), &tabs, &style(true));
         let blue = rects(&decos, BLUE);
@@ -1534,6 +1553,55 @@ mod decoration_tests {
         assert!(decos
             .iter()
             .all(|d| !matches!(d, Deco::Arc { inner: Some(_), .. })));
+    }
+
+    #[test]
+    fn active_tab_accent_colors_separator_and_door() {
+        const ACCENT: LinearRgba = LinearRgba(0.6, 0.15, 0.15, 1.);
+        let mut active = tab(110., true, false);
+        active.accent = Some(ACCENT);
+        let mut other = tab(10., false, false);
+        // An inactive tab's accent is ignored.
+        other.accent = Some(GLOW);
+        let decos = tab_bar_decorations(bar(), &[other, active], &style(false));
+        let accent = rects(&decos, ACCENT);
+        assert!(accent.contains(&euclid::rect(0., 29., 111., 1.)));
+        assert!(accent.contains(&euclid::rect(209., 29., 191., 1.)));
+        assert!(accent.contains(&euclid::rect(115., 4., 90., 1.)));
+        assert_eq!(
+            arcs(&decos, ACCENT),
+            vec![DecoCorner::TopLeft, DecoCorner::TopRight]
+        );
+        assert!(rects(&decos, BLUE).is_empty());
+
+        // A waiting active tab keeps the orange door; the separator keeps
+        // the accent.
+        active.waiting = true;
+        let decos = tab_bar_decorations(bar(), &[active], &style(false));
+        assert!(rects(&decos, ACCENT).contains(&euclid::rect(0., 29., 111., 1.)));
+        assert!(rects(&decos, ORANGE).contains(&euclid::rect(115., 4., 90., 1.)));
+    }
+
+    #[test]
+    fn separator_and_door_use_their_own_width() {
+        let mut s = style(false);
+        s.edge_line = 3.;
+        let tabs = [
+            tab(10., false, false),
+            tab(110., true, false),
+            tab(210., false, true),
+        ];
+        let decos = tab_bar_decorations(bar(), &tabs, &s);
+        let blue = rects(&decos, BLUE);
+        // Separator 3px high, joining the 3px door posts.
+        assert!(blue.contains(&euclid::rect(0., 27., 113., 3.)));
+        assert!(blue.contains(&euclid::rect(207., 27., 193., 3.)));
+        assert!(blue.contains(&euclid::rect(110., 14., 3., 16.)));
+        assert!(blue.contains(&euclid::rect(115., 4., 90., 3.)));
+        // The waiting ring keeps the tab border width.
+        let orange = rects(&decos, ORANGE);
+        assert!(orange.contains(&euclid::rect(210., 14., 1., 16.)));
+        assert!(orange.contains(&euclid::rect(210., 29., 100., 1.)));
     }
 
     #[test]

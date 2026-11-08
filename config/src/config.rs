@@ -541,6 +541,17 @@ pub struct Config {
     )]
     pub tab_bar_tab_border_width: Dimension,
 
+    /// Stroke width of the separator between the fancy tab bar and the
+    /// terminal, and of the door it folds into around the active tab
+    /// (drawn when colors.tab_bar.active_tab_edge is set). Zero, the
+    /// default, follows tab_bar_tab_border_width. Accepts dimension strings
+    /// such as "2px" or "1.5pt".
+    #[dynamic(
+        try_from = "crate::units::PixelUnit",
+        default = "default_tab_bar_active_edge_width"
+    )]
+    pub tab_bar_active_edge_width: Dimension,
+
     /// If true, hide the tab bar if the window only has a single tab.
     #[dynamic(default)]
     pub hide_tab_bar_if_only_one_tab: bool,
@@ -1923,6 +1934,10 @@ fn default_tab_bar_side_reserve_ratio() -> f64 {
 
 fn default_tab_bar_tab_border_width() -> Dimension {
     Dimension::Pixels(1.)
+}
+
+fn default_tab_bar_active_edge_width() -> Dimension {
+    Dimension::Pixels(0.)
 }
 
 fn default_update_interval() -> u64 {

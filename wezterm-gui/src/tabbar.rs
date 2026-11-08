@@ -5,7 +5,7 @@ use mlua::FromLua;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 use termwiz::cell::{unicode_column_width, Cell, CellAttributes};
-use termwiz::color::{AnsiColor, ColorSpec};
+use termwiz::color::{AnsiColor, ColorSpec, SrgbaTuple};
 use termwiz::escape::csi::Sgr;
 use termwiz::escape::parser::Parser;
 use termwiz::escape::{Action, ControlCode, CSI};
@@ -41,6 +41,9 @@ pub struct TabEntry {
     pub right_title: Option<Line>,
     /// Drives the full waiting-border ring in the fancy tab bar.
     pub agent_waiting: bool,
+    /// The tab's accent color, declared by format-tab-title with U+001D.
+    /// Colors the separator and door when this tab is active.
+    pub accent: Option<SrgbaTuple>,
     x: usize,
     width: usize,
 }
@@ -59,10 +62,50 @@ struct TitleText {
     /// Width of the fixed left block (index + badge), marked by U+001E in the
     /// callback result. Zero when the callback does not use the marker.
     left_len: usize,
+    /// Foreground color in effect at the first U+001D marker.
+    accent: Option<SrgbaTuple>,
 }
 
 const RIGHT_MARKER: char = '\u{1f}';
 const TITLE_MARKER: char = '\u{1e}';
+const ACCENT_MARKER: char = '\u{1d}';
+
+/// Strip U+001D markers from a format-tab-title result. The foreground color
+/// in effect at the first marker (`{Foreground={Color=...}}, {Text='\x1d'}`)
+/// is the tab's accent; only explicit RGB colors count.
+fn take_accent(items: Vec<FormatItem>) -> (Vec<FormatItem>, Option<SrgbaTuple>) {
+    let mut fg: Option<FormatColor> = None;
+    let mut accent = None;
+    let mut seen = false;
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        match item {
+            FormatItem::Foreground(color) => {
+                fg = Some(color.clone());
+                out.push(FormatItem::Foreground(color));
+            }
+            FormatItem::ResetAttributes => {
+                fg = None;
+                out.push(FormatItem::ResetAttributes);
+            }
+            FormatItem::Text(text) if text.contains(ACCENT_MARKER) => {
+                if !seen {
+                    seen = true;
+                    accent = match &fg {
+                        Some(FormatColor::Color(s)) => s.parse::<SrgbaTuple>().ok(),
+                        _ => None,
+                    };
+                }
+                let rest: String = text.chars().filter(|&c| c != ACCENT_MARKER).collect();
+                if !rest.is_empty() {
+                    out.push(FormatItem::Text(rest));
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    (out, accent)
+}
 
 /// Split a FormatItem list at the first occurrence of `marker`, returning the
 /// items before it, the items after it, and whether the marker was present.
@@ -127,6 +170,7 @@ fn call_format_tab_title(
                 mlua::Value::Nil => Ok(None),
                 mlua::Value::Table(_) => {
                     let items = <Vec<FormatItem>>::from_lua(v, &*lua)?;
+                    let (items, accent) = take_accent(items);
                     let (left_items, right_items) = split_right(items);
                     // U+001E separates the fixed left block (index + badge)
                     // from the title. The tab bar measures the left block and
@@ -157,6 +201,7 @@ fn call_format_tab_title(
                         has_indeterminate: false,
                         right,
                         left_len,
+                        accent,
                     }))
                 }
                 _ => {
@@ -176,6 +221,7 @@ fn call_format_tab_title(
                         has_indeterminate: false,
                         right,
                         left_len: 0,
+                        accent: None,
                     }))
                 }
             }
@@ -371,6 +417,7 @@ fn compute_tab_title(
                 has_indeterminate,
                 right: None,
                 left_len: 0,
+                accent: None,
             }
         }
     }
@@ -390,7 +437,7 @@ pub(crate) fn agent_state_is_waiting(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::agent_state_is_waiting;
+    use super::{agent_state_is_waiting, take_accent, FormatColor, FormatItem, SrgbaTuple};
 
     #[test]
     fn detects_waiting_agent_state() {
@@ -401,6 +448,54 @@ mod tests {
         assert!(!agent_state_is_waiting("error:1762500000"));
         assert!(!agent_state_is_waiting("waiting-room"));
         assert!(!agent_state_is_waiting(""));
+    }
+
+    fn fg(s: &str) -> FormatItem {
+        FormatItem::Foreground(FormatColor::Color(s.to_string()))
+    }
+
+    fn text(s: &str) -> FormatItem {
+        FormatItem::Text(s.to_string())
+    }
+
+    #[test]
+    fn accent_is_the_foreground_at_the_marker_and_the_marker_is_removed() {
+        let (items, accent) = take_accent(vec![
+            fg("#a02a28"),
+            text("\u{1d}"),
+            fg("#eff1f5"),
+            text("1|"),
+        ]);
+        assert_eq!(accent, "#a02a28".parse::<SrgbaTuple>().ok());
+        assert_eq!(items, vec![fg("#a02a28"), fg("#eff1f5"), text("1|")]);
+    }
+
+    #[test]
+    fn accent_marker_inside_text_keeps_the_rest_and_first_marker_wins() {
+        let (items, accent) = take_accent(vec![
+            fg("#123456"),
+            text("a\u{1d}b"),
+            fg("#654321"),
+            text("\u{1d}c"),
+        ]);
+        assert_eq!(accent, "#123456".parse::<SrgbaTuple>().ok());
+        assert_eq!(
+            items,
+            vec![fg("#123456"), text("ab"), fg("#654321"), text("c")]
+        );
+    }
+
+    #[test]
+    fn no_marker_or_no_rgb_foreground_means_no_accent() {
+        let (items, accent) = take_accent(vec![fg("#123456"), text("plain")]);
+        assert_eq!(accent, None);
+        assert_eq!(items, vec![fg("#123456"), text("plain")]);
+        let (_, accent) = take_accent(vec![
+            fg("#123456"),
+            FormatItem::ResetAttributes,
+            text("\u{1d}"),
+        ]);
+        assert_eq!(accent, None);
     }
 }
 
@@ -413,6 +508,7 @@ impl TabBarState {
                 title: Line::from_text(" ", &CellAttributes::blank(), 1, None),
                 right_title: None,
                 agent_waiting: false,
+                accent: None,
                 x: 1,
                 width: 1,
             }],
@@ -513,6 +609,7 @@ impl TabBarState {
                 title: title.to_owned(),
                 right_title: None,
                 agent_waiting: false,
+                accent: None,
                 x: *x,
                 width,
             });
@@ -680,6 +777,7 @@ impl TabBarState {
                 title: left_status_line.clone(),
                 right_title: None,
                 agent_waiting: false,
+                accent: None,
                 x,
                 width: left_status_line.len(),
             });
@@ -748,6 +846,7 @@ impl TabBarState {
                 title,
                 right_title: tab_title.right.clone(),
                 agent_waiting: tab_info[tab_idx].agent_waiting,
+                accent: tab_title.accent,
                 x: tab_start_idx,
                 width,
             });
@@ -772,6 +871,7 @@ impl TabBarState {
                 title: new_tab_button.clone(),
                 right_title: None,
                 agent_waiting: false,
+                accent: None,
                 x: button_start,
                 width,
             });
@@ -836,6 +936,7 @@ impl TabBarState {
             title: right_status_line.clone(),
             right_title: None,
             agent_waiting: false,
+            accent: None,
             x,
             width: status_space_available,
         });
