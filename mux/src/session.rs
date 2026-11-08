@@ -180,6 +180,14 @@ mod tests {
     }
 
     #[test]
+    fn empty_cwd_is_ignored() {
+        let mut pane = pane_with_vars(&["sh"], &[]);
+        pane.cwd = Some(String::new());
+        let command = command_for(&pane).unwrap();
+        assert!(command.command.get_cwd().is_none());
+    }
+
+    #[test]
     fn session_state_round_trips() {
         let state = SessionState {
             version: 1,
@@ -296,7 +304,7 @@ fn command_for(pane: &PaneState) -> Option<RestoreCommand> {
     if argv.len() > 1 {
         command.args(&argv[1..]);
     }
-    if let Some(cwd) = &pane.cwd {
+    if let Some(cwd) = pane.cwd.as_deref().filter(|cwd| !cwd.is_empty()) {
         command.cwd(cwd);
     }
     for (key, value) in &pane.env {
