@@ -11,11 +11,10 @@ impl crate::TermWindow {
         // While any tab shows the indeterminate progress spinner, ask to be
         // repainted when its next frame is due. The paint scheduler wakes us
         // when this is the soonest pending animation and rebuilds the tab bar
-        // to advance the frame.
+        // to advance the frame.  A waiting agent's TTL expiry is handled by
+        // the independent timer armed in update_title_impl, which is not
+        // gated on window focus.
         self.update_next_frame_time(self.tab_bar.next_progress_frame_due());
-        // A waiting agent's TTL expiry has no event of its own; rebuild the
-        // bar then so the ring disappears even when nothing else changes.
-        self.update_next_frame_time(self.tab_bar.next_waiting_expiry());
 
         if self.config.use_fancy_tab_bar {
             if self.fancy_tab_bar.is_none() {

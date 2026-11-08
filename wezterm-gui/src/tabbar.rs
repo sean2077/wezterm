@@ -24,11 +24,6 @@ pub struct TabBarState {
     /// at which the tab bar should be rebuilt to advance to the next frame;
     /// None when no spinner is visible.
     next_progress_frame_due: Option<Instant>,
-    /// When a waiting agent's `agent_state` epoch reaches
-    /// `tab_bar_waiting_ttl_seconds`, the instant at which the tab bar should
-    /// be rebuilt so the waiting ring disappears even when nothing else
-    /// triggers a repaint. None when no waiting state is scheduled to expire.
-    next_waiting_expiry: Option<Instant>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -717,7 +712,6 @@ impl TabBarState {
                 width: 1,
             }],
             next_progress_frame_due: None,
-            next_waiting_expiry: None,
         }
     }
 
@@ -731,10 +725,6 @@ impl TabBarState {
 
     pub fn next_progress_frame_due(&self) -> Option<Instant> {
         self.next_progress_frame_due
-    }
-
-    pub fn next_waiting_expiry(&self) -> Option<Instant> {
-        self.next_waiting_expiry
     }
 
     fn integrated_title_buttons(
@@ -842,7 +832,6 @@ impl TabBarState {
         right_status: &str,
         fancy_title_width: Option<usize>,
         fancy_tab: Option<&FancyTabMetrics>,
-        next_waiting_expiry: Option<Instant>,
     ) -> Self {
         let colors = colors.cloned().unwrap_or_else(TabBarColors::default);
 
@@ -1218,7 +1207,6 @@ impl TabBarState {
             line,
             items,
             next_progress_frame_due: has_indeterminate_progress.then(next_spinner_frame_due),
-            next_waiting_expiry,
         }
     }
 

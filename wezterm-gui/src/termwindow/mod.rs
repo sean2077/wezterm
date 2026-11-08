@@ -60,7 +60,7 @@ use std::ops::Add;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use termwiz::hyperlink::Hyperlink;
 use termwiz::surface::SequenceNo;
 use wezterm_dynamic::Value;
@@ -445,6 +445,12 @@ pub struct TermWindow {
     line_quad_cache: RefCell<LfuCache<LineQuadCacheKey, LineQuadCacheValue>>,
 
     last_status_call: Instant,
+    /// Wall-clock expiry of the earliest waiting agent state.  The timer armed
+    /// for it rebuilds the tab bar even while the window is unfocused, unlike
+    /// the animation-frame scheduling, which only runs when focused.  Stored
+    /// as SystemTime so repeated title updates see the same value and do not
+    /// re-arm the timer every time.
+    waiting_expiry_timer: Option<SystemTime>,
     cursor_blink_state: RefCell<ColorEase>,
     blink_state: RefCell<ColorEase>,
     rapid_blink_state: RefCell<ColorEase>,
@@ -768,6 +774,7 @@ impl TermWindow {
                 &config,
             )),
             last_status_call: Instant::now(),
+            waiting_expiry_timer: None,
             cursor_blink_state: RefCell::new(ColorEase::new(
                 config.cursor_blink_rate,
                 config.cursor_blink_ease_in,
@@ -2004,6 +2011,9 @@ impl TermWindow {
             _ => return,
         };
         let (tabs, next_waiting_expiry) = self.get_tab_information();
+        // Schedule the TTL rebuild independently of the focus-gated animation
+        // frame timer, so an unfocused window drops the waiting ring too.
+        self.schedule_waiting_expiry(next_waiting_expiry);
         let panes = self.get_pane_information();
         let active_tab = tabs.iter().find(|t| t.is_active).cloned();
         let active_pane = panes.iter().find(|p| p.is_active).cloned();
@@ -2081,7 +2091,6 @@ impl TermWindow {
             &self.right_status,
             fancy_title_width,
             fancy_tab_metrics.as_ref(),
-            next_waiting_expiry,
         );
         if new_tab_bar != self.tab_bar {
             self.tab_bar = new_tab_bar;
@@ -2188,6 +2197,41 @@ impl TermWindow {
                 .detach();
             }
         }
+    }
+
+    /// Rebuild the tab bar when the earliest waiting agent's TTL expires.
+    /// Unlike the animation-frame scheduling, this timer is not gated on the
+    /// window having focus, so an unfocused window also drops the ring.  The
+    /// expiry is the stable wall-clock value from `get_tab_information`, so
+    /// title updates that do not change it keep the same armed timer.
+    fn schedule_waiting_expiry(&mut self, expiry: Option<SystemTime>) {
+        if self.waiting_expiry_timer == expiry {
+            return;
+        }
+        let Some(expiry) = expiry else {
+            self.waiting_expiry_timer = None;
+            return;
+        };
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+        self.waiting_expiry_timer = Some(expiry);
+        let window = window.clone();
+        let delay = expiry
+            .duration_since(SystemTime::now())
+            .unwrap_or_default();
+        promise::spawn::spawn(async move {
+            Timer::at(Instant::now() + delay).await;
+            window.notify(TermWindowNotif::Apply(Box::new(move |tw| {
+                // A newer expiry may have been armed while this timer was
+                // pending; only clear the mark this timer owns.
+                if tw.waiting_expiry_timer == Some(expiry) {
+                    tw.waiting_expiry_timer = None;
+                }
+                tw.update_title();
+            })));
+        })
+        .detach();
     }
 
     fn update_text_cursor(&mut self, pos: &PositionedPane) {
@@ -3561,19 +3605,20 @@ impl TermWindow {
         }
     }
 
-    fn get_tab_information(&mut self) -> (Vec<TabInformation>, Option<Instant>) {
+    fn get_tab_information(&mut self) -> (Vec<TabInformation>, Option<SystemTime>) {
         let mux = Mux::get();
         let window = match mux.get_window(self.mux_window_id) {
             Some(window) => window,
             _ => return (vec![], None),
         };
         let tab_index = window.get_active_tab_idx();
-        let now_epoch = std::time::SystemTime::now()
+        let now_wall = std::time::SystemTime::now();
+        let now_epoch = now_wall
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| duration.as_secs())
             .unwrap_or(0);
         let ttl_seconds = self.config.tab_bar_waiting_ttl_seconds;
-        let mut next_waiting_expiry: Option<Instant> = None;
+        let mut next_waiting_expiry: Option<SystemTime> = None;
 
         let tabs = window
             .iter_tabs()
@@ -3594,18 +3639,18 @@ impl TermWindow {
                         continue;
                     }
                     agent_waiting = true;
-                    // Schedule a rebuild at the TTL boundary so the ring goes
-                    // away even when no other event repaints the bar.
+                    // Keep the wall-clock expiry of the earliest waiting
+                    // state; update_title_impl arms an independent timer for
+                    // it so the ring goes away even while unfocused.  Storing
+                    // SystemTime (not Instant) keeps the value stable across
+                    // rebuilds, so the timer is not re-armed on every update.
                     if ttl_seconds > 0 {
                         if let Some(epoch) = epoch {
                             let expiry = std::time::UNIX_EPOCH
                                 + std::time::Duration::from_secs(epoch.saturating_add(ttl_seconds));
-                            if let Ok(remaining) =
-                                expiry.duration_since(std::time::SystemTime::now())
-                            {
-                                let due = Instant::now() + remaining;
+                            if expiry > now_wall {
                                 next_waiting_expiry =
-                                    Some(next_waiting_expiry.map_or(due, |cur| cur.min(due)));
+                                    Some(next_waiting_expiry.map_or(expiry, |cur| cur.min(expiry)));
                             }
                         }
                     }
