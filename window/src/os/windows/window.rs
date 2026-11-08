@@ -824,7 +824,7 @@ impl WindowOps for Window {
     }
 
     fn quake_hotkey_available(&self) -> bool {
-        quake::hotkey_available()
+        quake::hotkey_available(self.0)
     }
 
     fn focus(&self) {

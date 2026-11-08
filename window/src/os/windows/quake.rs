@@ -9,7 +9,8 @@
 
 use super::{rc_from_hwnd, HWindow, WindowInner};
 use config::{DeferredKeyCode, KeyNoAction, QuakeAlignment, QuakeConfig, QuakeEdge, QuakeMonitor};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::HashSet;
+use std::sync::{LazyLock, Mutex};
 use wezterm_input_types::{KeyCode, Modifiers};
 use winapi::shared::minwindef::*;
 use winapi::shared::windef::*;
@@ -17,7 +18,34 @@ use winapi::um::winuser::*;
 
 const QUAKE_HOTKEY_ID: i32 = 1;
 
-static QUAKE_HOTKEY_REGISTERED: AtomicBool = AtomicBool::new(false);
+/// Windows (by HWND) that currently own the global quake hotkey.  The
+/// registration itself is per-window, so the "available" answer must be too:
+/// a second window failing to register must not make the first window think
+/// its hotkey is gone.
+static QUAKE_HOTKEY_WINDOWS: LazyLock<Mutex<HashSet<isize>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+fn hotkey_key(hwnd: HWindow) -> isize {
+    hwnd.0 as isize
+}
+
+fn set_hotkey_registered(hwnd: HWindow, registered: bool) {
+    let key = hotkey_key(hwnd);
+    let mut windows = QUAKE_HOTKEY_WINDOWS.lock().unwrap();
+    if registered {
+        windows.insert(key);
+    } else {
+        windows.remove(&key);
+    }
+}
+
+/// Whether this window owns the quake hotkey.
+pub(super) fn hotkey_available(hwnd: HWindow) -> bool {
+    QUAKE_HOTKEY_WINDOWS
+        .lock()
+        .unwrap()
+        .contains(&hotkey_key(hwnd))
+}
 
 #[derive(Default)]
 pub(super) struct QuakeState {
@@ -37,10 +65,6 @@ struct Bounds {
     y: i32,
     width: i32,
     height: i32,
-}
-
-pub(super) fn hotkey_available() -> bool {
-    QUAKE_HOTKEY_REGISTERED.load(Ordering::Relaxed)
 }
 
 /// Register, unregister or re-register the configured global hotkey and keep
@@ -80,12 +104,12 @@ pub(super) fn sync_hotkey(inner: &mut WindowInner) {
     match register_hotkey(inner.hwnd.0, &spec) {
         Ok(()) => {
             inner.quake.registered = true;
-            QUAKE_HOTKEY_REGISTERED.store(true, Ordering::Relaxed);
+            set_hotkey_registered(inner.hwnd, true);
             log::info!("quake: registered global hotkey");
         }
         Err(err) => {
             inner.quake.registered = false;
-            QUAKE_HOTKEY_REGISTERED.store(false, Ordering::Relaxed);
+            set_hotkey_registered(inner.hwnd, false);
             log::error!("quake: {err}");
             if !is_visible(inner.hwnd.0) {
                 show_async(inner.hwnd.0);
@@ -107,7 +131,7 @@ pub(super) fn unregister_hotkey(inner: &mut WindowInner) {
             }
         }
         inner.quake.registered = false;
-        QUAKE_HOTKEY_REGISTERED.store(false, Ordering::Relaxed);
+        set_hotkey_registered(inner.hwnd, false);
     }
 }
 
@@ -135,6 +159,15 @@ pub(super) fn focus_lost(hwnd: HWND, config: &QuakeConfig) {
     if !config.enabled || !config.hide_on_focus_loss || hwnd.is_null() {
         return;
     }
+    // If the hotkey could not be registered the window is a visible fallback;
+    // hiding it here would leave no way back (no hotkey, no taskbar entry).
+    let registered = match rc_from_hwnd(hwnd) {
+        Some(inner) => inner.borrow().quake.registered,
+        None => false,
+    };
+    if !registered {
+        return;
+    }
     if unsafe { IsWindowVisible(hwnd) } == 0 {
         return;
     }
@@ -159,16 +192,20 @@ pub(super) fn close_hides(hwnd: HWND) -> bool {
     let Some(inner) = rc_from_hwnd(hwnd) else {
         return false;
     };
-    let enabled = {
+    let (enabled, registered) = {
         let inner = inner.borrow();
-        inner.config.quake.enabled
+        (inner.config.quake.enabled, inner.quake.registered)
     };
-    if enabled {
+    // Only hide on close when the hotkey is actually there to bring the window
+    // back.  A failed registration falls back to normal window behavior.
+    if enabled && registered {
         unsafe {
             ShowWindowAsync(hwnd, SW_HIDE);
         }
+        true
+    } else {
+        false
     }
-    enabled
 }
 
 fn toggle(hwnd: HWND, config: &QuakeConfig, fullscreen: bool) {
@@ -206,7 +243,26 @@ fn show_quake(hwnd: HWND, config: &QuakeConfig, fullscreen: bool) -> Result<(), 
             log::warn!("quake: SetForegroundWindow was refused");
         }
     }
+    // Moving the hidden window across monitors can make the GUI queue a
+    // "keep rows/cols" resize during WM_DPICHANGED.  Its queued task runs
+    // after this handler, so re-apply the quake bounds once more behind it.
+    reapply_bounds_async(hwnd, config, fullscreen);
     Ok(())
+}
+
+/// Re-apply the quake bounds from a queued main-thread task.  Used after a
+/// show or fullscreen toggle so a speculative GUI resize cannot win.
+fn reapply_bounds_async(hwnd: HWND, config: &QuakeConfig, fullscreen: bool) {
+    let config = config.clone();
+    promise::spawn::spawn(async move {
+        match quake_bounds(&config, fullscreen)
+            .and_then(|bounds| apply_bounds(hwnd, &config, &bounds))
+        {
+            Ok(()) => log::debug!("quake: re-applied bounds"),
+            Err(err) => log::warn!("quake: re-applying bounds failed: {err}"),
+        }
+    })
+    .detach();
 }
 
 /// Move and size the quake window to `bounds`. Callers must not hold a
@@ -271,8 +327,21 @@ pub(super) fn toggle_fullscreen(inner: &mut WindowInner) {
         match quake_bounds(&config, fullscreen)
             .and_then(|bounds| apply_bounds(hwnd.0, &config, &bounds))
         {
-            Ok(()) => log::info!("quake: fullscreen={fullscreen}"),
-            Err(err) => log::error!("quake: {err}"),
+            Ok(()) => {
+                log::info!("quake: fullscreen={fullscreen}");
+                reapply_bounds_async(hwnd.0, &config, fullscreen);
+            }
+            Err(err) => {
+                log::warn!("quake: {err}");
+                // The state was flipped before the asynchronous apply; roll it
+                // back so the next F3 matches what is actually on screen.
+                if let Some(inner) = rc_from_hwnd(hwnd.0) {
+                    let mut inner = inner.borrow_mut();
+                    if inner.quake.fullscreen == fullscreen {
+                        inner.quake.fullscreen = !fullscreen;
+                    }
+                }
+            }
         }
     })
     .detach();
