@@ -335,6 +335,10 @@ impl WindowInner {
         self.last_size.replace(current_dims);
 
         if !same {
+            // Reset the cache too: the IME is told the cursor is at (0,0)
+            // here, so the next paint must send the real position even if it
+            // matches the previously cached rect.
+            self.last_ime_cursor = None;
             self.set_ime_window_position(Rect::default());
 
             self.events.dispatch(WindowEvent::Resized {
