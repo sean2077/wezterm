@@ -277,6 +277,11 @@ pub trait Pane: Downcast + Send + Sync {
         None
     }
 
+    /// Replace the recorded spawn command.  Used after restoring a pane from
+    /// `agent.restore_argv` so the next save records the pane's original
+    /// command instead of the replacement command.
+    fn set_spawn_info(&self, _info: Option<crate::session::SpawnInfo>) {}
+
     /// Set or clear a user var from a host-side integration.
     fn set_user_var(&self, _name: &str, _value: Option<&str>) {}
 

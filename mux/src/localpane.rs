@@ -134,7 +134,7 @@ pub struct LocalPane {
     #[cfg(unix)]
     leader: Arc<Mutex<Option<CachedLeaderInfo>>>,
     command_description: String,
-    spawn_info: Option<SpawnInfo>,
+    spawn_info: Mutex<Option<SpawnInfo>>,
 }
 
 #[async_trait(?Send)]
@@ -226,7 +226,11 @@ impl Pane for LocalPane {
     }
 
     fn get_spawn_info(&self) -> Option<SpawnInfo> {
-        self.spawn_info.clone()
+        self.spawn_info.lock().clone()
+    }
+
+    fn set_spawn_info(&self, info: Option<SpawnInfo>) {
+        *self.spawn_info.lock() = info;
     }
 
     fn set_user_var(&self, name: &str, value: Option<&str>) {
@@ -1048,7 +1052,7 @@ impl LocalPane {
             #[cfg(unix)]
             leader: Arc::new(Mutex::new(None)),
             command_description,
-            spawn_info,
+            spawn_info: Mutex::new(spawn_info),
         }
     }
 

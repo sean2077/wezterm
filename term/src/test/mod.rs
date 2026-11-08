@@ -1378,3 +1378,21 @@ fn test_hyperlinks() {
         Compare::TEXT | Compare::ATTRS,
     );
 }
+
+#[test]
+fn osc_cannot_set_reserved_agent_user_vars() {
+    let mut term = TestTerm::new(2, 20, 0);
+    // base64("hello")
+    term.print("\x1b]1337;SetUserVar=agent.restore_argv=aGVsbG8=\x07");
+    assert!(
+        !term.term.user_vars().contains_key("agent.restore_argv"),
+        "OSC 1337 must not write the host-reserved agent namespace"
+    );
+    // A regular name still works (agent_state has no dot and is used by the
+    // notification helpers).
+    term.print("\x1b]1337;SetUserVar=agent_state=aGVsbG8=\x07");
+    assert_eq!(
+        term.term.user_vars().get("agent_state").map(String::as_str),
+        Some("hello")
+    );
+}

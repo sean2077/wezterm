@@ -831,9 +831,17 @@ impl<'a> Performer<'a> {
                 }
                 ITermProprietary::File(image) => self.set_image(*image),
                 ITermProprietary::SetUserVar { name, value } => {
-                    self.user_vars.insert(name.clone(), value.clone());
-                    if let Some(handler) = self.alert_handler.as_mut() {
-                        handler.alert(Alert::SetUserVar { name, value });
+                    // `agent.*` is reserved for the host integration: the mux
+                    // CLI is the only writer.  Allowing terminal output to set
+                    // these would let untrusted bytes inject a restore
+                    // command (agent.restore_argv) or a shutdown marker.
+                    if name.starts_with("agent.") {
+                        log::warn!("ignoring OSC 1337 SetUserVar for reserved name {name}");
+                    } else {
+                        self.user_vars.insert(name.clone(), value.clone());
+                        if let Some(handler) = self.alert_handler.as_mut() {
+                            handler.alert(Alert::SetUserVar { name, value });
+                        }
                     }
                 }
                 ITermProprietary::UnicodeVersion(ITermUnicodeVersionOp::Set(n)) => {

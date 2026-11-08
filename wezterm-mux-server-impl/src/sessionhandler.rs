@@ -1045,15 +1045,12 @@ impl SessionHandler {
 
             Pdu::CloseAgentSessions(CloseAgentSessions {
                 timeout_seconds,
-                force,
+                force: _,
             }) => {
                 promise::spawn::spawn(async move {
                     let mux = Mux::get();
                     let result = mux
-                        .close_agent_sessions(
-                            std::time::Duration::from_secs(timeout_seconds),
-                            force,
-                        )
+                        .close_agent_sessions(std::time::Duration::from_secs(timeout_seconds))
                         .await;
                     send_response(result.map(|summary| {
                         Pdu::CloseAgentSessionsResponse(CloseAgentSessionsResponse {

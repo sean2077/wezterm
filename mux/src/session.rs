@@ -4,8 +4,17 @@
 //! other agent.  A pane carries its original spawn argv/cwd/env, its user vars
 //! and its title.  Agent integrations communicate through user vars:
 //!
-//! * `agent.resume_args` - JSON array of arguments appended on restore
-//! * `agent.shutdown`    - non-empty means close-agent-sessions should target it
+//! * `agent.restore_argv` - JSON array; a complete replacement command used on
+//!   restore.  This var is host-only: OSC 1337 cannot set `agent.*` names, so
+//!   untrusted terminal output cannot inject a command.
+//! * `agent.shutdown`     - non-empty means close-agent-sessions should target it
+//!
+//! `agent.resume_args` is obsolete.  It was appended to the original spawn
+//! argv, which sent the arguments to shell wrappers instead of the agent; it is
+//! ignored on restore (with a warning) so old snapshots stay readable.
+//!
+//! The session file still has an `env` field for format compatibility, but
+//! spawn-info env is not captured today, so it is always empty.
 //!
 //! This keeps the native implementation reusable for any terminal program.
 
@@ -18,8 +27,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use wezterm_term::TerminalSize;
 
+pub const AGENT_RESTORE_ARGV: &str = "agent.restore_argv";
+/// Obsolete append-style resume variable; ignored on restore.
 pub const AGENT_RESUME_ARGS: &str = "agent.resume_args";
 pub const AGENT_SHUTDOWN: &str = "agent.shutdown";
 
@@ -70,6 +80,9 @@ pub struct SaveSummary {
     pub path: PathBuf,
     pub windows: usize,
     pub tabs: usize,
+    /// Tabs that could not be represented because their pane has no local
+    /// spawn command (for example ssh or tmux client panes).
+    pub skipped: usize,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -103,38 +116,66 @@ pub fn default_workspace_path() -> PathBuf {
 mod tests {
     use super::*;
 
-    #[test]
-    fn command_appends_generic_resume_args() {
-        let pane = PaneState {
+    fn argv_of(command: &RestoreCommand) -> Vec<String> {
+        command
+            .command
+            .get_argv()
+            .iter()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect::<Vec<_>>()
+    }
+
+    fn pane_with_vars(argv: &[&str], vars: &[(&str, &str)]) -> PaneState {
+        PaneState {
             cwd: Some("/tmp".to_string()),
-            argv: vec!["agent".to_string(), "--flag".to_string()],
+            argv: argv.iter().map(|arg| arg.to_string()).collect(),
             env: BTreeMap::new(),
             title: "agent".to_string(),
-            user_vars: BTreeMap::from([(
-                AGENT_RESUME_ARGS.to_string(),
-                r#"["--resume","123"]"#.to_string(),
-            )]),
-        };
-        let command = command_for(&pane).unwrap();
-        assert_eq!(
-            command
-                .get_argv()
+            user_vars: vars
                 .iter()
-                .map(|arg| arg.to_string_lossy().to_string())
-                .collect::<Vec<_>>(),
-            vec!["agent", "--flag", "--resume", "123"]
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn restore_argv_replaces_the_command() {
+        let pane = pane_with_vars(
+            &["zsh", "-i"],
+            &[(AGENT_RESTORE_ARGV, r#"["zsh","-i","-c","claude --resume 123"]"#)],
         );
+        let command = command_for(&pane).unwrap();
+        assert!(command.used_restore_argv);
+        assert_eq!(
+            argv_of(&command),
+            vec!["zsh", "-i", "-c", "claude --resume 123"]
+        );
+        // The recorded base argv must stay the original spawn command.
+        assert_eq!(command.base_argv, vec!["zsh", "-i"]);
+    }
+
+    #[test]
+    fn obsolete_resume_args_are_ignored() {
+        let pane = pane_with_vars(
+            &["agent", "--flag"],
+            &[(AGENT_RESUME_ARGS, r#"["--resume","123"]"#)],
+        );
+        let command = command_for(&pane).unwrap();
+        assert!(!command.used_restore_argv);
+        assert_eq!(argv_of(&command), vec!["agent", "--flag"]);
+    }
+
+    #[test]
+    fn invalid_restore_argv_falls_back_to_the_base_argv() {
+        let pane = pane_with_vars(&["sh"], &[(AGENT_RESTORE_ARGV, "not json")]);
+        let command = command_for(&pane).unwrap();
+        assert!(!command.used_restore_argv);
+        assert_eq!(argv_of(&command), vec!["sh"]);
     }
 
     #[test]
     fn empty_argv_uses_default_shell() {
-        let pane = PaneState {
-            cwd: None,
-            argv: vec![],
-            env: BTreeMap::new(),
-            title: String::new(),
-            user_vars: BTreeMap::new(),
-        };
+        let pane = pane_with_vars(&[], &[]);
         assert!(command_for(&pane).is_none());
     }
 
@@ -214,16 +255,40 @@ fn truthy(value: Option<&String>) -> bool {
     matches!(value.map(|v| v.as_str()), Some("1" | "true" | "yes"))
 }
 
-fn resume_args(user_vars: &BTreeMap<String, String>) -> Vec<String> {
-    user_vars
-        .get(AGENT_RESUME_ARGS)
-        .and_then(|value| serde_json::from_str::<Vec<String>>(value).ok())
-        .unwrap_or_default()
+fn restore_argv(user_vars: &BTreeMap<String, String>) -> Option<Vec<String>> {
+    let raw = user_vars.get(AGENT_RESTORE_ARGV)?;
+    match serde_json::from_str::<Vec<String>>(raw) {
+        Ok(argv) if !argv.is_empty() && !argv[0].is_empty() => Some(argv),
+        Ok(_) => {
+            log::warn!("restore workspace: ignoring empty {AGENT_RESTORE_ARGV}");
+            None
+        }
+        Err(err) => {
+            log::warn!("restore workspace: ignoring invalid {AGENT_RESTORE_ARGV}: {err:#}");
+            None
+        }
+    }
 }
 
-fn command_for(pane: &PaneState) -> Option<portable_pty::CommandBuilder> {
-    let mut argv = pane.argv.clone();
-    argv.extend(resume_args(&pane.user_vars));
+struct RestoreCommand {
+    command: portable_pty::CommandBuilder,
+    /// The pane's original spawn argv.  Restored panes must record this rather
+    /// than the replacement command so repeated save/restore cycles do not
+    /// accumulate arguments.
+    base_argv: Vec<String>,
+    used_restore_argv: bool,
+}
+
+fn command_for(pane: &PaneState) -> Option<RestoreCommand> {
+    if pane.user_vars.contains_key(AGENT_RESUME_ARGS) {
+        log::warn!(
+            "restore workspace: ignoring obsolete {AGENT_RESUME_ARGS} (use {AGENT_RESTORE_ARGV}): argv={:?}",
+            pane.argv
+        );
+    }
+    let replacement = restore_argv(&pane.user_vars);
+    let used_restore_argv = replacement.is_some();
+    let argv = replacement.unwrap_or_else(|| pane.argv.clone());
     if argv.is_empty() {
         return None;
     }
@@ -237,7 +302,11 @@ fn command_for(pane: &PaneState) -> Option<portable_pty::CommandBuilder> {
     for (key, value) in &pane.env {
         command.env(key, value);
     }
-    Some(command)
+    Some(RestoreCommand {
+        command,
+        base_argv: pane.argv.clone(),
+        used_restore_argv,
+    })
 }
 
 impl Mux {
@@ -245,6 +314,7 @@ impl Mux {
         let mut state = SessionState::new();
         let mut window_ids = self.iter_windows();
         window_ids.sort();
+        let mut skipped = 0usize;
 
         for window_id in window_ids {
             let window = self
@@ -255,29 +325,36 @@ impl Mux {
                 let Some(pane) = tab.get_active_pane() else {
                     continue;
                 };
-                let spawn = pane.get_spawn_info();
+                let Some(spawn) = pane.get_spawn_info() else {
+                    // A pane hosted by another domain (ssh, tmux, ...) has no
+                    // local spawn command.  Restoring it as the default shell
+                    // would silently replace the remote session, so skip it.
+                    skipped += 1;
+                    log::warn!(
+                        "save workspace: skipping pane {} ({:?}); it has no local spawn command",
+                        pane.pane_id(),
+                        tab.get_title()
+                    );
+                    continue;
+                };
                 let cwd = pane
                     .get_current_working_dir(CachePolicy::AllowStale)
                     .as_ref()
                     .and_then(path_string)
-                    .or_else(|| spawn.as_ref().and_then(|info| info.cwd.clone()));
+                    .or_else(|| spawn.cwd.clone());
                 let user_vars = pane
                     .copy_user_vars()
                     .into_iter()
                     .collect::<BTreeMap<_, _>>();
                 tabs.push(TabState {
                     title: tab.get_title(),
+                    // Kept for format compatibility; the active tab lives on
+                    // WindowState.  Per-tab split focus was never restored.
                     active_tab: 0,
                     pane: PaneState {
                         cwd,
-                        argv: spawn
-                            .as_ref()
-                            .map(|info| info.argv.clone())
-                            .unwrap_or_default(),
-                        env: spawn
-                            .as_ref()
-                            .map(|info| info.env.clone())
-                            .unwrap_or_default(),
+                        argv: spawn.argv.clone(),
+                        env: spawn.env.clone(),
                         title: pane.get_title(),
                         user_vars,
                     },
@@ -293,11 +370,17 @@ impl Mux {
             });
         }
 
+        if skipped > 0 {
+            log::warn!(
+                "save workspace: skipped {skipped} pane(s) without a local spawn command (ssh/tmux)"
+            );
+        }
         write_json(path, &state)?;
         Ok(SaveSummary {
             path: path.to_path_buf(),
             windows: state.windows.len(),
             tabs: state.windows.iter().map(|window| window.tabs.len()).sum(),
+            skipped,
         })
     }
 
@@ -308,14 +391,21 @@ impl Mux {
         replace: bool,
     ) -> Result<RestoreSummary> {
         let state = read_json(path)?;
-        let target_window = target_window.or_else(|| {
-            let windows = self.iter_windows();
-            if windows.len() == 1 {
-                windows.first().copied()
-            } else {
-                None
+        let target_window = match target_window {
+            Some(id) => Some(id),
+            None => {
+                let windows = self.iter_windows();
+                if windows.len() == 1 {
+                    windows.first().copied()
+                } else if replace {
+                    return Err(anyhow!(
+                        "restore-workspace --replace requires --window-id when more than one window exists"
+                    ));
+                } else {
+                    None
+                }
             }
-        });
+        };
         let old_tabs: Vec<_> = if replace {
             target_window
                 .and_then(|id| self.get_window(id))
@@ -326,21 +416,34 @@ impl Mux {
         };
 
         let mut summary = RestoreSummary::default();
+        let mut restored_any = false;
+        // Active tabs are applied after --replace removes the old tabs, so the
+        // index still points at the same restored tab.
+        let mut active_targets: Vec<(crate::window::WindowId, crate::tab::TabId)> = Vec::new();
         for (window_index, saved_window) in state.windows.iter().enumerate() {
             let mut current_window = if window_index == 0 {
                 target_window
             } else {
                 None
             };
-            let mut active_tab = 0;
+            let mut restored_tab_ids = Vec::new();
             for (tab_index, saved_tab) in saved_window.tabs.iter().enumerate() {
-                let window_id_for_spawn = if tab_index == 0 {
-                    current_window
-                } else {
-                    current_window
+                let Some(restore) = command_for(&saved_tab.pane) else {
+                    log::warn!(
+                        "restore workspace: window {window_index} tab {tab_index} ({:?}) has no command",
+                        saved_tab.title
+                    );
+                    summary.failed += 1;
+                    continue;
                 };
-                let command = command_for(&saved_tab.pane);
-                let size = TerminalSize::default();
+                // The tab bar size comes from the target window; only a brand
+                // new window needs the configured initial size.
+                let size = current_window
+                    .and_then(|window_id| {
+                        self.get_window(window_id)
+                            .and_then(|window| window.get_active_tab().map(|tab| tab.get_size()))
+                    })
+                    .unwrap_or_else(|| config::configuration().initial_size(0, None));
                 let workspace = if saved_window.workspace.is_empty() {
                     "default".to_string()
                 } else {
@@ -348,9 +451,9 @@ impl Mux {
                 };
                 let result = self
                     .spawn_tab_or_window(
-                        window_id_for_spawn,
+                        current_window,
                         SpawnTabDomain::DefaultDomain,
-                        command,
+                        Some(restore.command),
                         saved_tab.pane.cwd.clone(),
                         size,
                         None,
@@ -361,14 +464,22 @@ impl Mux {
                 match result {
                     Ok((tab, pane, window_id)) => {
                         tab.set_title(&saved_tab.title);
-                        for (name, value) in &saved_tab.pane.user_vars {
-                            pane.set_user_var(name, Some(value));
+                        if restore.used_restore_argv && !restore.base_argv.is_empty() {
+                            // Remember the pane's original spawn command, not
+                            // the replacement command, so repeated restore
+                            // cycles never accumulate arguments.
+                            pane.set_spawn_info(Some(SpawnInfo {
+                                argv: restore.base_argv,
+                                cwd: saved_tab.pane.cwd.clone(),
+                                env: BTreeMap::new(),
+                            }));
                         }
-                        if tab_index == 0 {
+                        if current_window.is_none() {
                             current_window = Some(window_id);
                         }
-                        active_tab = tab_index;
+                        restored_tab_ids.push(tab.tab_id());
                         summary.tabs += 1;
+                        restored_any = true;
                     }
                     Err(err) => {
                         log::error!(
@@ -379,29 +490,49 @@ impl Mux {
                     }
                 }
             }
-            if let Some(window_id) = current_window {
-                if let Some(mut window) = self.get_window_mut(window_id) {
-                    let count = window.count_tabs();
-                    if count > 0 {
-                        window.remember_and_set_active_tab_idx(active_tab.min(count - 1));
-                    }
+            if !restored_tab_ids.is_empty() {
+                // Prefer the saved active tab; fall back to the last tab that
+                // was actually restored.
+                let saved_idx = saved_window
+                    .active_tab
+                    .min(restored_tab_ids.len().saturating_sub(1));
+                let desired = restored_tab_ids
+                    .get(saved_idx)
+                    .copied()
+                    .unwrap_or_else(|| *restored_tab_ids.last().unwrap());
+                if let Some(window_id) = current_window {
+                    active_targets.push((window_id, desired));
                 }
                 summary.windows += 1;
             }
         }
 
-        for tab_id in old_tabs {
-            self.remove_tab(tab_id);
+        // Never destroy the target window when nothing could be restored.
+        if replace && restored_any {
+            for tab_id in old_tabs {
+                self.remove_tab(tab_id);
+            }
+        }
+        for (window_id, tab_id) in active_targets {
+            if let Some(mut window) = self.get_window_mut(window_id) {
+                let idx = window
+                    .iter_tabs()
+                    .position(|tab| tab.tab_id() == tab_id);
+                if let Some(idx) = idx {
+                    window.remember_and_set_active_tab_idx(idx);
+                }
+            }
         }
         self.prune_dead_windows();
         Ok(summary)
     }
 
-    pub async fn close_agent_sessions(
-        &self,
-        timeout: Duration,
-        force: bool,
-    ) -> Result<CloseSummary> {
+    pub async fn close_agent_sessions(&self, timeout: Duration) -> Result<CloseSummary> {
+        // Defend against absurd values from older clients even though the CLI
+        // already validates the range.
+        let timeout = timeout
+            .max(Duration::from_secs(1))
+            .min(Duration::from_secs(3600));
         let mut targets = Vec::new();
         for window_id in self.iter_windows() {
             let Some(window) = self.get_window(window_id) else {
@@ -420,24 +551,25 @@ impl Mux {
             return Ok(CloseSummary::default());
         }
 
+        // Send each step to every pane before moving on, so a room full of
+        // agents sees the same sequence in parallel rather than one pane
+        // waiting for the previous pane's full 450ms.
         for pane in &targets {
-            {
-                let mut writer = pane.writer();
-                let _ = writer.write_all(b"\x1b");
-                let _ = writer.flush();
-            }
-            smol::Timer::after(Duration::from_millis(200)).await;
-            {
-                let mut writer = pane.writer();
-                let _ = writer.write_all(b"\x03");
-                let _ = writer.flush();
-            }
-            smol::Timer::after(Duration::from_millis(250)).await;
-            {
-                let mut writer = pane.writer();
-                let _ = writer.write_all(b"/exit\r");
-                let _ = writer.flush();
-            }
+            let mut writer = pane.writer();
+            let _ = writer.write_all(b"\x1b");
+            let _ = writer.flush();
+        }
+        smol::Timer::after(Duration::from_millis(200)).await;
+        for pane in &targets {
+            let mut writer = pane.writer();
+            let _ = writer.write_all(b"\x03");
+            let _ = writer.flush();
+        }
+        smol::Timer::after(Duration::from_millis(250)).await;
+        for pane in &targets {
+            let mut writer = pane.writer();
+            let _ = writer.write_all(b"/exit\r");
+            let _ = writer.flush();
         }
 
         let deadline = Instant::now() + timeout;
@@ -462,10 +594,6 @@ impl Mux {
                     remaining: remaining_count,
                 });
             }
-            if force {
-                // Continue a little while even with force, so a session that
-                // is already exiting can finish its hook.
-            }
             smol::Timer::after(Duration::from_millis(500)).await;
         }
     }
@@ -475,6 +603,16 @@ impl Mux {
             .get_pane(pane_id)
             .ok_or_else(|| anyhow!("pane {pane_id} not found"))?;
         pane.set_user_var(name, value);
+        // The OSC 1337 path reports changes through the terminal alert
+        // handler; the host-side path must do the same so Lua events fire and
+        // the GUI repaints immediately.
+        self.notify(crate::MuxNotification::Alert {
+            pane_id,
+            alert: wezterm_term::Alert::SetUserVar {
+                name: name.to_string(),
+                value: value.unwrap_or("").to_string(),
+            },
+        });
         Ok(())
     }
 }
