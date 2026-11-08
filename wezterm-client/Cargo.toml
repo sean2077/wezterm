@@ -42,4 +42,8 @@ wezterm-uds.workspace = true
 [target."cfg(windows)".dependencies]
 winapi = { workspace = true, features = [
     "synchapi",
+    "processthreadsapi",
+    "handleapi",
+    "winnt",
+    "minwindef",
 ] }

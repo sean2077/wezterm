@@ -444,3 +444,157 @@ fn prune_dead_agent_links_in(dir: &std::path::Path) -> usize {
     }
     removed
 }
+
+/// Age after which an orphaned GUI log is pruned.
+const GUI_LOG_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// Extract the pid from `wezterm*-log-<pid>.txt`.
+fn gui_log_pid(name: &str) -> Option<u32> {
+    let rest = name.strip_prefix("wezterm")?;
+    let rest = rest.strip_suffix(".txt")?;
+    let idx = rest.find("-log-")?;
+    let pid = &rest[idx + 5..];
+    if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    pid.parse().ok()
+}
+
+/// Whether a pid is alive. `None` means the check is unavailable (never
+/// delete on an unknown answer).
+fn pid_is_alive(pid: u32) -> Option<bool> {
+    #[cfg(windows)]
+    unsafe {
+        use winapi::shared::minwindef::FALSE;
+        use winapi::um::handleapi::CloseHandle;
+        use winapi::um::processthreadsapi::OpenProcess;
+        use winapi::um::winnt::PROCESS_QUERY_LIMITED_INFORMATION;
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if handle.is_null() {
+            return match std::io::Error::last_os_error().raw_os_error() {
+                Some(87) => Some(false), // ERROR_INVALID_PARAMETER: no such process
+                Some(5) => Some(true),   // ERROR_ACCESS_DENIED: exists, protected
+                _ => None,
+            };
+        }
+        CloseHandle(handle);
+        Some(true)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// Remove `wezterm*-log-<pid>.txt` files whose process is gone and that are
+/// older than a week. The current process's own log is never touched.
+pub fn prune_old_gui_logs() -> usize {
+    prune_old_gui_logs_in(
+        &config::RUNTIME_DIR,
+        std::process::id(),
+        SystemTime::now(),
+        &pid_is_alive,
+    )
+}
+
+fn prune_old_gui_logs_in(
+    dir: &std::path::Path,
+    current_pid: u32,
+    now: SystemTime,
+    alive: &dyn Fn(u32) -> Option<bool>,
+) -> usize {
+    let mut removed = 0;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        let Some(pid) = gui_log_pid(name) else {
+            continue;
+        };
+        if pid == current_pid {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
+        let old = now
+            .duration_since(modified)
+            .map(|age| age > GUI_LOG_MAX_AGE)
+            .unwrap_or(false);
+        if !old {
+            continue;
+        }
+        if alive(pid) == Some(false) && std::fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gui_log_pid_parses_only_wezterm_logs() {
+        assert_eq!(gui_log_pid("wezterm-gui.exe-log-123.txt"), Some(123));
+        assert_eq!(gui_log_pid("wezterm.exe-log-7.txt"), Some(7));
+        assert_eq!(gui_log_pid("wezterm-gui.exe-log-.txt"), None);
+        assert_eq!(gui_log_pid("wezterm-gui.exe-log-abc.txt"), None);
+        assert_eq!(gui_log_pid("other-log-1.txt"), None);
+        assert_eq!(gui_log_pid("wezterm-gui.exe-log-1.log"), None);
+    }
+
+    #[test]
+    fn prunes_only_old_dead_logs() {
+        let dir = std::env::temp_dir().join(format!(
+            "wezterm-log-prune-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let now = SystemTime::now();
+        let old = now - Duration::from_secs(8 * 24 * 60 * 60);
+        let make = |name: &str, mtime: SystemTime| {
+            let path = dir.join(name);
+            std::fs::write(&path, b"log").unwrap();
+            let file = std::fs::File::options().write(true).open(&path).unwrap();
+            file.set_times(std::fs::FileTimes::new().set_modified(mtime))
+                .unwrap();
+            path
+        };
+        let dead_old = make("wezterm-gui.exe-log-111.txt", old);
+        let live_old = make("wezterm.exe-log-222.txt", old);
+        let dead_new = make("wezterm-gui.exe-log-333.txt", now);
+        let current = make(&format!("wezterm-gui.exe-log-{}.txt", std::process::id()), old);
+        let other = dir.join("notes.txt");
+        std::fs::write(&other, b"x").unwrap();
+
+        let removed = prune_old_gui_logs_in(&dir, std::process::id(), now, &|pid| match pid {
+            111 => Some(false),
+            222 => Some(true),
+            333 => Some(false),
+            _ => Some(false),
+        });
+        assert_eq!(removed, 1);
+        assert!(!dead_old.exists());
+        assert!(live_old.exists());
+        assert!(dead_new.exists());
+        assert!(current.exists());
+        assert!(other.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

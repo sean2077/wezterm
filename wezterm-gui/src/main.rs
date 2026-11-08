@@ -419,6 +419,10 @@ async fn async_run_terminal_gui(
     if pruned_agent_links > 0 {
         log::info!("pruned {pruned_agent_links} stale agent symlink(s)");
     }
+    let pruned_logs = wezterm_client::discovery::prune_old_gui_logs();
+    if pruned_logs > 0 {
+        log::info!("pruned {pruned_logs} stale GUI log(s)");
+    }
     let unix_socket_path =
         config::RUNTIME_DIR.join(format!("gui-sock-{}", unsafe { libc::getpid() }));
     std::env::set_var("WEZTERM_UNIX_SOCKET", unix_socket_path.clone());
