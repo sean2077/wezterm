@@ -396,6 +396,18 @@ pub struct TabBarColors {
     /// are unchanged. Defaults to #ff9500.
     #[dynamic(default)]
     pub waiting_tab_edge: Option<RgbaColor>,
+
+    /// When set, the fancy tab bar draws a 1-line separator along the edge
+    /// that faces the terminal and folds it around the active tab (left, far
+    /// edge and right), leaving the active tab open towards the content.
+    /// Unset keeps the upstream look.
+    #[dynamic(default)]
+    pub active_tab_edge: Option<RgbaColor>,
+
+    /// Color of the indicator bar and the soft outer glow drawn around tabs
+    /// that are waiting for input. Defaults to `waiting_tab_edge`.
+    #[dynamic(default)]
+    pub waiting_tab_glow: Option<RgbaColor>,
 }
 
 impl TabBarColors {
@@ -444,6 +456,15 @@ impl TabBarColors {
             .unwrap_or_else(default_waiting_tab_edge)
     }
 
+    pub fn active_tab_edge(&self) -> Option<RgbaColor> {
+        self.active_tab_edge
+    }
+
+    pub fn waiting_tab_glow(&self) -> RgbaColor {
+        self.waiting_tab_glow
+            .unwrap_or_else(|| self.waiting_tab_edge())
+    }
+
     pub fn overlay_with(&self, other: &Self) -> Self {
         macro_rules! overlay {
             ($name:ident) => {
@@ -462,6 +483,8 @@ impl TabBarColors {
             inactive_tab_edge: overlay!(inactive_tab_edge),
             inactive_tab_edge_hover: overlay!(inactive_tab_edge_hover),
             waiting_tab_edge: overlay!(waiting_tab_edge),
+            active_tab_edge: overlay!(active_tab_edge),
+            waiting_tab_glow: overlay!(waiting_tab_glow),
             new_tab: overlay!(new_tab),
             new_tab_hover: overlay!(new_tab_hover),
         }
@@ -834,4 +857,19 @@ fn test_waiting_tab_edge_default() {
         TabBarColors::default().waiting_tab_edge(),
         RgbColor::new_8bpc(0xff, 0x95, 0x00).into()
     );
+}
+
+#[cfg(test)]
+#[test]
+fn test_tab_edge_and_glow_defaults() {
+    let colors = TabBarColors::default();
+    assert_eq!(colors.active_tab_edge(), None);
+    assert_eq!(colors.waiting_tab_glow(), colors.waiting_tab_edge());
+
+    let custom: RgbaColor = RgbColor::new_8bpc(0x89, 0xb4, 0xfa).into();
+    let colors = TabBarColors {
+        waiting_tab_edge: Some(custom),
+        ..TabBarColors::default()
+    };
+    assert_eq!(colors.waiting_tab_glow(), custom);
 }

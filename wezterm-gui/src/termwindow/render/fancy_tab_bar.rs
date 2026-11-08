@@ -1,16 +1,431 @@
+use crate::color::LinearRgba;
 use crate::customglyph::*;
+use crate::quad::QuadTrait;
 use crate::tabbar::{TabBarItem, TabEntry};
 use crate::termwindow::box_model::*;
 use crate::termwindow::render::corners::*;
 
 use crate::termwindow::render::window_buttons::window_button_element;
-use crate::termwindow::{UIItem, UIItemType};
+use crate::termwindow::{RenderState, UIItem, UIItemType};
 use crate::utilsprites::RenderMetrics;
 use config::{Dimension, DimensionContext, TabBarColors};
 use std::rc::Rc;
 use wezterm_font::LoadedFont;
 use wezterm_term::color::{ColorAttribute, ColorPalette};
-use window::{IntegratedTitleButtonAlignment, IntegratedTitleButtonStyle};
+use window::{IntegratedTitleButtonAlignment, IntegratedTitleButtonStyle, RectF};
+
+/// Half a stroke in from the near edge / far edge of a corner glyph, so a
+/// stroke of `line_width` lands inside the tab's border pixels.
+const NEAR: BlockCoord = BlockCoord::FracWithOffset(0, 1, LineScale::Div(2));
+const FAR: BlockCoord = BlockCoord::FracWithOffset(1, 1, LineScale::Div(-2));
+
+const TOP_LEFT_ARC: &[Poly] = &[Poly {
+    path: &[
+        PolyCommand::MoveTo(NEAR, BlockCoord::One),
+        PolyCommand::QuadTo {
+            control: (NEAR, NEAR),
+            to: (BlockCoord::One, NEAR),
+        },
+    ],
+    intensity: BlockAlpha::Full,
+    style: PolyStyle::Outline,
+}];
+
+const TOP_RIGHT_ARC: &[Poly] = &[Poly {
+    path: &[
+        PolyCommand::MoveTo(BlockCoord::Zero, NEAR),
+        PolyCommand::QuadTo {
+            control: (FAR, NEAR),
+            to: (FAR, BlockCoord::One),
+        },
+    ],
+    intensity: BlockAlpha::Full,
+    style: PolyStyle::Outline,
+}];
+
+const BOTTOM_LEFT_ARC: &[Poly] = &[Poly {
+    path: &[
+        PolyCommand::MoveTo(NEAR, BlockCoord::Zero),
+        PolyCommand::QuadTo {
+            control: (NEAR, FAR),
+            to: (BlockCoord::One, FAR),
+        },
+    ],
+    intensity: BlockAlpha::Full,
+    style: PolyStyle::Outline,
+}];
+
+const BOTTOM_RIGHT_ARC: &[Poly] = &[Poly {
+    path: &[
+        PolyCommand::MoveTo(BlockCoord::Zero, FAR),
+        PolyCommand::QuadTo {
+            control: (FAR, FAR),
+            to: (FAR, BlockCoord::Zero),
+        },
+    ],
+    intensity: BlockAlpha::Full,
+    style: PolyStyle::Outline,
+}];
+
+/// Opacity of the waiting glow rings, innermost first.
+const GLOW_ALPHA: [f32; 3] = [0.5, 0.26, 0.12];
+/// Above the tab bar (zindex 10 + children), below modal overlays (100).
+const DECORATION_ZINDEX: i8 = 20;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum DecoCorner {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+impl DecoCorner {
+    fn poly(self) -> &'static [Poly] {
+        match self {
+            Self::TopLeft => TOP_LEFT_ARC,
+            Self::TopRight => TOP_RIGHT_ARC,
+            Self::BottomLeft => BOTTOM_LEFT_ARC,
+            Self::BottomRight => BOTTOM_RIGHT_ARC,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum Deco {
+    Rect {
+        rect: RectF,
+        color: LinearRgba,
+    },
+    Arc {
+        corner: DecoCorner,
+        rect: RectF,
+        line_width: f32,
+        color: LinearRgba,
+    },
+}
+
+/// (width, height) of each rounded corner; (0, 0) for a square corner.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+struct CornerSizes {
+    top_left: (f32, f32),
+    top_right: (f32, f32),
+    bottom_left: (f32, f32),
+    bottom_right: (f32, f32),
+}
+
+impl CornerSizes {
+    fn from_pixel(corners: Option<&PixelCorners>) -> Self {
+        fn size(p: &PixelSizedPoly) -> (f32, f32) {
+            if p.poly.is_empty() || p.width <= 0. || p.height <= 0. {
+                (0., 0.)
+            } else {
+                (p.width, p.height)
+            }
+        }
+        match corners {
+            Some(c) => Self {
+                top_left: size(&c.top_left),
+                top_right: size(&c.top_right),
+                bottom_left: size(&c.bottom_left),
+                bottom_right: size(&c.bottom_right),
+            },
+            None => Self::default(),
+        }
+    }
+
+    /// Concentric corners for a ring `by` pixels outside this one.
+    fn grow(self, by: f32) -> Self {
+        fn g(c: (f32, f32), by: f32) -> (f32, f32) {
+            if c.0 > 0. && c.1 > 0. {
+                (c.0 + by, c.1 + by)
+            } else {
+                (0., 0.)
+            }
+        }
+        Self {
+            top_left: g(self.top_left, by),
+            top_right: g(self.top_right, by),
+            bottom_left: g(self.bottom_left, by),
+            bottom_right: g(self.bottom_right, by),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct TabGeom {
+    active: bool,
+    waiting: bool,
+    /// The tab's border rect.
+    rect: RectF,
+    corners: CornerSizes,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct DecoStyle {
+    /// Separator and active-door color; None disables both.
+    active_edge: Option<LinearRgba>,
+    waiting_edge: LinearRgba,
+    glow: LinearRgba,
+    /// Stroke width of the separator, door and waiting ring.
+    line: f32,
+    /// Width of one glow ring.
+    ring: f32,
+    /// Height of the waiting indicator bar.
+    lamp: f32,
+    at_bottom: bool,
+}
+
+fn push_rect(out: &mut Vec<Deco>, rect: RectF, color: LinearRgba) {
+    if rect.width() > 0. && rect.height() > 0. {
+        out.push(Deco::Rect { rect, color });
+    }
+}
+
+/// Stroke the outline of `r`, rounded where `corners` says so. An open side
+/// is skipped and its corners are treated as square, so the side strokes
+/// run all the way to it.
+fn push_outline(
+    out: &mut Vec<Deco>,
+    r: RectF,
+    corners: CornerSizes,
+    line: f32,
+    color: LinearRgba,
+    open_top: bool,
+    open_bottom: bool,
+) {
+    let zero = (0., 0.);
+    let tl = if open_top { zero } else { corners.top_left };
+    let tr = if open_top { zero } else { corners.top_right };
+    let bl = if open_bottom {
+        zero
+    } else {
+        corners.bottom_left
+    };
+    let br = if open_bottom {
+        zero
+    } else {
+        corners.bottom_right
+    };
+
+    push_rect(
+        out,
+        euclid::rect(r.min_x(), r.min_y() + tl.1, line, r.height() - tl.1 - bl.1),
+        color,
+    );
+    push_rect(
+        out,
+        euclid::rect(
+            r.max_x() - line,
+            r.min_y() + tr.1,
+            line,
+            r.height() - tr.1 - br.1,
+        ),
+        color,
+    );
+    if !open_top {
+        push_rect(
+            out,
+            euclid::rect(r.min_x() + tl.0, r.min_y(), r.width() - tl.0 - tr.0, line),
+            color,
+        );
+    }
+    if !open_bottom {
+        push_rect(
+            out,
+            euclid::rect(
+                r.min_x() + bl.0,
+                r.max_y() - line,
+                r.width() - bl.0 - br.0,
+                line,
+            ),
+            color,
+        );
+    }
+    for (corner, size, origin) in [
+        (DecoCorner::TopLeft, tl, (r.min_x(), r.min_y())),
+        (DecoCorner::TopRight, tr, (r.max_x() - tr.0, r.min_y())),
+        (DecoCorner::BottomLeft, bl, (r.min_x(), r.max_y() - bl.1)),
+        (
+            DecoCorner::BottomRight,
+            br,
+            (r.max_x() - br.0, r.max_y() - br.1),
+        ),
+    ] {
+        if size.0 > 0. && size.1 > 0. {
+            out.push(Deco::Arc {
+                corner,
+                rect: euclid::rect(origin.0, origin.1, size.0, size.1),
+                line_width: line,
+                color,
+            });
+        }
+    }
+}
+
+/// Lay out the tab bar decorations in paint order: waiting glow, separator,
+/// active door and waiting rings, indicator bars.
+///
+/// The "far" edge of a tab faces away from the terminal content (the top
+/// edge for a top tab bar); the separator runs along the bar's near edge.
+fn tab_bar_decorations(bar: RectF, tabs: &[TabGeom], style: &DecoStyle) -> Vec<Deco> {
+    let mut out = vec![];
+    let at_bottom = style.at_bottom;
+    let line = style.line;
+
+    // Glow: concentric rings outside the far edge and both sides, open on
+    // the near edge. Only as many rings as fit between the tab and the bar.
+    for tab in tabs.iter().filter(|t| t.waiting) {
+        let r = tab.rect;
+        let room = if at_bottom {
+            bar.max_y() - r.max_y()
+        } else {
+            r.min_y() - bar.min_y()
+        };
+        let rings = ((room / style.ring).floor().max(0.) as usize).min(GLOW_ALPHA.len());
+        for (i, alpha) in GLOW_ALPHA.iter().take(rings).enumerate() {
+            let off = style.ring * (i + 1) as f32;
+            let top = if at_bottom {
+                r.min_y()
+            } else {
+                r.min_y() - off
+            };
+            let grect = euclid::rect(r.min_x() - off, top, r.width() + 2. * off, r.height() + off);
+            let mut ring = vec![];
+            push_outline(
+                &mut ring,
+                grect,
+                tab.corners.grow(off),
+                style.ring,
+                style.glow.mul_alpha(*alpha),
+                at_bottom,
+                !at_bottom,
+            );
+            for deco in ring {
+                match deco {
+                    Deco::Rect { rect, color } => {
+                        if let Some(rect) = rect.intersection(&bar) {
+                            push_rect(&mut out, rect, color);
+                        }
+                    }
+                    arc => out.push(arc),
+                }
+            }
+        }
+    }
+
+    if let Some(edge) = style.active_edge {
+        let y = if at_bottom {
+            bar.min_y()
+        } else {
+            bar.max_y() - line
+        };
+        match tabs.iter().find(|t| t.active) {
+            Some(a) => {
+                let r = a.rect;
+                push_rect(
+                    &mut out,
+                    euclid::rect(bar.min_x(), y, r.min_x() + line - bar.min_x(), line),
+                    edge,
+                );
+                push_rect(
+                    &mut out,
+                    euclid::rect(r.max_x() - line, y, bar.max_x() - (r.max_x() - line), line),
+                    edge,
+                );
+                // If the tab does not reach the separator, extend the door
+                // posts to it.
+                let (gap_y, gap_h) = if at_bottom {
+                    (bar.min_y(), r.min_y() - bar.min_y())
+                } else {
+                    (r.max_y(), bar.max_y() - r.max_y())
+                };
+                let door = if a.waiting { style.waiting_edge } else { edge };
+                for x in [r.min_x(), r.max_x() - line] {
+                    push_rect(&mut out, euclid::rect(x, gap_y, line, gap_h), door);
+                }
+            }
+            None => push_rect(
+                &mut out,
+                euclid::rect(bar.min_x(), y, bar.width(), line),
+                edge,
+            ),
+        }
+    }
+
+    for tab in tabs {
+        match (tab.active, style.active_edge) {
+            (true, Some(edge)) => {
+                let color = if tab.waiting {
+                    style.waiting_edge
+                } else {
+                    edge
+                };
+                push_outline(
+                    &mut out,
+                    tab.rect,
+                    tab.corners,
+                    line,
+                    color,
+                    at_bottom,
+                    !at_bottom,
+                );
+            }
+            _ if tab.waiting => push_outline(
+                &mut out,
+                tab.rect,
+                tab.corners,
+                line,
+                style.waiting_edge,
+                false,
+                false,
+            ),
+            _ => {}
+        }
+    }
+
+    for tab in tabs.iter().filter(|t| t.waiting) {
+        let r = tab.rect;
+        let c = tab.corners;
+        let lamp = if at_bottom {
+            euclid::rect(
+                r.min_x() + c.bottom_left.0,
+                r.max_y() - style.lamp,
+                r.width() - c.bottom_left.0 - c.bottom_right.0,
+                style.lamp,
+            )
+        } else {
+            euclid::rect(
+                r.min_x() + c.top_left.0,
+                r.min_y(),
+                r.width() - c.top_left.0 - c.top_right.0,
+                style.lamp,
+            )
+        };
+        push_rect(&mut out, lamp, style.glow);
+    }
+
+    out
+}
+
+fn collect_tab_geoms(element: &ComputedElement, waiting: &[usize], out: &mut Vec<TabGeom>) {
+    if let Some(UIItemType::TabBar(TabBarItem::Tab { tab_idx, active })) = &element.item_type {
+        // The first match is the tab itself; its right-floated suffix reuses
+        // the same item type, so do not descend any further.
+        out.push(TabGeom {
+            active: *active,
+            waiting: waiting.contains(tab_idx),
+            rect: element.border_rect,
+            corners: CornerSizes::from_pixel(element.border_corners.as_ref()),
+        });
+        return;
+    }
+    if let ComputedElementContent::Children(kids) = &element.content {
+        for kid in kids {
+            collect_tab_geoms(kid, waiting, out);
+        }
+    }
+}
 
 const X_BUTTON: &[Poly] = &[
     Poly {
@@ -96,15 +511,14 @@ impl crate::TermWindow {
         // Upstream hardcodes a 1px tab border. Make it configurable so the
         // inactive-tab divider can be made heavier (and scale with DPI) to
         // keep adjacent tabs visually distinct.
-        let border_width = self
-            .config
-            .tab_bar_tab_border_width
-            .evaluate_as_pixels(DimensionContext {
-                dpi: self.dimensions.dpi as f32,
-                pixel_max: self.dimensions.pixel_width as f32,
-                pixel_cell: metrics.cell_size.width as f32,
-            });
-        let waiting_edge = colors.waiting_tab_edge().to_linear();
+        let border_width =
+            self.config
+                .tab_bar_tab_border_width
+                .evaluate_as_pixels(DimensionContext {
+                    dpi: self.dimensions.dpi as f32,
+                    pixel_max: self.dimensions.pixel_width as f32,
+                    pixel_cell: metrics.cell_size.width as f32,
+                });
 
         let item_to_elem = |item: &TabEntry| -> Element {
             let element = Element::with_line(&font, &item.title, palette);
@@ -240,15 +654,16 @@ impl crate::TermWindow {
                         }
                     }))
                     .colors(ElementColors {
-                        border: if item.agent_waiting {
-                            BorderColor::new(waiting_edge)
-                        } else {
-                            BorderColor::new(
-                                bg_color
-                                    .unwrap_or_else(|| active_tab.bg_color.into())
-                                    .to_linear(),
-                            )
-                        },
+                        // The active door and the waiting ring are stroked by
+                        // paint_tab_bar_decorations. The element border keeps
+                        // the fill color: rounded corners are filled quarter
+                        // discs in the border color, so a colored border would
+                        // turn them into solid blobs.
+                        border: BorderColor::new(
+                            bg_color
+                                .unwrap_or_else(|| active_tab.bg_color.into())
+                                .to_linear(),
+                        ),
                         bg: bg_color
                             .unwrap_or_else(|| active_tab.bg_color.into())
                             .to_linear()
@@ -337,15 +752,11 @@ impl crate::TermWindow {
                             .to_linear();
                         let edge = colors.inactive_tab_edge().to_linear();
                         ElementColors {
-                            border: if item.agent_waiting {
-                                BorderColor::new(waiting_edge)
-                            } else {
-                                BorderColor {
-                                    left: bg,
-                                    right: edge,
-                                    top: bg,
-                                    bottom: bg,
-                                }
+                            border: BorderColor {
+                                left: bg,
+                                right: edge,
+                                top: bg,
+                                bottom: bg,
                             },
                             bg: bg.into(),
                             text: fg_color
@@ -365,15 +776,11 @@ impl crate::TermWindow {
                             // four borders with the hover background and the
                             // line disappeared. inactive_tab_edge_hover was
                             // previously defined but never read.
-                            border: if item.agent_waiting {
-                                BorderColor::new(waiting_edge)
-                            } else {
-                                BorderColor {
-                                    left: hover_bg,
-                                    right: colors.inactive_tab_edge_hover().to_linear(),
-                                    top: hover_bg,
-                                    bottom: hover_bg,
-                                }
+                            border: BorderColor {
+                                left: hover_bg,
+                                right: colors.inactive_tab_edge_hover().to_linear(),
+                                top: hover_bg,
+                                bottom: hover_bg,
                             },
                             bg: hover_bg.into(),
                             text: fg_color
@@ -500,9 +907,7 @@ impl crate::TermWindow {
                         // horizontal padding (1 cell) and borders (2 × width)
                         // so the rendered element matches tab_width exactly.
                         elem.min_width = Some(Dimension::Pixels(
-                            (tab_width
-                                - metrics.cell_size.width as f32
-                                - 2. * border_width)
+                            (tab_width - metrics.cell_size.width as f32 - 2. * border_width)
                                 .max(0.),
                         ));
                         elem.max_width = Some(Dimension::Pixels(tab_width));
@@ -640,8 +1045,96 @@ impl crate::TermWindow {
 
         let gl_state = self.render_state.as_ref().unwrap();
         self.render_element(&computed, gl_state, None)?;
+        self.paint_tab_bar_decorations(computed, gl_state)?;
 
         Ok(ui_items)
+    }
+
+    /// Stroke the separator, the active-tab door and the waiting ring, glow
+    /// and indicator bar on a layer above the tab bar. Nothing here changes
+    /// the tab bar layout.
+    fn paint_tab_bar_decorations(
+        &self,
+        computed: &ComputedElement,
+        gl_state: &RenderState,
+    ) -> anyhow::Result<()> {
+        let colors = self
+            .config
+            .colors
+            .as_ref()
+            .and_then(|c| c.tab_bar.as_ref())
+            .cloned()
+            .unwrap_or_else(TabBarColors::default);
+        let waiting: Vec<usize> = self
+            .tab_bar
+            .items()
+            .iter()
+            .filter_map(|item| match item.item {
+                TabBarItem::Tab { tab_idx, .. } if item.agent_waiting => Some(tab_idx),
+                _ => None,
+            })
+            .collect();
+        let active_edge = colors.active_tab_edge().map(|c| c.to_linear());
+        if active_edge.is_none() && waiting.is_empty() {
+            return Ok(());
+        }
+
+        let mut tabs = vec![];
+        collect_tab_geoms(computed, &waiting, &mut tabs);
+        let font = self.fonts.title_font()?;
+        let metrics = RenderMetrics::with_font_metrics(&font.metrics());
+        let line = self
+            .config
+            .tab_bar_tab_border_width
+            .evaluate_as_pixels(DimensionContext {
+                dpi: self.dimensions.dpi as f32,
+                pixel_max: self.dimensions.pixel_width as f32,
+                pixel_cell: metrics.cell_size.width as f32,
+            })
+            .round()
+            .max(1.);
+        let scale = (self.dimensions.dpi as f32 / 96.).max(1.);
+        let style = DecoStyle {
+            active_edge,
+            waiting_edge: colors.waiting_tab_edge().to_linear(),
+            glow: colors.waiting_tab_glow().to_linear(),
+            line,
+            ring: scale.round().max(1.),
+            lamp: (3. * scale).round().max(2.),
+            at_bottom: self.config.tab_bar_at_bottom,
+        };
+
+        let decos = tab_bar_decorations(computed.bounds, &tabs, &style);
+        if decos.is_empty() {
+            return Ok(());
+        }
+        let layer = gl_state.layer_for_zindex(DECORATION_ZINDEX)?;
+        let mut layers = layer.quad_allocator();
+        for deco in decos {
+            match deco {
+                Deco::Rect { rect, color } => {
+                    self.filled_rectangle(&mut layers, 0, rect, color)?;
+                }
+                Deco::Arc {
+                    corner,
+                    rect,
+                    line_width,
+                    color,
+                } => {
+                    self.poly_quad(
+                        &mut layers,
+                        0,
+                        rect.origin,
+                        corner.poly(),
+                        line_width.round().max(1.) as isize,
+                        rect.size,
+                        color,
+                    )?
+                    .set_grayscale();
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -703,4 +1196,202 @@ fn make_x_button(
         top: Dimension::Cells(0.),
         bottom: Dimension::Cells(0.),
     })
+}
+
+#[cfg(test)]
+mod decoration_tests {
+    use super::*;
+
+    const BLUE: LinearRgba = LinearRgba(0., 0., 1., 1.);
+    const ORANGE: LinearRgba = LinearRgba(1., 0.5, 0., 1.);
+    const GLOW: LinearRgba = LinearRgba(1., 0.6, 0., 1.);
+
+    fn style(at_bottom: bool) -> DecoStyle {
+        DecoStyle {
+            active_edge: Some(BLUE),
+            waiting_edge: ORANGE,
+            glow: GLOW,
+            line: 1.,
+            ring: 1.,
+            lamp: 3.,
+            at_bottom,
+        }
+    }
+
+    fn tab(x: f32, active: bool, waiting: bool) -> TabGeom {
+        // The bar is 30px high; tabs sit on its bottom edge with 4px above.
+        TabGeom {
+            active,
+            waiting,
+            rect: euclid::rect(x, 4., 100., 26.),
+            corners: CornerSizes {
+                top_left: (5., 10.),
+                top_right: (5., 10.),
+                ..CornerSizes::default()
+            },
+        }
+    }
+
+    fn bar() -> RectF {
+        euclid::rect(0., 0., 400., 30.)
+    }
+
+    fn rects(decos: &[Deco], color: LinearRgba) -> Vec<RectF> {
+        decos
+            .iter()
+            .filter_map(|d| match d {
+                Deco::Rect { rect, color: c } if *c == color => Some(*rect),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn arcs(decos: &[Deco], color: LinearRgba) -> Vec<DecoCorner> {
+        decos
+            .iter()
+            .filter_map(|d| match d {
+                Deco::Arc {
+                    corner, color: c, ..
+                } if *c == color => Some(*corner),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn nothing_without_active_edge_or_waiting() {
+        let mut s = style(false);
+        s.active_edge = None;
+        let tabs = [tab(10., true, false), tab(110., false, false)];
+        assert!(tab_bar_decorations(bar(), &tabs, &s).is_empty());
+    }
+
+    #[test]
+    fn separator_folds_around_the_active_tab() {
+        let tabs = [tab(10., false, false), tab(110., true, false)];
+        let decos = tab_bar_decorations(bar(), &tabs, &style(false));
+        let blue = rects(&decos, BLUE);
+        // Separator up to the door's left post, and from its right post on.
+        assert!(blue.contains(&euclid::rect(0., 29., 111., 1.)));
+        assert!(blue.contains(&euclid::rect(209., 29., 191., 1.)));
+        // Door: posts below the rounded corners, top between them.
+        assert!(blue.contains(&euclid::rect(110., 14., 1., 16.)));
+        assert!(blue.contains(&euclid::rect(209., 14., 1., 16.)));
+        assert!(blue.contains(&euclid::rect(115., 4., 90., 1.)));
+        // Open towards the content: nothing between the posts on the bottom row.
+        assert!(!blue
+            .iter()
+            .any(|r| r.min_x() >= 111. && r.max_x() <= 209. && r.min_y() >= 29.));
+        assert_eq!(
+            arcs(&decos, BLUE),
+            vec![DecoCorner::TopLeft, DecoCorner::TopRight]
+        );
+    }
+
+    #[test]
+    fn waiting_inactive_tab_gets_ring_lamp_and_glow() {
+        let tabs = [tab(10., true, false), tab(110., false, true)];
+        let decos = tab_bar_decorations(bar(), &tabs, &style(false));
+        let orange = rects(&decos, ORANGE);
+        // Closed ring: posts, top and bottom.
+        assert!(orange.contains(&euclid::rect(110., 14., 1., 16.)));
+        assert!(orange.contains(&euclid::rect(209., 14., 1., 16.)));
+        assert!(orange.contains(&euclid::rect(115., 4., 90., 1.)));
+        assert!(orange.contains(&euclid::rect(110., 29., 100., 1.)));
+        // Indicator bar along the far (top) edge between the corners.
+        assert!(rects(&decos, GLOW).contains(&euclid::rect(115., 4., 90., 3.)));
+        // Three glow rings fit in the 4px above the tab, fading outwards.
+        for (i, alpha) in GLOW_ALPHA.iter().enumerate() {
+            let off = (i + 1) as f32;
+            let ring = rects(&decos, GLOW.mul_alpha(*alpha));
+            assert!(
+                ring.contains(&euclid::rect(115., 4. - off, 90., 1.)),
+                "ring {} top",
+                i
+            );
+            assert!(
+                ring.contains(&euclid::rect(110. - off, 14., 1., 16.)),
+                "ring {} left",
+                i
+            );
+            assert!(!ring.iter().any(|r| r.max_y() > 30.), "ring {} open", i);
+        }
+        // The separator is painted first, so the ring wins on the bottom row.
+        let sep = decos
+            .iter()
+            .position(|d| matches!(d, Deco::Rect { color, .. } if *color == BLUE))
+            .unwrap();
+        let ring_bottom = decos
+            .iter()
+            .position(|d| {
+                matches!(d, Deco::Rect { rect, color } if *color == ORANGE && rect.min_y() == 29.)
+            })
+            .unwrap();
+        assert!(sep < ring_bottom);
+    }
+
+    #[test]
+    fn waiting_active_tab_uses_the_waiting_door() {
+        let tabs = [tab(10., true, true)];
+        let decos = tab_bar_decorations(bar(), &tabs, &style(false));
+        let orange = rects(&decos, ORANGE);
+        assert!(orange.contains(&euclid::rect(15., 4., 90., 1.)));
+        assert!(!orange.iter().any(|r| r.min_y() >= 29.));
+        assert_eq!(
+            arcs(&decos, ORANGE),
+            vec![DecoCorner::TopLeft, DecoCorner::TopRight]
+        );
+    }
+
+    #[test]
+    fn waiting_without_active_edge_keeps_a_closed_ring() {
+        let mut s = style(false);
+        s.active_edge = None;
+        let decos = tab_bar_decorations(bar(), &[tab(10., true, true)], &s);
+        assert!(rects(&decos, BLUE).is_empty());
+        assert!(rects(&decos, ORANGE).contains(&euclid::rect(10., 29., 100., 1.)));
+    }
+
+    #[test]
+    fn glow_rings_are_limited_by_the_room_above() {
+        let mut t = tab(10., false, true);
+        t.rect = euclid::rect(10., 2., 100., 28.);
+        let decos = tab_bar_decorations(bar(), &[t], &style(false));
+        assert!(!rects(&decos, GLOW.mul_alpha(GLOW_ALPHA[0])).is_empty());
+        assert!(!rects(&decos, GLOW.mul_alpha(GLOW_ALPHA[1])).is_empty());
+        assert!(rects(&decos, GLOW.mul_alpha(GLOW_ALPHA[2])).is_empty());
+    }
+
+    #[test]
+    fn bottom_tab_bar_is_mirrored() {
+        let tabs = [TabGeom {
+            active: true,
+            waiting: false,
+            rect: euclid::rect(10., 0., 100., 26.),
+            corners: CornerSizes {
+                bottom_left: (5., 10.),
+                bottom_right: (5., 10.),
+                ..CornerSizes::default()
+            },
+        }];
+        let decos = tab_bar_decorations(bar(), &tabs, &style(true));
+        let blue = rects(&decos, BLUE);
+        assert!(blue.contains(&euclid::rect(0., 0., 11., 1.)));
+        assert!(blue.contains(&euclid::rect(15., 25., 90., 1.)));
+        assert!(blue.contains(&euclid::rect(10., 0., 1., 16.)));
+        assert_eq!(
+            arcs(&decos, BLUE),
+            vec![DecoCorner::BottomLeft, DecoCorner::BottomRight]
+        );
+    }
+
+    #[test]
+    fn door_posts_reach_a_separator_below_the_tab() {
+        let mut t = tab(10., true, false);
+        t.rect = euclid::rect(10., 4., 100., 24.);
+        let decos = tab_bar_decorations(bar(), &[t], &style(false));
+        let blue = rects(&decos, BLUE);
+        assert!(blue.contains(&euclid::rect(10., 28., 1., 2.)));
+        assert!(blue.contains(&euclid::rect(109., 28., 1., 2.)));
+    }
 }

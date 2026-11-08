@@ -23,6 +23,7 @@
 | gui: add an opt-in uniform fancy tab bar width | 自用 | — | 上游提供等价的标签栏布局选项后可删 |
 | gui: make the fancy tab bar border width configurable | 自用 | — | 上游提供等价的标签栏边框宽度选项后可删 |
 | gui: ring tabs whose panes are waiting for input | 自用 | — | 上游提供按 user var 高亮标签栏边框的能力后可删 |
+| gui: outline the active tab and light up waiting tabs | 自用 | — | 上游提供活动 tab 门框/标签栏分隔线与按状态高亮的能力后可删 |
 | cli: report tab/window indices and focus the owning GUI window | 自用 | — | 上游的 `list` 输出索引且 `activate-*` 会前台化窗口后可删 |
 | mux: generic workspace save/restore and agent user vars | 自用 | — | 上游提供等价的 session persistence/CLI 后可删 |
 | gui: expose tab budgets, mergeable overrides, CWD links and status coalescing | 自用 | — | 上游提供等价 API 后可删 |
@@ -43,7 +44,11 @@
 
 `config.tab_bar_tab_border_width` 控制 fancy 标签栏每个 tab 的四边边框宽度，默认 `1px`（与上游一致），支持 `"2px"`、`"1.5pt"` 等 Dimension 写法，`pt` 会按显示 DPI 缩放。上游只有非活动 tab 的右边框可见（颜色取 `colors.tab_bar.inactive_tab_edge`），其余三边使用 tab 自身背景色；调大后该分隔线随之加粗。hover 时这条边线现在也会保留，颜色改用此前已定义但从未被渲染读取的 `colors.tab_bar.inactive_tab_edge_hover`。改宽度只需改配置，不需要重新编译。
 
-`colors.tab_bar.waiting_tab_edge`（默认 `#ff9500`）让任意 pane 的 `agent_state` user var 为 `waiting`（可带 `:epoch` 后缀）的 tab 显示整圈橙色边框；只改边框颜色，不改填充色，也不改 `tab_bar_tab_border_width`，因此 `tab_bar_uniform_width` 等布局不受影响。活动、非活动和 hover 三种状态都生效，`running`/`done`/`error` 不触发。判定与 Lua 徽章一致：遍历 mux tab 的真实 pane（`iter_panes_ignoring_zoom`，忽略 zoom 和 GUI overlay），任一 waiting 即高亮。状态变化会进入 `TabEntry` 并参与缓存比较，user var 更新后立即触发重绘。
+`colors.tab_bar.waiting_tab_edge`（默认 `#ff9500`）让任意 pane 的 `agent_state` user var 为 `waiting`（可带 `:epoch` 后缀）的 tab 显示一圈细边框（线宽同 `tab_bar_tab_border_width`）；远离终端内容的一侧（顶部标签栏为上边）在两个圆角之间加一条约 3 逻辑像素的指示灯条，框外再画最多 3 层逐渐变淡的光晕（不透明度 0.5/0.26/0.12，每层约 1 逻辑像素，层数受 tab 与标签栏边缘之间的空间限制）。灯条和光晕的颜色由 `colors.tab_bar.waiting_tab_glow` 控制，默认与 `waiting_tab_edge` 相同。活动、非活动和 hover 三种状态都生效，`running`/`done`/`error` 不触发。判定与 Lua 徽章一致：遍历 mux tab 的真实 pane（`iter_panes_ignoring_zoom`，忽略 zoom 和 GUI overlay），任一 waiting 即高亮。状态变化会进入 `TabEntry` 并参与缓存比较，user var 更新后立即触发重绘。
+
+`colors.tab_bar.active_tab_edge`（默认不设置，即保持上游外观）设置后，标签栏靠近终端内容的一侧画一条贯穿整个窗口的分隔线，并在活动 tab 处折成左、上、右三边的门框（Chrome 式）；底边断开，活动 tab 与内容区连在一起。活动 tab 同时处于 waiting 时，门框改用 `waiting_tab_edge` 的颜色，并加上灯条和光晕。`tab_bar_at_bottom = true` 时上下镜像。
+
+这些线条都画在 zindex 20 的叠加层上（标签栏之上、模态浮层之下），不参与布局，`tab_bar_uniform_width` 的几何不变。tab 元素自身的边框保持填充色：box model 的圆角是用边框色填充的实心四分之一圆，边框一旦换色，圆角就会变成色块；因此门框、等待环和光晕的圆角改用描边弧线（二次贝塞尔，向内缩半个线宽）。几何计算在纯函数 `tab_bar_decorations` 中完成，单测位于 `fancy_tab_bar.rs` 的 `decoration_tests`。
 
 `format-tab-title` 的第 6 个参数（`max_width`）在 fancy bar 下现在按标题字体宽度和 tab 数换算成真实预算，不再是恒定的 `tab_max_width`；第二遍渲染在 uniform 模式下会扣掉回调声明的左块和右浮动后缀/关闭按钮，把剩下的宽度当作标题块预算。回调可以用 U+001E 标记左块（索引/徽章）与标题块的分界。`window:set_config_override(key, value)` / `clear_config_override(key)` 用于增量修改 per-window override；hyperlink URI 中的 `$CWD` 在点击时展开为当前 pane 的工作目录；`update-status` / `update-right-status` 统一按 `status_update_interval` 调度，不再随高频标题变化每帧触发。
 
