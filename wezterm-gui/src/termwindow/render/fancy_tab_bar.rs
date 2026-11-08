@@ -76,7 +76,6 @@ const DECORATION_ZINDEX: i8 = 20;
 const TAB_CORNER_RADIUS_CELLS: f32 = 0.40;
 /// Radius of the flare where the active tab's door meets the separator,
 /// as a fraction of the title font's cell height.
-const TAB_DOOR_FILLET_CELLS: f32 = 0.30;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum DecoCorner {
@@ -197,71 +196,7 @@ struct DecoStyle {
     ring: f32,
     /// Height of the waiting indicator bar.
     lamp: f32,
-    /// Radius where the door's side strokes meet the separator (the near
-    /// edge), so the junction flares out instead of meeting at a right
-    /// angle.
-    fillet: f32,
-    /// The tab bar background, used to cut the flare back into a fillet.
-    bar_bg: LinearRgba,
     at_bottom: bool,
-}
-
-/// Radius of the flare where the active tab's door meets the separator. At
-/// least one stroke wide so the rounding never pinches the line.
-fn door_fillet(style: &DecoStyle, rect: RectF) -> f32 {
-    style
-        .fillet
-        .min(rect.width() / 2.)
-        .max(style.edge_line.round().max(1.))
-}
-
-/// The two annular quarter discs that flare the door posts out into the
-/// separator: the ring is one stroke thick, its inner edge curves from the
-/// post to the separator's inner edge, and the inner disc restores the tab
-/// fill so the junction opens outward instead of turning a corner.
-fn door_flares(
-    style: &DecoStyle,
-    bar: RectF,
-    rect: RectF,
-    fillet: f32,
-    door: LinearRgba,
-) -> Vec<Deco> {
-    let line = style.edge_line;
-    // The separator's inner edge; the flare sits on the bar side of it.
-    let inner_y = if style.at_bottom {
-        bar.min_y() + line
-    } else {
-        bar.max_y() - line
-    };
-    // Square on the bar side of the separator, at the tab's edge; a disc of
-    // the bar background cuts it back into a concave fillet.
-    let (y0, corner) = if style.at_bottom {
-        (inner_y, (DecoCorner::BottomLeft, DecoCorner::BottomRight))
-    } else {
-        (
-            inner_y - fillet,
-            (DecoCorner::TopLeft, DecoCorner::TopRight),
-        )
-    };
-    let mut out = vec![];
-    for (x, corner) in [(rect.min_x() - fillet, corner.0), (rect.max_x(), corner.1)] {
-        // Keep the flare inside the bar so an edge tab cannot paint over the
-        // window frame.
-        let Some(square) = euclid::rect(x, y0, fillet, fillet).intersection(&bar) else {
-            continue;
-        };
-        out.push(Deco::Quarter {
-            corner,
-            rect: square,
-            color: door,
-        });
-        out.push(Deco::Quarter {
-            corner,
-            rect: square,
-            color: style.bar_bg,
-        });
-    }
-    out
 }
 
 fn push_rect(out: &mut Vec<Deco>, rect: RectF, color: LinearRgba) {
@@ -429,8 +364,6 @@ fn tab_bar_decorations(bar: RectF, tabs: &[TabGeom], style: &DecoStyle) -> Vec<D
         match active {
             Some(a) => {
                 let r = a.rect;
-                // Concave flare radius where the door meets the separator.
-                let fillet = door_fillet(style, r);
                 let door = if a.waiting { style.waiting_edge } else { edge };
                 // The separator runs under the flare and stops at its
                 // tangent point.
@@ -458,11 +391,6 @@ fn tab_bar_decorations(bar: RectF, tabs: &[TabGeom], style: &DecoStyle) -> Vec<D
                         door,
                     );
                 }
-                // Flare: an annular quarter disc whose inner edge curves from
-                // the door post out to the separator's inner edge, so the
-                // junction opens outward instead of turning a corner. The
-                // inner disc restores the tab fill.
-                out.extend(door_flares(style, bar, r, fillet, door));
             }
             None => push_rect(
                 &mut out,
@@ -1288,9 +1216,6 @@ impl crate::TermWindow {
             edge_line,
             ring: scale.round().max(1.),
             lamp: (3. * scale).round().max(2.),
-            fillet: ((metrics.cell_size.height as f32 * TAB_DOOR_FILLET_CELLS).round())
-                .max(edge_line),
-            bar_bg: colors.background().to_linear(),
             at_bottom: self.config.tab_bar_at_bottom,
         };
 
@@ -1475,7 +1400,6 @@ mod decoration_tests {
     const ORANGE: LinearRgba = LinearRgba(1., 0.5, 0., 1.);
     const GLOW: LinearRgba = LinearRgba(1., 0.6, 0., 1.);
     const FILL: LinearRgba = LinearRgba(0.5, 0.1, 0.1, 1.);
-    const BG: LinearRgba = LinearRgba(0.05, 0.05, 0.07, 1.);
 
     fn style(at_bottom: bool) -> DecoStyle {
         DecoStyle {
@@ -1486,8 +1410,6 @@ mod decoration_tests {
             edge_line: 1.,
             ring: 1.,
             lamp: 3.,
-            fillet: 1.,
-            bar_bg: BG,
             at_bottom,
         }
     }
@@ -1517,21 +1439,6 @@ mod decoration_tests {
             .iter()
             .filter_map(|d| match d {
                 Deco::Rect { rect, color: c } if *c == color => Some(*rect),
-                _ => None,
-            })
-            .collect()
-    }
-
-    /// Filled quarter discs in `color` (the door flares, outer rings).
-    fn quarters(decos: &[Deco], color: LinearRgba) -> Vec<(DecoCorner, RectF)> {
-        decos
-            .iter()
-            .filter_map(|d| match d {
-                Deco::Quarter {
-                    corner,
-                    rect,
-                    color: c,
-                } if *c == color => Some((*corner, *rect)),
                 _ => None,
             })
             .collect()
@@ -1574,16 +1481,6 @@ mod decoration_tests {
             arcs(&decos, BLUE),
             vec![DecoCorner::TopLeft, DecoCorner::TopRight]
         );
-        // The flare sits outside the tab, on the bar side of the separator:
-        // a square cut back to a concave curve by a disc of the background.
-        assert_eq!(
-            quarters(&decos, BLUE),
-            vec![
-                (DecoCorner::TopLeft, euclid::rect(109., 28., 1., 1.)),
-                (DecoCorner::TopRight, euclid::rect(210., 28., 1., 1.)),
-            ]
-        );
-        assert_eq!(quarters(&decos, BG).len(), 2);
         // Open towards the content: nothing between the posts on the bottom row.
         assert!(!blue
             .iter()
@@ -1692,14 +1589,7 @@ mod decoration_tests {
             arcs(&decos, BLUE),
             vec![DecoCorner::BottomLeft, DecoCorner::BottomRight]
         );
-        // The flare flips below the separator.
-        assert_eq!(
-            quarters(&decos, BLUE),
-            vec![
-                (DecoCorner::BottomLeft, euclid::rect(9., 1., 1., 1.)),
-                (DecoCorner::BottomRight, euclid::rect(110., 1., 1., 1.)),
-            ]
-        );
+
         assert_eq!(
             arcs(&decos, BLUE),
             vec![DecoCorner::BottomLeft, DecoCorner::BottomRight]
@@ -1717,43 +1607,6 @@ mod decoration_tests {
         assert_eq!(
             arcs(&decos, BLUE),
             vec![DecoCorner::TopLeft, DecoCorner::TopRight]
-        );
-        assert_eq!(
-            quarters(&decos, BLUE),
-            vec![
-                (DecoCorner::TopLeft, euclid::rect(9., 28., 1., 1.)),
-                (DecoCorner::TopRight, euclid::rect(110., 28., 1., 1.)),
-            ]
-        );
-    }
-
-    #[test]
-    fn door_meets_the_separator_with_a_flare() {
-        let mut s = style(false);
-        s.edge_line = 2.;
-        s.fillet = 6.;
-        let decos = tab_bar_decorations(bar(), &[tab(10., true, false)], &s);
-        let blue = rects(&decos, BLUE);
-        // The separator runs up to the door posts.
-        assert!(blue.contains(&euclid::rect(0., 28., 12., 2.)));
-        assert!(blue.contains(&euclid::rect(108., 28., 292., 2.)));
-        // The posts run all the way down to the separator.
-        assert!(blue.contains(&euclid::rect(10., 14., 2., 16.)));
-        // The flare squares sit just outside the tab, above the separator.
-        assert_eq!(
-            quarters(&decos, BLUE),
-            vec![
-                (DecoCorner::TopLeft, euclid::rect(4., 22., 6., 6.)),
-                (DecoCorner::TopRight, euclid::rect(110., 22., 6., 6.)),
-            ]
-        );
-        // Each square is cut back by a background disc, leaving the curve.
-        assert_eq!(
-            quarters(&decos, BG),
-            vec![
-                (DecoCorner::TopLeft, euclid::rect(4., 22., 6., 6.)),
-                (DecoCorner::TopRight, euclid::rect(110., 22., 6., 6.)),
-            ]
         );
     }
 
@@ -1829,32 +1682,6 @@ mod decoration_tests {
         let orange = rects(&decos, ORANGE);
         assert!(orange.contains(&euclid::rect(210., 14., 1., 16.)));
         assert!(orange.contains(&euclid::rect(210., 29., 100., 1.)));
-    }
-
-    #[test]
-    fn door_flares_returns_two_concentric_rings() {
-        let mut st = style(false);
-        st.edge_line = 2.;
-        let b = bar();
-        let r = euclid::rect(10., 4., 100., 26.);
-        let d = door_flares(&st, b, r, 6., BLUE);
-        assert_eq!(d.len(), 4, "{d:?}");
-        assert_eq!(
-            d[0],
-            Deco::Quarter {
-                corner: DecoCorner::TopLeft,
-                rect: euclid::rect(4., 22., 6., 6.),
-                color: BLUE,
-            }
-        );
-        assert_eq!(
-            d[1],
-            Deco::Quarter {
-                corner: DecoCorner::TopLeft,
-                rect: euclid::rect(4., 22., 6., 6.),
-                color: BG,
-            }
-        );
     }
 
     #[test]
