@@ -3537,9 +3537,11 @@ impl TermWindow {
             .map(|(idx, tab)| {
                 let panes = self.get_pos_panes_for_tab(tab);
 
-                // Match the Lua badge aggregation (tab:panes() uses
-                // iter_panes_ignoring_zoom): inspect the real panes of the
-                // mux tab, not the overlay-substituted PositionedPane list.
+                // Inspect the real panes of the mux tab, not the
+                // overlay-substituted PositionedPane list.  The Lua
+                // `tab.panes` field respects zoom, so a waiting pane that is
+                // zoomed away lights the ring without changing the badge; the
+                // ring is meant to catch exactly that hidden case.
                 let agent_waiting = tab
                     .iter_panes_ignoring_zoom()
                     .into_iter()

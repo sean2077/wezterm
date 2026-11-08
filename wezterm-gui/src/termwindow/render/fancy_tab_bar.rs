@@ -114,12 +114,6 @@ enum Deco {
         /// matches the straight strokes. Without it the arc is stroked.
         inner: Option<LinearRgba>,
     },
-    /// A solid quarter disc, used to round a convex corner of the strokes.
-    Quarter {
-        corner: DecoCorner,
-        rect: RectF,
-        color: LinearRgba,
-    },
 }
 
 /// (width, height) of each rounded corner; (0, 0) for a square corner.
@@ -1167,8 +1161,12 @@ impl crate::TermWindow {
         }
 
         let left_padding = if window_buttons_at_left {
-            if self.config.integrated_title_button_style == IntegratedTitleButtonStyle::MacOsNative
+            if self.config.integrated_title_button_style
+                == IntegratedTitleButtonStyle::MacOsNative
+                && cfg!(target_os = "macos")
             {
+                // Only macOS draws its traffic lights in the window frame at
+                // the far left; the fork-drawn ones live in the bar itself.
                 if !self.window_state.contains(window::WindowState::FULL_SCREEN) {
                     Dimension::Pixels(70.0)
                 } else {
@@ -1382,22 +1380,6 @@ impl crate::TermWindow {
                     )?
                     .set_grayscale();
                 }
-                Deco::Quarter {
-                    corner,
-                    rect,
-                    color,
-                } => {
-                    self.poly_quad(
-                        &mut layers,
-                        0,
-                        rect.origin,
-                        corner.filled_poly(),
-                        1,
-                        euclid::size2(rect.width().round(), rect.height().round()),
-                        color,
-                    )?
-                    .set_grayscale();
-                }
             }
         }
         Ok(())
@@ -1574,10 +1556,6 @@ mod decoration_tests {
         assert!(!blue
             .iter()
             .any(|r| r.min_x() >= 111. && r.max_x() <= 209. && r.min_y() >= 29.));
-        assert_eq!(
-            arcs(&decos, BLUE),
-            vec![DecoCorner::TopLeft, DecoCorner::TopRight]
-        );
     }
 
     #[test]
@@ -1677,11 +1655,6 @@ mod decoration_tests {
         assert!(blue.contains(&euclid::rect(15., 25., 90., 1.)));
         // Posts reach the separator, mirrors of the top bar.
         assert!(blue.contains(&euclid::rect(10., 0., 1., 16.)));
-        assert_eq!(
-            arcs(&decos, BLUE),
-            vec![DecoCorner::BottomLeft, DecoCorner::BottomRight]
-        );
-
         assert_eq!(
             arcs(&decos, BLUE),
             vec![DecoCorner::BottomLeft, DecoCorner::BottomRight]
@@ -1823,8 +1796,6 @@ mod decoration_tests {
         assert!(blue.contains(&euclid::rect(110., 14., 3., 7.)));
         assert!(blue.contains(&euclid::rect(207., 14., 3., 7.)));
         assert!(!blue.iter().any(|r| r.min_y() < 27. && r.max_y() > 21.));
-        // Nothing is painted in a background color.
-        assert!(decos.iter().all(|d| !matches!(d, Deco::Quarter { .. })));
     }
 
     #[test]
