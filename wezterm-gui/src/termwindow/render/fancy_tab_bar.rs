@@ -102,6 +102,11 @@ enum Deco {
         rect: RectF,
         line_width: f32,
         color: LinearRgba,
+        /// Fill inside the arc. When known, the arc is painted as a filled
+        /// quarter disc in `color` with a disc of `inner` inset by
+        /// `line_width` on top: both edges are antialiased fills, so the arc
+        /// matches the straight strokes. Without it the arc is stroked.
+        inner: Option<LinearRgba>,
     },
 }
 
@@ -159,6 +164,8 @@ struct TabGeom {
     /// The tab's border rect.
     rect: RectF,
     corners: CornerSizes,
+    /// The tab's current fill (hover-aware), when it is a plain color.
+    fill: Option<LinearRgba>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -184,13 +191,15 @@ fn push_rect(out: &mut Vec<Deco>, rect: RectF, color: LinearRgba) {
 
 /// Stroke the outline of `r`, rounded where `corners` says so. An open side
 /// is skipped and its corners are treated as square, so the side strokes
-/// run all the way to it.
+/// run all the way to it. `inner` is the fill inside the outline (see
+/// `Deco::Arc`).
 fn push_outline(
     out: &mut Vec<Deco>,
     r: RectF,
     corners: CornerSizes,
     line: f32,
     color: LinearRgba,
+    inner: Option<LinearRgba>,
     open_top: bool,
     open_bottom: bool,
 ) {
@@ -258,6 +267,7 @@ fn push_outline(
                 rect: euclid::rect(origin.0, origin.1, size.0, size.1),
                 line_width: line,
                 color,
+                inner,
             });
         }
     }
@@ -298,6 +308,7 @@ fn tab_bar_decorations(bar: RectF, tabs: &[TabGeom], style: &DecoStyle) -> Vec<D
                 tab.corners.grow(off),
                 style.ring,
                 style.glow.mul_alpha(*alpha),
+                None,
                 at_bottom,
                 !at_bottom,
             );
@@ -367,6 +378,7 @@ fn tab_bar_decorations(bar: RectF, tabs: &[TabGeom], style: &DecoStyle) -> Vec<D
                     tab.corners,
                     line,
                     color,
+                    tab.fill,
                     at_bottom,
                     !at_bottom,
                 );
@@ -377,6 +389,7 @@ fn tab_bar_decorations(bar: RectF, tabs: &[TabGeom], style: &DecoStyle) -> Vec<D
                 tab.corners,
                 line,
                 style.waiting_edge,
+                tab.fill,
                 false,
                 false,
             ),
@@ -408,7 +421,12 @@ fn tab_bar_decorations(bar: RectF, tabs: &[TabGeom], style: &DecoStyle) -> Vec<D
     out
 }
 
-fn collect_tab_geoms(element: &ComputedElement, waiting: &[usize], out: &mut Vec<TabGeom>) {
+fn collect_tab_geoms(
+    element: &ComputedElement,
+    waiting: &[usize],
+    fill: &dyn Fn(&ComputedElement) -> Option<LinearRgba>,
+    out: &mut Vec<TabGeom>,
+) {
     if let Some(UIItemType::TabBar(TabBarItem::Tab { tab_idx, active })) = &element.item_type {
         // The first match is the tab itself; its right-floated suffix reuses
         // the same item type, so do not descend any further.
@@ -417,13 +435,39 @@ fn collect_tab_geoms(element: &ComputedElement, waiting: &[usize], out: &mut Vec
             waiting: waiting.contains(tab_idx),
             rect: element.border_rect,
             corners: CornerSizes::from_pixel(element.border_corners.as_ref()),
+            fill: fill(element),
         });
         return;
     }
     if let ComputedElementContent::Children(kids) = &element.content {
         for kid in kids {
-            collect_tab_geoms(kid, waiting, out);
+            collect_tab_geoms(kid, waiting, fill, out);
         }
+    }
+}
+
+impl DecoCorner {
+    fn filled_poly(self) -> &'static [Poly] {
+        match self {
+            Self::TopLeft => TOP_LEFT_ROUNDED_CORNER,
+            Self::TopRight => TOP_RIGHT_ROUNDED_CORNER,
+            Self::BottomLeft => BOTTOM_LEFT_ROUNDED_CORNER,
+            Self::BottomRight => BOTTOM_RIGHT_ROUNDED_CORNER,
+        }
+    }
+
+    /// The quad of the concentric disc `inset` pixels inside the one that
+    /// fills `rect`. The disc center is the rect corner facing the tab body.
+    fn inset(self, rect: RectF, inset: f32) -> RectF {
+        let w = (rect.width() - inset).max(0.);
+        let h = (rect.height() - inset).max(0.);
+        let (x, y) = match self {
+            Self::TopLeft => (rect.min_x() + inset, rect.min_y() + inset),
+            Self::TopRight => (rect.min_x(), rect.min_y() + inset),
+            Self::BottomLeft => (rect.min_x() + inset, rect.min_y()),
+            Self::BottomRight => (rect.min_x(), rect.min_y()),
+        };
+        euclid::rect(x, y, w, h)
     }
 }
 
@@ -519,6 +563,12 @@ impl crate::TermWindow {
                     pixel_max: self.dimensions.pixel_width as f32,
                     pixel_cell: metrics.cell_size.width as f32,
                 });
+        // Upstream sizes the rounded tab corners as half a cell in each
+        // direction, which is an ellipse (cells are taller than wide) and
+        // reads as a chamfer once the corner is outlined. Use one pixel
+        // radius for both axes so the corners are circular.
+        let corner_radius =
+            Dimension::Pixels((metrics.cell_size.height as f32 * 0.4).round().max(2.));
 
         let item_to_elem = |item: &TabEntry| -> Element {
             let element = Element::with_line(&font, &item.title, palette);
@@ -627,26 +677,26 @@ impl crate::TermWindow {
                             top_left: SizedPoly::none(),
                             top_right: SizedPoly::none(),
                             bottom_left: SizedPoly {
-                                width: Dimension::Cells(0.5),
-                                height: Dimension::Cells(0.5),
+                                width: corner_radius,
+                                height: corner_radius,
                                 poly: BOTTOM_LEFT_ROUNDED_CORNER,
                             },
                             bottom_right: SizedPoly {
-                                width: Dimension::Cells(0.5),
-                                height: Dimension::Cells(0.5),
+                                width: corner_radius,
+                                height: corner_radius,
                                 poly: BOTTOM_RIGHT_ROUNDED_CORNER,
                             },
                         }
                     } else {
                         Corners {
                             top_left: SizedPoly {
-                                width: Dimension::Cells(0.5),
-                                height: Dimension::Cells(0.5),
+                                width: corner_radius,
+                                height: corner_radius,
                                 poly: TOP_LEFT_ROUNDED_CORNER,
                             },
                             top_right: SizedPoly {
-                                width: Dimension::Cells(0.5),
-                                height: Dimension::Cells(0.5),
+                                width: corner_radius,
+                                height: corner_radius,
                                 poly: TOP_RIGHT_ROUNDED_CORNER,
                             },
                             bottom_left: SizedPoly::none(),
@@ -711,26 +761,26 @@ impl crate::TermWindow {
                                 poly: &[],
                             },
                             bottom_left: SizedPoly {
-                                width: Dimension::Cells(0.5),
-                                height: Dimension::Cells(0.5),
+                                width: corner_radius,
+                                height: corner_radius,
                                 poly: BOTTOM_LEFT_ROUNDED_CORNER,
                             },
                             bottom_right: SizedPoly {
-                                width: Dimension::Cells(0.5),
-                                height: Dimension::Cells(0.5),
+                                width: corner_radius,
+                                height: corner_radius,
                                 poly: BOTTOM_RIGHT_ROUNDED_CORNER,
                             },
                         }
                     } else {
                         Corners {
                             top_left: SizedPoly {
-                                width: Dimension::Cells(0.5),
-                                height: Dimension::Cells(0.5),
+                                width: corner_radius,
+                                height: corner_radius,
                                 poly: TOP_LEFT_ROUNDED_CORNER,
                             },
                             top_right: SizedPoly {
-                                width: Dimension::Cells(0.5),
-                                height: Dimension::Cells(0.5),
+                                width: corner_radius,
+                                height: corner_radius,
                                 poly: TOP_RIGHT_ROUNDED_CORNER,
                             },
                             bottom_left: SizedPoly {
@@ -1080,7 +1130,7 @@ impl crate::TermWindow {
         }
 
         let mut tabs = vec![];
-        collect_tab_geoms(computed, &waiting, &mut tabs);
+        collect_tab_geoms(computed, &waiting, &|e| self.tab_fill(e), &mut tabs);
         let font = self.fonts.title_font()?;
         let metrics = RenderMetrics::with_font_metrics(&font.metrics());
         let line = self
@@ -1120,6 +1170,39 @@ impl crate::TermWindow {
                     rect,
                     line_width,
                     color,
+                    inner: Some(inner),
+                } => {
+                    let size = |r: RectF| euclid::size2(r.width().round(), r.height().round());
+                    self.poly_quad(
+                        &mut layers,
+                        0,
+                        rect.origin,
+                        corner.filled_poly(),
+                        1,
+                        size(rect),
+                        color,
+                    )?
+                    .set_grayscale();
+                    let inset = corner.inset(rect, line_width);
+                    if inset.width() >= 1. && inset.height() >= 1. {
+                        self.poly_quad(
+                            &mut layers,
+                            0,
+                            inset.origin,
+                            corner.filled_poly(),
+                            1,
+                            size(inset),
+                            inner,
+                        )?
+                        .set_grayscale();
+                    }
+                }
+                Deco::Arc {
+                    corner,
+                    rect,
+                    line_width,
+                    color,
+                    inner: None,
                 } => {
                     self.poly_quad(
                         &mut layers,
@@ -1135,6 +1218,36 @@ impl crate::TermWindow {
             }
         }
         Ok(())
+    }
+
+    /// The fill a tab element is painted with this frame: its hover colors
+    /// while the pointer is over it (same test as `render_element`), when
+    /// that fill is a plain color.
+    fn tab_fill(&self, element: &ComputedElement) -> Option<LinearRgba> {
+        let hovering = element.hover_colors.is_some()
+            && match &self.current_mouse_event {
+                Some(event) => {
+                    let x = event.coords.x as f32;
+                    let y = event.coords.y as f32;
+                    x >= element.bounds.min_x()
+                        && x <= element.bounds.max_x()
+                        && y >= element.bounds.min_y()
+                        && y <= element.bounds.max_y()
+                }
+                None => false,
+            }
+            && matches!(
+                self.current_mouse_capture,
+                None | Some(crate::termwindow::MouseCapture::UI)
+            );
+        let colors = match (&element.hover_colors, hovering) {
+            (Some(hover), true) => hover,
+            _ => &element.colors,
+        };
+        match colors.bg {
+            InheritableColor::Color(color) => Some(color),
+            _ => None,
+        }
     }
 }
 
@@ -1205,6 +1318,7 @@ mod decoration_tests {
     const BLUE: LinearRgba = LinearRgba(0., 0., 1., 1.);
     const ORANGE: LinearRgba = LinearRgba(1., 0.5, 0., 1.);
     const GLOW: LinearRgba = LinearRgba(1., 0.6, 0., 1.);
+    const FILL: LinearRgba = LinearRgba(0.5, 0.1, 0.1, 1.);
 
     fn style(at_bottom: bool) -> DecoStyle {
         DecoStyle {
@@ -1229,6 +1343,7 @@ mod decoration_tests {
                 top_right: (5., 10.),
                 ..CornerSizes::default()
             },
+            fill: Some(FILL),
         }
     }
 
@@ -1373,6 +1488,7 @@ mod decoration_tests {
                 bottom_right: (5., 10.),
                 ..CornerSizes::default()
             },
+            fill: Some(FILL),
         }];
         let decos = tab_bar_decorations(bar(), &tabs, &style(true));
         let blue = rects(&decos, BLUE);
@@ -1393,5 +1509,51 @@ mod decoration_tests {
         let blue = rects(&decos, BLUE);
         assert!(blue.contains(&euclid::rect(10., 28., 1., 2.)));
         assert!(blue.contains(&euclid::rect(109., 28., 1., 2.)));
+    }
+
+    #[test]
+    fn outline_arcs_are_filled_against_the_tab_fill_and_glow_arcs_are_stroked() {
+        let tabs = [tab(10., true, false), tab(110., false, true)];
+        let decos = tab_bar_decorations(bar(), &tabs, &style(false));
+        for deco in &decos {
+            if let Deco::Arc {
+                color, inner, rect, ..
+            } = deco
+            {
+                if *color == BLUE || *color == ORANGE {
+                    assert_eq!(*inner, Some(FILL), "outline arc {:?}", rect);
+                } else {
+                    assert_eq!(*inner, None, "glow arc {:?}", rect);
+                }
+            }
+        }
+        // Without a known fill the outline falls back to a stroked arc.
+        let mut t = tab(10., true, false);
+        t.fill = None;
+        let decos = tab_bar_decorations(bar(), &[t], &style(false));
+        assert!(decos
+            .iter()
+            .all(|d| !matches!(d, Deco::Arc { inner: Some(_), .. })));
+    }
+
+    #[test]
+    fn inset_disc_shares_the_outer_disc_center() {
+        let r = euclid::rect(10., 20., 8., 8.);
+        assert_eq!(
+            DecoCorner::TopLeft.inset(r, 1.),
+            euclid::rect(11., 21., 7., 7.)
+        );
+        assert_eq!(
+            DecoCorner::TopRight.inset(r, 1.),
+            euclid::rect(10., 21., 7., 7.)
+        );
+        assert_eq!(
+            DecoCorner::BottomLeft.inset(r, 1.),
+            euclid::rect(11., 20., 7., 7.)
+        );
+        assert_eq!(
+            DecoCorner::BottomRight.inset(r, 1.),
+            euclid::rect(10., 20., 7., 7.)
+        );
     }
 }

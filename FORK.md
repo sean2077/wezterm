@@ -48,7 +48,7 @@
 
 `colors.tab_bar.active_tab_edge`（默认不设置，即保持上游外观）设置后，标签栏靠近终端内容的一侧画一条贯穿整个窗口的分隔线，并在活动 tab 处折成左、上、右三边的门框（Chrome 式）；底边断开，活动 tab 与内容区连在一起。活动 tab 同时处于 waiting 时，门框改用 `waiting_tab_edge` 的颜色，并加上灯条和光晕。`tab_bar_at_bottom = true` 时上下镜像。
 
-这些线条都画在 zindex 20 的叠加层上（标签栏之上、模态浮层之下），不参与布局，`tab_bar_uniform_width` 的几何不变。tab 元素自身的边框保持填充色：box model 的圆角是用边框色填充的实心四分之一圆，边框一旦换色，圆角就会变成色块；因此门框、等待环和光晕的圆角改用描边弧线（二次贝塞尔，向内缩半个线宽）。几何计算在纯函数 `tab_bar_decorations` 中完成，单测位于 `fancy_tab_bar.rs` 的 `decoration_tests`。
+这些线条都画在 zindex 20 的叠加层上（标签栏之上、模态浮层之下），不参与布局，`tab_bar_uniform_width` 的几何不变。tab 元素自身的边框保持填充色：box model 的圆角是用边框色填充的实心四分之一圆，边框一旦换色，圆角就会变成色块。所以门框和等待环的圆角不改边框色，而是叠两层实心四分之一圆：外层是线条色，内层是 tab 当前的填充色（悬停时取悬停色），同圆心、半径小一个线宽。两条边缘都是抗锯齿填充，弧线和直线的粗细、亮度一致。1px 的描边弧线在实测中又淡又断，所以不用。填充色不是纯色时退回描边。光晕的弧线是半透明的，仍然用描边。tab 圆角改为宽高相同的像素半径（标题字体格高的 0.4 倍）：上游用 0.5 格宽 × 0.5 格高，格子高于宽，实际是椭圆，描边后看起来像斜切。几何计算在纯函数 `tab_bar_decorations` 中完成，单测位于 `fancy_tab_bar.rs` 的 `decoration_tests`。
 
 `format-tab-title` 的第 6 个参数（`max_width`）在 fancy bar 下现在按标题字体宽度和 tab 数换算成真实预算，不再是恒定的 `tab_max_width`；第二遍渲染在 uniform 模式下会扣掉回调声明的左块和右浮动后缀/关闭按钮，把剩下的宽度当作标题块预算。回调可以用 U+001E 标记左块（索引/徽章）与标题块的分界。`window:set_config_override(key, value)` / `clear_config_override(key)` 用于增量修改 per-window override；hyperlink URI 中的 `$CWD` 在点击时展开为当前 pane 的工作目录；`update-status` / `update-right-status` 统一按 `status_update_interval` 调度，不再随高频标题变化每帧触发。
 
@@ -77,17 +77,21 @@ Agent 集成通过通用 user vars 完成：`agent.resume_args`（JSON argv 追�
 
 ## 日常维护入口
 
-日常维护由 dotfiles 仓库（`sean2077/dotfiles`）里的 `scripts/wezterm-fork.ps1` 完成。它负责回拉上游、rebase、推送、构建、安装和切换启动入口；Windows 上每次同步配置时都会运行它。下面是它背后的手动步骤，用于脚本停下（例如 rebase 冲突）时人工处理。
+日常维护由 dotfiles 仓库（`sean2077/dotfiles`）里的 `scripts/wezterm-fork.ps1` 完成。它负责回拉上游、merge、推送、构建、安装和切换启动入口；Windows 上每次同步配置时都会运行它。下面是它背后的手动步骤，用于脚本停下（例如 merge 冲突）时人工处理。
 
 ## 回拉上游
+
+一律用 merge，不 rebase：补丁提交保持原哈希，`patched` 历史只增不改，推送不需要 force。2026-11-08 之前 `patched` 是按 rebase 维护的，那段历史保持原样。
 
 ```sh
 git fetch upstream
 git switch main && git merge --ff-only upstream/main && git push origin main
-git switch patched && git rebase main
-# 冲突时逐个解决；补丁已被上游合并的话，rebase 会提示提交为空，用 git rebase --skip 跳过，并更新上面的补丁清单
-git push --force-with-lease origin patched
+git switch patched && git merge --no-ff main
+# 冲突时逐个解决后 git commit；补丁已被上游合并的话，确认后用 git revert 去掉它，并更新上面的补丁清单
+git push origin patched
 ```
+
+查看当前补丁（跳过 merge 提交和内容已与上游等价的提交）：`git log --oneline --no-merges --cherry-pick --right-only main...patched`。```
 
 ## 构建与安装（Windows）
 
