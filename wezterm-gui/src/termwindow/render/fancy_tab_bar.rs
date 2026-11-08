@@ -1008,12 +1008,15 @@ impl crate::TermWindow {
         let mut remaining_tabs = tab_count;
         let mut remaining_width = uniform_width;
 
-        // Reserve space for the native titlebar buttons
+        // Reserve space for the native titlebar buttons. Only macOS draws them
+        // in the window frame at the far left; the fork-drawn traffic lights
+        // follow integrated_title_button_alignment instead.
         if self
             .config
             .window_decorations
             .contains(::window::WindowDecorations::INTEGRATED_BUTTONS)
             && self.config.integrated_title_button_style == IntegratedTitleButtonStyle::MacOsNative
+            && cfg!(target_os = "macos")
             && !self.window_state.contains(window::WindowState::FULL_SCREEN)
         {
             left_status.push(
