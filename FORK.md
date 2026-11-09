@@ -33,6 +33,9 @@
 | mux: restore agent commands from agent.restore_argv | 自用 | — | 与上一行一起删；替代已废弃的 `agent.resume_args` 追加语义，`agent.*` 由宿主保留 |
 | gui: foreground only explicit window activations | 自用 | — | 上游 `activate-*` 默认遮挡窗口的前台化行为等价后可删 |
 | gui: expose tab budgets, mergeable overrides, CWD links and status coalescing | 自用 | — | 上游提供等价 API 后可删 |
+| gui: keep the last glyph when paint rounding overshoots the text box | 自用（可提交上游） | — | 上游修正 box model 测量/绘制的 f32 累加不一致后可删 |
+
+box model 末字丢失：`compute_element` 只保留放得下的字形，内容框宽度 = 这些字形 advance 从 0 累加的和；`render_element` 再从内容框（平移后的）原点逐个累加同一组 advance，并用严格的 `pos_x + advance > max_x` 截断。两次 f32 累加顺序不同，advance 不是 1/64 整数倍时（彩色 emoji 被缩放进格子，例如 LXGW 缺 `✳` 时回退到 Noto Color Emoji），最后一个字形会超出 1 ulp，被整个丢掉。表现为标签栏标题末字（如 `✳ 服务状态` 显示成 `✳ 服务状`）偶发消失，没有省略号，并随 tab 的 x 坐标变化时有时无。绘制阶段只会拿到测量阶段已接受的格子，所以这条比较只用于防漂移；补丁改为允许 0.5px 余量（`paint_overflows`，单测 `paint_overflow_tests` 用 144 DPI 下 `✳ 服务状态` 量级的 advance 复现了旧比较丢字）。
 
 #4456 的影响：Windows 上 GUI 只把 `gui-sock-<pid>` 这个文件名发布到共享内存，新启动的 `wezterm-gui` 和 `wezterm cli` 按自己的工作目录去解析，于是任务栏、开始菜单、右键菜单每次启动都会新开一个进程（每个进程有几百 MB 的基础开销），在 WezTerm 外运行 `wezterm cli` 也会连不上。
 

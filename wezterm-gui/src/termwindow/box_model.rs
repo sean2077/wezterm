@@ -21,6 +21,24 @@ use wezterm_font::LoadedFont;
 use wezterm_term::color::{ColorAttribute, ColorPalette};
 use window::bitmaps::atlas::Sprite;
 
+/// Sub-pixel slack for the paint-time overflow check of text elements.
+///
+/// `compute_element` keeps only the cells that fit and sizes the content box
+/// to their summed advances, accumulated from zero.  `render_element` walks
+/// the same advances again starting at the box's (translated) origin.  The two
+/// f32 sums round differently, and when an advance is not a multiple of 1/64
+/// (color glyphs scaled into their cells) the painted position of the last
+/// glyph can exceed `max_x` by an ulp.  A strict comparison then silently
+/// drops that glyph, e.g. the trailing CJK character of a tab title.
+const PAINT_OVERFLOW_SLACK: f32 = 0.5;
+
+/// Whether a cell that starts at `pos_x` and advances by `advance` would be
+/// painted past `max_x`.  Only cells accepted by `compute_element` reach the
+/// painter, so the check only guards against rounding drift.
+fn paint_overflows(pos_x: f32, advance: f32, max_x: f32) -> bool {
+    pos_x + advance > max_x + PAINT_OVERFLOW_SLACK
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VerticalAlign {
     Top,
@@ -889,7 +907,7 @@ impl super::TermWindow {
                             let height = sprite.coords.height();
                             let pos_y = top + element.content_rect.min_y();
 
-                            if pos_x + width as f32 > element.content_rect.max_x() {
+                            if paint_overflows(pos_x, width as f32, element.content_rect.max_x()) {
                                 break;
                             }
 
@@ -911,9 +929,11 @@ impl super::TermWindow {
                                     - (glyph.y_offset + glyph.bearing_y).get() as f32
                                     + element.baseline;
 
-                                if pos_x + glyph.x_advance.get() as f32
-                                    > element.content_rect.max_x()
-                                {
+                                if paint_overflows(
+                                    pos_x,
+                                    glyph.x_advance.get() as f32,
+                                    element.content_rect.max_x(),
+                                ) {
                                     break;
                                 }
                                 let pos_x = pos_x + (glyph.x_offset + glyph.bearing_x).get() as f32;
@@ -1291,5 +1311,56 @@ impl super::TermWindow {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod paint_overflow_tests {
+    use super::paint_overflows;
+
+    /// Replays compute_element (width summed from zero, box at `min_x`) and
+    /// render_element (advances re-accumulated from `min_x`) in f32 and
+    /// returns how many cells the painter keeps.
+    fn painted_cells(
+        min_x: f32,
+        advances: &[f32],
+        overflows: impl Fn(f32, f32, f32) -> bool,
+    ) -> usize {
+        let width: f32 = advances.iter().fold(0.0f32, |w, a| w + a);
+        let rect = euclid::rect::<f32, ()>(min_x, 0., width, 1.);
+        let max_x = rect.max_x();
+        let mut pos_x = rect.min_x();
+        for (idx, advance) in advances.iter().enumerate() {
+            if overflows(pos_x, *advance, max_x) {
+                return idx;
+            }
+            pos_x += advance;
+        }
+        advances.len()
+    }
+
+    // "✳ 服务状态" at 144 dpi: the emoji fallback glyph is scaled into one
+    // cell, leaving an advance that is not a multiple of 1/64.
+    const MIN_X: f32 = 311.188_995_361_328_1;
+    const ADVANCES: [f32; 6] = [9.224_536_895_751_953, 10., 20., 20., 20., 20.];
+
+    #[test]
+    fn strict_comparison_drops_the_last_glyph() {
+        let strict = |pos: f32, adv: f32, max: f32| pos + adv > max;
+        assert_eq!(painted_cells(MIN_X, &ADVANCES, strict), ADVANCES.len() - 1);
+    }
+
+    #[test]
+    fn rounding_drift_keeps_every_measured_cell() {
+        assert_eq!(
+            painted_cells(MIN_X, &ADVANCES, paint_overflows),
+            ADVANCES.len()
+        );
+    }
+
+    #[test]
+    fn a_whole_cell_past_the_box_still_overflows() {
+        assert!(paint_overflows(100., 10., 105.));
+        assert!(!paint_overflows(100., 10., 110.));
     }
 }
