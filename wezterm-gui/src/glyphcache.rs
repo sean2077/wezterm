@@ -1344,20 +1344,24 @@ impl GlyphCache {
 
     /// Figure out what we're going to draw for the underline.
     /// If the current cell is part of the current URL highlight
-    /// then we want to show the underline.
+    /// then we want to show the underline.  Accented hyperlinks (see
+    /// `hyperlink_accent_rules`) also show one while idle, but only when
+    /// the text does not already carry its own underline.
     pub fn cached_line_sprite(
         &mut self,
         is_highlited_hyperlink: bool,
+        accent_underline: bool,
         is_strike_through: bool,
         underline: Underline,
         overline: bool,
         metrics: &RenderMetrics,
     ) -> anyhow::Result<Sprite> {
-        let effective_underline = match (is_highlited_hyperlink, underline) {
-            (true, Underline::None) => Underline::Single,
-            (true, Underline::Single) => Underline::Double,
-            (true, _) => Underline::Single,
-            (false, u) => u,
+        let effective_underline = match (is_highlited_hyperlink, accent_underline, underline) {
+            (true, _, Underline::None) => Underline::Single,
+            (true, _, Underline::Single) => Underline::Double,
+            (true, _, _) => Underline::Single,
+            (false, true, Underline::None) => Underline::Single,
+            (false, _, u) => u,
         };
 
         let key = LineKey {

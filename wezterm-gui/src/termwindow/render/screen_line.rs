@@ -774,7 +774,21 @@ impl crate::TermWindow {
         let mut invalidate_on_hover_change = false;
 
         for cluster in &cell_clusters {
-            if !matches!(last_style.as_ref(), Some(ClusterStyleCache{attrs,..}) if *attrs == &cluster.attrs)
+            let accent = cluster
+                .attrs
+                .hyperlink()
+                .and_then(|link| params.config.hyperlink_accent_for(link.uri()));
+            let accent_underline = accent.map_or(false, |rule| rule.underline);
+            let accent_fg = accent
+                .and_then(|rule| rule.foreground)
+                .map(|color| color.to_linear());
+            let accent_key = (accent_underline, accent_fg);
+
+            if !matches!(
+                last_style.as_ref(),
+                Some(ClusterStyleCache { attrs, accent, .. })
+                    if *attrs == &cluster.attrs && *accent == accent_key
+            )
             {
                 let attrs = &cluster.attrs;
                 let style = self.fonts.match_style(params.config, attrs);
@@ -790,6 +804,7 @@ impl crate::TermWindow {
                     .borrow_mut()
                     .cached_line_sprite(
                         is_highlited_hyperlink,
+                        accent_underline,
                         attrs.strikethrough(),
                         attrs.underline(),
                         attrs.overline(),
@@ -799,13 +814,16 @@ impl crate::TermWindow {
                 let bg_is_default = attrs.background() == ColorAttribute::Default;
                 let bg_color = params.palette.resolve_bg(attrs.background()).to_linear();
 
-                let fg_color = resolve_fg_color_attr(
-                    &attrs,
-                    attrs.foreground(),
-                    &params.palette,
-                    &params.config,
-                    style,
-                );
+                let fg_color = match accent_fg {
+                    Some(color) => color,
+                    None => resolve_fg_color_attr(
+                        &attrs,
+                        attrs.foreground(),
+                        &params.palette,
+                        &params.config,
+                        style,
+                    ),
+                };
                 let (fg_color, bg_color, bg_is_default) = {
                     let mut fg = fg_color;
                     let mut bg = bg_color;
@@ -854,7 +872,7 @@ impl crate::TermWindow {
 
                 let glyph_color = fg_color;
                 let underline_color = match attrs.underline_color() {
-                    ColorAttribute::Default => fg_color,
+                    ColorAttribute::Default => accent_fg.unwrap_or(fg_color),
                     c => resolve_fg_color_attr(&attrs, c, &params.palette, &params.config, style),
                 };
 
@@ -873,6 +891,7 @@ impl crate::TermWindow {
                 last_style.replace(ClusterStyleCache {
                     attrs,
                     style,
+                    accent: accent_key,
                     underline_tex_rect: underline_tex_rect.clone(),
                     bg_color,
                     fg_color: glyph_color,

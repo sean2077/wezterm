@@ -216,6 +216,10 @@ pub struct ComputeCellFgBgResult {
 pub struct ClusterStyleCache<'a> {
     attrs: &'a CellAttributes,
     style: &'a TextStyle,
+    /// The accent rule state (underline, foreground) applied to this
+    /// cluster, so a neighbouring cluster with equal attrs but a different
+    /// hyperlink accent is not served from this cache entry.
+    accent: (bool, Option<LinearRgba>),
     underline_tex_rect: TextureRect,
     fg_color: LinearRgba,
     bg_color: LinearRgba,

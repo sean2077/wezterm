@@ -280,6 +280,13 @@ pub struct Config {
     #[dynamic(default = "default_hyperlink_rules")]
     pub hyperlink_rules: Vec<hyperlink::Rule>,
 
+    /// Persistent visual accents for hyperlinks.  Each entry matches links
+    /// whose URI starts with `prefix` and applies its underline and
+    /// foreground color while the link is idle, instead of only while the
+    /// mouse hovers over it.
+    #[dynamic(default)]
+    pub hyperlink_accent_rules: Vec<HyperlinkAccentRule>,
+
     /// What to set the TERM variable to
     #[dynamic(default = "default_term")]
     pub term: String,
@@ -991,6 +998,14 @@ impl Default for Config {
 impl Config {
     pub fn load() -> LoadedConfig {
         Self::load_with_overrides(&wezterm_dynamic::Value::default())
+    }
+
+    /// Returns the first accent rule whose non-empty prefix matches the
+    /// beginning of `uri`.
+    pub fn hyperlink_accent_for(&self, uri: &str) -> Option<&HyperlinkAccentRule> {
+        self.hyperlink_accent_rules
+            .iter()
+            .find(|rule| !rule.prefix.is_empty() && uri.starts_with(rule.prefix.as_str()))
     }
 
     /// It is relatively expensive to parse all the ssh config files,
@@ -1777,6 +1792,30 @@ fn default_initial_rows() -> u16 {
 
 fn default_initial_cols() -> u16 {
     80
+}
+
+/// A persistent visual accent for hyperlinks whose URI matches `prefix`.
+///
+/// Upstream only highlights a link while the mouse hovers over it.  An
+/// accent rule is applied to idle links as well, so links that the user
+/// wants to notice at a glance (an internal issue tracker, for example)
+/// read as links without hovering.
+#[derive(Debug, Clone, Default, PartialEq, FromDynamic, ToDynamic)]
+pub struct HyperlinkAccentRule {
+    /// Only links whose URI starts with this literal, case-sensitive prefix
+    /// are accented.
+    pub prefix: String,
+    /// Draw a single underline under the link text even when the mouse is
+    /// not hovering it.  Text that already has its own underline keeps that
+    /// underline and is not turned into a double underline.  Defaults to
+    /// true.
+    #[dynamic(default = "default_true")]
+    pub underline: bool,
+    /// Foreground color for the link text.  The underline uses the same
+    /// color unless the program set an explicit underline color.  The text
+    /// keeps its original color when this is unset.
+    #[dynamic(default)]
+    pub foreground: Option<RgbaColor>,
 }
 
 pub fn default_hyperlink_rules() -> Vec<hyperlink::Rule> {

@@ -33,6 +33,7 @@
 | mux: restore agent commands from agent.restore_argv | 自用 | — | 与上一行一起删；替代已废弃的 `agent.resume_args` 追加语义，`agent.*` 由宿主保留 |
 | gui: foreground only explicit window activations | 自用 | — | 上游 `activate-*` 默认遮挡窗口的前台化行为等价后可删 |
 | gui: expose tab budgets, mergeable overrides, CWD links and status coalescing | 自用 | — | 上游提供等价 API 后可删 |
+| gui: accent hyperlinks by URI prefix | 自用 | — | 上游提供常显链接样式或等价配置后可删 |
 | gui: keep the last glyph when paint rounding overshoots the text box | 自用（可提交上游） | — | 上游修正 box model 测量/绘制的 f32 累加不一致后可删 |
 
 box model 末字丢失：`compute_element` 只保留放得下的字形，内容框宽度 = 这些字形 advance 从 0 累加的和；`render_element` 再从内容框（平移后的）原点逐个累加同一组 advance，并用严格的 `pos_x + advance > max_x` 截断。两次 f32 累加顺序不同，advance 不是 1/64 整数倍时（彩色 emoji 被缩放进格子，例如 LXGW 缺 `✳` 时回退到 Noto Color Emoji），最后一个字形会超出 1 ulp，被整个丢掉。表现为标签栏标题末字（如 `✳ 服务状态` 显示成 `✳ 服务状`）偶发消失，没有省略号，并随 tab 的 x 坐标变化时有时无。绘制阶段只会拿到测量阶段已接受的格子，所以这条比较只用于防漂移；补丁改为允许 0.5px 余量（`paint_overflows`，单测 `paint_overflow_tests` 用 144 DPI 下 `✳ 服务状态` 量级的 advance 复现了旧比较丢字）。
@@ -74,6 +75,10 @@ uniform 模式下 tab 的 hover 判定也改用像素：按同样的份额累计
 `wezterm cli list` 增加 `tab_index`、`window_index`、`is_active_tab`（表格末尾的 `ACTIVE` 列）；新增 `wezterm cli activate-window --window-id <WINID>`，通过 `SetFocusedPane` 切到该窗口的活动 tab 并前台化。`ListPanesResponse` 增加了 `active_tab_ids` 字段，因此 `CODEC_VERSION` 升到 47；升级后需要重启所有 GUI 进程，避免新旧 codec 混用。
 
 该功能仅 Windows 有实现；上游目前没有全局热键/quake 模式。补丁同时在 `window/Cargo.toml` 显式声明了 `winapi/shellapi` feature：窗口代码原本就使用 `DragAcceptFiles`，此前只是靠其他 crate 的 feature 合并才编过，单独构建 `window` crate 会失败。
+
+## hyperlink accent（自用）
+
+上游只在鼠标悬停链接时画下划线，平时链接和普通文本没有区别。`config.hyperlink_accent_rules` 让 URI 以前缀匹配的链接在空闲时也保持强调样式：`prefix` 是字面前缀（区分大小写，空串不匹配），`underline`（默认 `true`）在链接自身没有下划线时补一条单下划线，`foreground` 设置文字颜色并兼作默认下划线颜色（程序显式设了 `underline_color` 时保留程序的值）。第一条命中的规则生效。规则对 `hyperlink_rules` 生成的隐式链接和程序输出的 OSC 8 链接都有效；渲染在 `wezterm-gui/src/termwindow/render/screen_line.rs` 的 cluster 样式计算里完成，`ClusterStyleCache` 把 accent 状态纳入缓存键，避免相邻同属性 cluster 复用错误样式。这项改动不涉及 mux/codec，不需要升 `CODEC_VERSION`。
 
 ## 通用工作区持久化（自用）
 
