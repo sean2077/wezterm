@@ -940,7 +940,7 @@ impl TabBarState {
         } else {
             (if available_cells >= titles_len {
                 // We can render each title with its full width
-                usize::max_value()
+                usize::MAX
             } else {
                 // We need to clamp the length to balance them out
                 available_cells / number_of_tabs.max(1)
