@@ -35,6 +35,7 @@
 | gui: expose tab budgets, mergeable overrides, CWD links and status coalescing | 自用 | — | 上游提供等价 API 后可删 |
 | gui: accent hyperlinks by URI prefix | 自用 | — | 上游提供常显链接样式或等价配置后可删 |
 | gui: keep the last glyph when paint rounding overshoots the text box | 自用（可提交上游） | — | 上游修正 box model 测量/绘制的 f32 累加不一致后可删 |
+| gui: hide the scrollbar on the alternate screen | 自用 | — | 上游在 alt screen 自动隐藏滚动条后可删 |
 
 box model 末字丢失：`compute_element` 只保留放得下的字形，内容框宽度 = 这些字形 advance 从 0 累加的和；`render_element` 再从内容框（平移后的）原点逐个累加同一组 advance，并用严格的 `pos_x + advance > max_x` 截断。两次 f32 累加顺序不同，advance 不是 1/64 整数倍时（彩色 emoji 被缩放进格子，例如 LXGW 缺 `✳` 时回退到 Noto Color Emoji），最后一个字形会超出 1 ulp，被整个丢掉。表现为标签栏标题末字（如 `✳ 服务状态` 显示成 `✳ 服务状`）偶发消失，没有省略号，并随 tab 的 x 坐标变化时有时无。绘制阶段只会拿到测量阶段已接受的格子，所以这条比较只用于防漂移；补丁改为允许 0.5px 余量（`paint_overflows`，单测 `paint_overflow_tests` 用 144 DPI 下 `✳ 服务状态` 量级的 advance 复现了旧比较丢字）。
 
@@ -43,6 +44,8 @@ box model 末字丢失：`compute_element` 只保留放得下的字形，内容�
 自用清理补丁：GUI 正常退出会在 `listener.run()` 返回后删除自己的 `gui-sock-<pid>`（`wezterm-gui/src/main.rs`），但崩溃、强杀和隔离测试实例都不走这条路径；这些标记文件放在 `~/.local/share/wezterm`，重启电脑也不会清。上游只在自动更新路径调用 `discover_gui_socks()`，日常启动不调用，死文件会一直留着。补丁在 `async_run_terminal_gui` 开头调用一次 `discover_gui_socks()`；该函数只删除连接失败且超过 1 秒的 socket，正在启动的实例不受影响。同一个启动路径还会删除目标已不存在的 `agent.*` 符号链接（SSH agent 转发按 pane 创建一个，崩溃/强杀后留下断链）；有效链接和普通文件不动。旧命名 `sock` 不在清理范围。
 
 #8166 的影响：Windows 上 `TermWindow::update_text_cursor` 在每帧绘制时都调用 `ImmSetCandidateWindow`（Builtin preedit）或 `ImmSetCompositionWindow`（System preedit），而 IME 每次收到调用都会销毁并重建候选窗，于是组合输入时候选窗每敲一键闪一次（Google 日语输入法、微软 IME、Rime/Weasel 都如此；Claude Code、Codex CLI 这类高频重绘的 TUI 更明显）。补丁缓存上次上报给 IME 的光标矩形，位置不变就跳过调用；在 `WM_SETFOCUS`、`WM_IME_SETCONTEXT`、`WM_IME_STARTCOMPOSITION`、`WM_IME_ENDCOMPOSITION` 以及配置变化时清缓存，保证重新获得焦点、每次组合开始时至少重新上报一次。
+
+alt screen 滚动条：WezTerm 在 `enable_scroll_bar` 打开时始终绘制右侧滚动条，包括 alternate screen；但 alternate screen 不保留 scrollback（`term/src/screen.rs` 的 `scrollback_size()` 对 alt screen 返回 0），滑块高度等于整条轨道，拖动没有可移动行程，表现为一条拖不动的色条。Claude Code 的 fullscreen 渲染器（`tui: fullscreen`）、`vim`、`less` 等全屏程序都在 alternate screen 中。补丁在 `wezterm-gui/src/termwindow/render/pane.rs` 的绘制条件里加上 `!pane.is_alt_screen_active()`，alt screen 下不绘制滚动条，也不注册 `ScrollThumb`/`AboveScrollThumb`/`BelowScrollThumb` 命中区；右侧 `window_padding` 保留，字符网格宽度不变，退出全屏程序后滚动条恢复。
 
 ## Quake 下拉模式（自用）
 

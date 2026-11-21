@@ -226,7 +226,13 @@ impl crate::TermWindow {
         // do a per-pane scrollbar.  That will require more extensive
         // changes to ScrollHit, mouse positioning, PositionedPane
         // and tab size calculation.
-        if pos.is_active && self.show_scroll_bar {
+        //
+        // The scrollbar reflects terminal scrollback, which the alternate
+        // screen doesn't have: its thumb would fill the whole track and
+        // dragging it could never move.  Skip drawing it (and registering
+        // its hit areas) in full-screen applications; the normal screen
+        // gets the usual bar when the application exits.
+        if pos.is_active && self.show_scroll_bar && !pos.pane.is_alt_screen_active() {
             let thumb_y_offset = top_bar_height as usize + border.top.get();
 
             let min_height = self.min_scroll_bar_height();
