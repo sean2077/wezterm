@@ -1,29 +1,12 @@
-//! See <https://developer.gnome.org/notification-spec/>
+//! See <https://specifications.freedesktop.org/notification/latest/>
 
 #![cfg(all(not(target_os = "macos"), not(windows)))]
 
 use crate::ToastNotification;
-use futures_util::stream::{abortable, StreamExt};
-use serde::{Deserialize, Serialize};
+use futures_util::TryStreamExt;
 use std::collections::HashMap;
-use zbus::proxy;
-use zvariant::{Type, Value};
-
-#[derive(Debug, Type, Serialize, Deserialize)]
-#[allow(dead_code)]
-pub struct ServerInformation {
-    /// The product name of the server.
-    pub name: String,
-
-    /// The vendor name. For example "KDE," "GNOME," "freedesktop.org" or "Microsoft".
-    pub vendor: String,
-
-    /// The server's version number.
-    pub version: String,
-
-    /// The specification version the server is compliant with.
-    pub spec_version: String,
-}
+use zbus::{fdo::DBusProxy, message::Type, proxy, MatchRule, MessageStream};
+use zvariant::Value;
 
 #[proxy(
     interface = "org.freedesktop.Notifications",
@@ -31,16 +14,8 @@ pub struct ServerInformation {
     default_path = "/org/freedesktop/Notifications"
 )]
 trait Notifications {
-    /// Get server information.
-    ///
-    /// This message returns the information on the server.
-    fn get_server_information(&self) -> zbus::Result<ServerInformation>;
-
     /// GetCapabilities method
     fn get_capabilities(&self) -> zbus::Result<Vec<String>>;
-
-    /// CloseNotification method
-    fn close_notification(&self, nid: u32) -> zbus::Result<()>;
 
     fn notify(
         &self,
@@ -53,53 +28,73 @@ trait Notifications {
         hints: &HashMap<&str, Value<'_>>,
         expire_timeout: i32,
     ) -> zbus::Result<u32>;
-
-    #[zbus(signal)]
-    fn action_invoked(&self, nid: u32, action_key: String) -> zbus::Result<()>;
-
-    #[zbus(signal)]
-    fn notification_closed(&self, nid: u32, reason: u32) -> zbus::Result<()>;
 }
 
-/// Timeout/expiration was reached
-const REASON_EXPIRED: u32 = 1;
-/// User dismissed it
-const REASON_USER_DISMISSED: u32 = 2;
-/// CloseNotification was called with the nid
-const REASON_CLOSE_NOTIFICATION: u32 = 3;
+type ClickHandler = Box<dyn FnOnce(Option<String>) + Send>;
 
-#[derive(Debug)]
-enum Reason {
-    Expired,
-    Dismissed,
-    Closed,
-    #[allow(dead_code)]
-    Unknown(u32),
+enum Action {
+    OpenUrl(String),
+    Activate(ClickHandler),
 }
 
-impl Reason {
-    fn new(n: u32) -> Self {
-        match n {
-            REASON_EXPIRED => Self::Expired,
-            REASON_USER_DISMISSED => Self::Dismissed,
-            REASON_CLOSE_NOTIFICATION => Self::Closed,
-            _ => Self::Unknown(n),
+impl Action {
+    fn key_and_label(&self) -> &'static [&'static str] {
+        match self {
+            Self::OpenUrl(_) => &["show", "Show"],
+            Self::Activate(_) => &["default", "Open pane"],
         }
     }
 }
 
-async fn show_notif_impl(notif: ToastNotification) -> Result<(), Box<dyn std::error::Error>> {
+async fn show_notif_impl(
+    notif: ToastNotification,
+    on_click: Option<ClickHandler>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let connection = zbus::ConnectionBuilder::session()?.build().await?;
+    let mut proxy = NotificationsProxy::new(&connection).await?;
 
-    let proxy = NotificationsProxy::new(&connection).await?;
-    let caps = proxy.get_capabilities().await?;
+    let action = on_click
+        .map(Action::Activate)
+        .or(notif.url.map(Action::OpenUrl));
+    let action = match action {
+        Some(action)
+            if !proxy
+                .get_capabilities()
+                .await?
+                .iter()
+                .any(|cap| cap == "actions") =>
+        {
+            // URL toasts may explicitly ask the user to click their button.
+            if matches!(action, Action::OpenUrl(_)) {
+                return Ok(());
+            }
+            None
+        }
+        action => action,
+    };
 
-    if notif.url.is_some() && !caps.iter().any(|cap| cap == "actions") {
-        // Server doesn't support actions, so skip showing this notification
-        // because it might have text that says "click to see more"
-        // and that just wouldn't work.
-        return Ok(());
-    }
+    // Subscribe before posting so even an immediate click is observed. Use one
+    // stream to preserve the order of the token, action, and close signals.
+    let mut signals = if action.is_some() {
+        let owner = DBusProxy::new(&connection)
+            .await?
+            .get_name_owner(proxy.inner().destination().clone())
+            .await?;
+        let rule = MatchRule::builder()
+            .msg_type(Type::Signal)
+            .sender(owner.clone())?
+            .interface(proxy.inner().interface().clone())?
+            .path(proxy.inner().path().clone())?
+            .build();
+        let signals = MessageStream::for_match_rule(rule, &connection, None).await?;
+        proxy = NotificationsProxy::builder(&connection)
+            .destination(owner)?
+            .build()
+            .await?;
+        Some(signals)
+    } else {
+        None
+    };
 
     let mut hints = HashMap::new();
     hints.insert("urgency", Value::U8(1 /* Normal */));
@@ -110,57 +105,73 @@ async fn show_notif_impl(notif: ToastNotification) -> Result<(), Box<dyn std::er
             "org.wezfurlong.wezterm",
             &notif.title,
             &notif.message,
-            if notif.url.is_some() {
-                &["show", "Show"]
-            } else {
-                &[]
-            },
+            action.as_ref().map_or(&[], Action::key_and_label),
             &hints,
             notif.timeout.map(|d| d.as_millis() as _).unwrap_or(0),
         )
         .await?;
 
-    let (mut invoked_stream, abort_invoked) = abortable(proxy.receive_action_invoked().await?);
-    let (mut closed_stream, abort_closed) = abortable(proxy.receive_notification_closed().await?);
-
-    futures_util::try_join!(
-        async {
-            while let Some(signal) = invoked_stream.next().await {
-                let args = signal.args()?;
-                if args.nid == notification {
-                    if let Some(url) = notif.url.as_ref() {
-                        wezterm_open_url::open_url(url);
-                        abort_closed.abort();
+    if let (Some(signals), Some(action)) = (&mut signals, action) {
+        let mut activation_token = None;
+        while let Some(signal) = signals.try_next().await? {
+            match signal.header().member().map(|name| name.as_str()) {
+                Some("ActivationToken") => {
+                    let (id, token): (u32, String) = signal.body().deserialize()?;
+                    if id == notification && !token.is_empty() {
+                        activation_token = Some(token);
+                    }
+                }
+                Some("ActionInvoked") => {
+                    let (id, key): (u32, String) = signal.body().deserialize()?;
+                    if id == notification && key == action.key_and_label()[0] {
+                        match action {
+                            Action::OpenUrl(url) => wezterm_open_url::open_url(&url),
+                            Action::Activate(on_click) => on_click(activation_token),
+                        }
                         break;
                     }
                 }
-            }
-            Ok::<(), zbus::Error>(())
-        },
-        async {
-            while let Some(signal) = closed_stream.next().await {
-                let args = signal.args()?;
-                let _reason = Reason::new(args.reason);
-                if args.nid == notification {
-                    abort_invoked.abort();
-                    break;
+                Some("NotificationClosed") => {
+                    let (id, _reason): (u32, u32) = signal.body().deserialize()?;
+                    if id == notification {
+                        break;
+                    }
                 }
+                _ => {}
             }
-            Ok(())
         }
-    )?;
+    }
 
     Ok(())
 }
 
-pub fn show_notif(notif: ToastNotification) -> Result<(), Box<dyn std::error::Error>> {
-    // Run this in a separate thread as we don't know if dbus or the notification
-    // service on the other end are up, and we'd otherwise block for some time.
+fn show_in_background(notif: ToastNotification, on_click: Option<ClickHandler>) {
+    // Run this in a separate thread so the notification service cannot block the GUI.
     std::thread::spawn(move || {
-        let res = async_io::block_on(async move { show_notif_impl(notif).await });
+        let res = async_io::block_on(show_notif_impl(notif, on_click));
         if let Err(err) = res {
             log::error!("while showing notification: {:#}", err);
         }
     });
+}
+
+pub fn show_notif(notif: ToastNotification) -> Result<(), Box<dyn std::error::Error>> {
+    show_in_background(notif, None);
     Ok(())
+}
+
+pub fn persistent_toast_notification_with_click_action(
+    title: &str,
+    message: &str,
+    on_click: impl FnOnce(Option<String>) + Send + 'static,
+) {
+    show_in_background(
+        ToastNotification {
+            title: title.to_string(),
+            message: message.to_string(),
+            url: None,
+            timeout: None,
+        },
+        Some(Box::new(on_click)),
+    );
 }

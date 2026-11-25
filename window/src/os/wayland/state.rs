@@ -29,10 +29,11 @@ use wayland_client::backend::ObjectId;
 use wayland_client::globals::GlobalList;
 use wayland_client::protocol::wl_keyboard::WlKeyboard;
 use wayland_client::protocol::wl_output::WlOutput;
-use wayland_client::{delegate_dispatch, Connection, QueueHandle};
+use wayland_client::{delegate_dispatch, delegate_noop, Connection, QueueHandle};
 use wayland_protocols::ext::background_effect::v1::client::ext_background_effect_manager_v1::ExtBackgroundEffectManagerV1;
 use wayland_protocols::wp::text_input::zv3::client::zwp_text_input_manager_v3::ZwpTextInputManagerV3;
 use wayland_protocols::wp::text_input::zv3::client::zwp_text_input_v3::ZwpTextInputV3;
+use wayland_protocols::xdg::activation::v1::client::xdg_activation_v1::XdgActivationV1;
 use wayland_protocols_plasma::blur::client::org_kde_kwin_blur_manager::OrgKdeKwinBlurManager;
 
 use crate::x11::KeyboardWithFallback;
@@ -53,6 +54,7 @@ pub(super) struct WaylandState {
     pub(super) output_manager: Option<OutputManagerState>,
     pub(super) seat: SeatState,
     pub(super) xdg: XdgShell,
+    pub(super) activation: Option<XdgActivationV1>,
     pub(super) windows: RefCell<HashMap<usize, Rc<RefCell<WaylandWindowInner>>>>,
 
     pub(super) active_surface_id: RefCell<Option<ObjectId>>,
@@ -121,6 +123,7 @@ impl WaylandState {
             windows: RefCell::new(HashMap::new()),
             seat: SeatState::new(globals, qh),
             xdg: XdgShell::bind(globals, qh)?,
+            activation: globals.bind(qh, 1..=1, ()).ok(),
             active_surface_id: RefCell::new(None),
             last_serial: RefCell::new(0),
             keyboard: None,
@@ -195,6 +198,7 @@ delegate_pointer!(WaylandState, pointer: [PointerUserData]);
 
 delegate_xdg_shell!(WaylandState);
 delegate_xdg_window!(WaylandState);
+delegate_noop!(WaylandState: ignore XdgActivationV1);
 
 delegate_primary_selection!(WaylandState);
 

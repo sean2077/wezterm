@@ -58,3 +58,6 @@ pub fn persistent_toast_notification(title: &str, message: &str) {
 
 #[cfg(target_os = "macos")]
 pub use macos::initialize as macos_initialize;
+
+#[cfg(all(not(target_os = "macos"), not(windows)))]
+pub use dbus::persistent_toast_notification_with_click_action;

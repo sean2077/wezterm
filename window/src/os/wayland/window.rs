@@ -355,6 +355,17 @@ impl WaylandWindow {
 
         Ok(window_handle)
     }
+
+    pub(crate) fn activate_with_token(&self, token: String) {
+        WaylandConnection::with_window_inner(self.0, move |inner| {
+            let conn = WaylandConnection::get().unwrap().wayland();
+            let wayland_state = conn.wayland_state.borrow();
+            if let (Some(activation), Some(window)) = (&wayland_state.activation, &inner.window) {
+                activation.activate(token, window.wl_surface());
+            }
+            Ok(())
+        });
+    }
 }
 
 #[async_trait(?Send)]

@@ -1,6 +1,6 @@
 # 自用 fork 说明
 
-这是 [wezterm/wezterm](https://github.com/wezterm/wezterm) 的自用 fork，只在 Windows 上构建、自己使用。
+这是 [wezterm/wezterm](https://github.com/wezterm/wezterm) 的自用 fork，在 Windows 和 Linux 上构建、自己使用。
 
 ## 分支
 
@@ -36,6 +36,7 @@
 | gui: accent hyperlinks by URI prefix | 自用 | — | 上游提供常显链接样式或等价配置后可删 |
 | gui: keep the last glyph when paint rounding overshoots the text box | 自用（可提交上游） | — | 上游修正 box model 测量/绘制的 f32 累加不一致后可删 |
 | gui: hide the scrollbar on the alternate screen | 自用 | — | 上游在 alt screen 自动隐藏滚动条后可删 |
+| gui: activate the source pane from desktop notifications on Linux | 自用 | — | 上游点击 OSC 9 / OSC 777 通知可返回源 pane 并激活 Wayland 窗口后可删 |
 
 box model 末字丢失：`compute_element` 只保留放得下的字形，内容框宽度 = 这些字形 advance 从 0 累加的和；`render_element` 再从内容框（平移后的）原点逐个累加同一组 advance，并用严格的 `pos_x + advance > max_x` 截断。两次 f32 累加顺序不同，advance 不是 1/64 整数倍时（彩色 emoji 被缩放进格子，例如 LXGW 缺 `✳` 时回退到 Noto Color Emoji），最后一个字形会超出 1 ulp，被整个丢掉。表现为标签栏标题末字（如 `✳ 服务状态` 显示成 `✳ 服务状`）偶发消失，没有省略号，并随 tab 的 x 坐标变化时有时无。绘制阶段只会拿到测量阶段已接受的格子，所以这条比较只用于防漂移；补丁改为允许 0.5px 余量（`paint_overflows`，单测 `paint_overflow_tests` 用 144 DPI 下 `✳ 服务状态` 量级的 advance 复现了旧比较丢字）。
 

@@ -115,7 +115,7 @@ impl GuiFrontEnd {
                         Alert::ToastNotification {
                             title,
                             body,
-                            focus: _,
+                            focus: _focus,
                         },
                 } => {
                     let mux = Mux::get();
@@ -139,9 +139,20 @@ impl GuiFrontEnd {
                             if show {
                                 let message = if title.is_none() { "" } else { &body };
                                 let title = title.as_ref().unwrap_or(&body);
-                                // FIXME: if notification.focus is true, we should do
-                                // something here to arrange to focus pane_id when the
-                                // notification is clicked
+                                #[cfg(all(unix, not(target_os = "macos")))]
+                                if _focus {
+                                    persistent_toast_notification_with_click_action(
+                                        title,
+                                        message,
+                                        move |token| {
+                                            promise::spawn::spawn_into_main_thread(
+                                                Self::activate_notification_pane(pane_id, token),
+                                            )
+                                            .detach();
+                                        },
+                                    );
+                                    return true;
+                                }
                                 persistent_toast_notification(title, message);
                             }
                         }
@@ -477,11 +488,45 @@ impl GuiFrontEnd {
         false
     }
 
-    pub fn switch_workspace(&self, workspace: &str) {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    async fn activate_notification_pane(pane_id: mux::pane::PaneId, token: Option<String>) {
+        let Some(mux) = Mux::try_get() else {
+            return;
+        };
+        let Some((_, window_id, _)) = mux.resolve_pane_id(pane_id) else {
+            return;
+        };
+        let Some(workspace) = mux
+            .get_window(window_id)
+            .map(|window| window.get_workspace().to_owned())
+        else {
+            return;
+        };
+        if let Err(err) = mux.focus_pane_and_containing_tab(pane_id) {
+            log::debug!("Cannot activate notification pane: {err:#}");
+            return;
+        }
+        let switch = try_front_end().and_then(|front_end| {
+            (workspace != mux.active_workspace_for_client(&front_end.client_id))
+                .then(|| front_end.switch_workspace(&workspace))
+        });
+        if let Some(switch) = switch {
+            let _ = switch.await;
+        }
+        if let (Some(front_end), Some((_, window_id, _))) =
+            (try_front_end(), mux.resolve_pane_id(pane_id))
+        {
+            if let Some(gui_window) = front_end.gui_window_for_mux_window(window_id) {
+                gui_window.window.activate_from_notification(token);
+            }
+        }
+    }
+
+    pub fn switch_workspace(&self, workspace: &str) -> Future<()> {
         let mux = Mux::get();
         mux.set_active_workspace_for_client(&self.client_id, workspace);
         *self.switching_workspaces.borrow_mut() = false;
-        self.reconcile_workspace();
+        self.reconcile_workspace()
     }
 
     pub fn record_known_window(&self, window: Window, mux_window_id: MuxWindowId) {

@@ -35,6 +35,25 @@ pub enum Window {
     Wayland(WaylandWindow),
 }
 
+impl Window {
+    /// Raise the target of a notification action. Wayland requires the token
+    /// provided by the notification service for that click.
+    pub fn activate_from_notification(&self, _token: Option<String>) {
+        match self {
+            Self::X11(window) => {
+                window.show();
+                window.focus();
+            }
+            #[cfg(feature = "wayland")]
+            Self::Wayland(window) => {
+                if let Some(token) = _token {
+                    window.activate_with_token(token);
+                }
+            }
+        }
+    }
+}
+
 impl Connection {
     pub(crate) fn create_new() -> anyhow::Result<Connection> {
         #[cfg(feature = "wayland")]
