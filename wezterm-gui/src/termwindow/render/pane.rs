@@ -478,6 +478,7 @@ impl crate::TermWindow {
 
                     let shape_key = LineToEleShapeCacheKey {
                         shape_hash,
+                        reverse_video: quad_key.reverse_video,
                         shape_generation: quad_key.shape_generation,
                         composing: if self.cursor.y == stable_row && self.pos.is_active {
                             if let DeadKeyStatus::Composing(composing) =

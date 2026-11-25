@@ -690,12 +690,16 @@ impl WindowInner {
         if self.last_ime_cursor == Some(cursor) {
             return;
         }
-        self.last_ime_cursor = Some(cursor);
-        self.set_ime_window_position(cursor);
+        if self.set_ime_window_position(cursor) {
+            self.last_ime_cursor = Some(cursor);
+        }
     }
 
-    fn set_ime_window_position(&mut self, cursor: Rect) {
+    fn set_ime_window_position(&self, cursor: Rect) -> bool {
         let imc = ImmContext::get(self.hwnd.0);
+        if imc.imc.is_null() {
+            return false;
+        }
         match self.config.ime_preedit_rendering {
             ImePreeditRendering::Builtin => imc.set_candidate_window_position(cursor),
             ImePreeditRendering::System => imc.set_composition_window_position(cursor),
@@ -1154,6 +1158,7 @@ unsafe fn wm_ncdestroy(
     if !raw.is_null() {
         let inner = take_rc_from_pointer(raw);
         let mut inner = inner.borrow_mut();
+        quake::clear_instance(hwnd);
         quake::unregister_hotkey(&mut inner);
         inner.events.dispatch(WindowEvent::Destroyed);
         inner.hwnd = HWindow(null_mut());
@@ -2066,7 +2071,7 @@ impl ImmContext {
     }
 
     /// Set the position of the IME candidate window relative to the cursor.
-    pub fn set_candidate_window_position(&self, cursor: Rect) {
+    pub fn set_candidate_window_position(&self, cursor: Rect) -> bool {
         let mut cf = CANDIDATEFORM {
             dwIndex: 0,
             // Don't draw the IME candidate window on the cursor
@@ -2085,13 +2090,11 @@ impl ImmContext {
                 bottom: cursor.max_y().max(0) as i32,
             },
         };
-        unsafe {
-            ImmSetCandidateWindow(self.imc, &mut cf);
-        }
+        unsafe { ImmSetCandidateWindow(self.imc, &mut cf) != 0 }
     }
 
     /// Set the position of the IME composition window relative to the cursor.
-    pub fn set_composition_window_position(&self, cursor: Rect) {
+    pub fn set_composition_window_position(&self, cursor: Rect) -> bool {
         let mut cf = COMPOSITIONFORM {
             dwStyle: CFS_POINT,
             ptCurrentPos: POINT {
@@ -2100,9 +2103,7 @@ impl ImmContext {
             },
             rcArea: RECT::default(),
         };
-        unsafe {
-            ImmSetCompositionWindow(self.imc, &mut cf);
-        }
+        unsafe { ImmSetCompositionWindow(self.imc, &mut cf) != 0 }
     }
 
     pub fn get_str(&self, which: DWORD) -> Result<String, OsString> {
@@ -3025,6 +3026,9 @@ unsafe fn do_wnd_proc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) -> 
         WM_SETFOCUS => wm_set_focus(hwnd, msg, wparam, lparam),
         WM_KILLFOCUS => wm_kill_focus(hwnd, msg, wparam, lparam),
         WM_HOTKEY => quake::wm_hotkey(hwnd, wparam),
+        registered if registered >= 0xc000 && registered == *quake::SHOW_QUAKE_MESSAGE => {
+            quake::show_instance(hwnd)
+        }
         WM_DEADCHAR | WM_KEYDOWN | WM_KEYUP | WM_SYSCHAR | WM_CHAR | WM_IME_CHAR | WM_SYSKEYUP
         | WM_SYSKEYDOWN => key(hwnd, msg, wparam, lparam),
         WM_SIZING => {
@@ -3079,6 +3083,11 @@ unsafe fn do_wnd_proc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) -> 
             None
         }
     }
+}
+
+/// Find the Windows Quake instance identified by the dedicated window class.
+pub fn find_quake_instance(class: &str, show: bool) -> anyhow::Result<bool> {
+    quake::find_instance(class, show)
 }
 
 unsafe extern "system" fn wnd_proc(

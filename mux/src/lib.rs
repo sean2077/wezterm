@@ -105,6 +105,7 @@ pub enum MuxNotification {
 static LAST_SUBSCRIBER_ID: AtomicUsize = AtomicUsize::new(0);
 
 pub struct Mux {
+    session_operation: smol::lock::Mutex<()>,
     tabs: RwLock<HashMap<TabId, Arc<Tab>>>,
     panes: RwLock<HashMap<PaneId, Arc<dyn Pane>>>,
     windows: RwLock<HashMap<WindowId, Window>>,
@@ -448,6 +449,7 @@ impl Mux {
         };
 
         Self {
+            session_operation: smol::lock::Mutex::new(()),
             tabs: RwLock::new(HashMap::new()),
             panes: RwLock::new(HashMap::new()),
             windows: RwLock::new(HashMap::new()),
@@ -1329,6 +1331,56 @@ impl Mux {
         workspace_for_new_window: String,
         window_position: Option<GuiPosition>,
     ) -> anyhow::Result<(Arc<Tab>, Arc<dyn Pane>, WindowId)> {
+        self.spawn_tab_or_window_inner(
+            window_id,
+            domain,
+            command,
+            command_dir,
+            size,
+            current_pane_id,
+            workspace_for_new_window,
+            window_position,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn spawn_tab_for_restore(
+        &self,
+        window_id: Option<WindowId>,
+        domain: SpawnTabDomain,
+        command: Option<CommandBuilder>,
+        command_dir: Option<String>,
+        size: TerminalSize,
+        workspace: String,
+        skip_domain_fixup: bool,
+    ) -> anyhow::Result<(Arc<Tab>, Arc<dyn Pane>, WindowId)> {
+        self.spawn_tab_or_window_inner(
+            window_id,
+            domain,
+            command,
+            command_dir,
+            size,
+            None,
+            workspace,
+            None,
+            Some(skip_domain_fixup),
+        )
+        .await
+    }
+
+    async fn spawn_tab_or_window_inner(
+        &self,
+        window_id: Option<WindowId>,
+        domain: SpawnTabDomain,
+        command: Option<CommandBuilder>,
+        command_dir: Option<String>,
+        size: TerminalSize,
+        current_pane_id: Option<PaneId>,
+        workspace_for_new_window: String,
+        window_position: Option<GuiPosition>,
+        restore_skip_domain_fixup: Option<bool>,
+    ) -> anyhow::Result<(Arc<Tab>, Arc<dyn Pane>, WindowId)> {
         let domain = self
             .resolve_spawn_tab_domain(current_pane_id, &domain)
             .context("resolve_spawn_tab_domain")?;
@@ -1382,15 +1434,20 @@ impl Mux {
             CachePolicy::FetchImmediate,
         );
 
-        let tab = domain
-            .spawn(size, command.clone(), cwd.clone(), window_id)
-            .await
-            .with_context(|| {
-                format!(
-                    "Spawning in domain `{}`: {size:?} command={command:?} cwd={cwd:?}",
-                    domain.domain_name()
-                )
-            })?;
+        let tab = match restore_skip_domain_fixup {
+            Some(skip_domain_fixup) => match domain
+                .spawn_pane_for_restore(size, command, cwd, skip_domain_fixup)
+                .await
+            {
+                Ok(pane) => domain::add_pane_as_tab(size, &pane, window_id),
+                Err(err) => Err(err),
+            },
+            None => domain
+                .spawn(size, command.clone(), cwd.clone(), window_id)
+                .await
+                .with_context(|| format!("command={command:?} cwd={cwd:?}")),
+        }
+        .with_context(|| format!("Spawning in domain '{}': {size:?}", domain.domain_name()))?;
 
         let pane = tab
             .get_active_pane()

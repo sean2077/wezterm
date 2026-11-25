@@ -1350,19 +1350,14 @@ impl GlyphCache {
     pub fn cached_line_sprite(
         &mut self,
         is_highlited_hyperlink: bool,
-        accent_underline: bool,
+        accent_underline: Option<bool>,
         is_strike_through: bool,
         underline: Underline,
         overline: bool,
         metrics: &RenderMetrics,
     ) -> anyhow::Result<Sprite> {
-        let effective_underline = match (is_highlited_hyperlink, accent_underline, underline) {
-            (true, _, Underline::None) => Underline::Single,
-            (true, _, Underline::Single) => Underline::Double,
-            (true, _, _) => Underline::Single,
-            (false, true, Underline::None) => Underline::Single,
-            (false, _, u) => u,
-        };
+        let effective_underline =
+            hyperlink_underline(is_highlited_hyperlink, accent_underline, underline);
 
         let key = LineKey {
             strike_through: is_strike_through,
@@ -1376,5 +1371,43 @@ impl GlyphCache {
         }
 
         self.line_sprite(key, metrics)
+    }
+}
+
+fn hyperlink_underline(hover: bool, accent: Option<bool>, underline: Underline) -> Underline {
+    match (accent, hover, underline) {
+        (Some(true), _, Underline::None) | (_, true, Underline::None) => Underline::Single,
+        (None, true, Underline::Single) => Underline::Double,
+        (None, true, _) => Underline::Single,
+        (_, _, underline) => underline,
+    }
+}
+
+#[cfg(test)]
+mod hyperlink_tests {
+    use super::{hyperlink_underline, Underline};
+
+    #[test]
+    fn accent_preserves_explicit_underline_on_hover() {
+        assert_eq!(
+            hyperlink_underline(true, Some(true), Underline::Curly),
+            Underline::Curly
+        );
+        assert_eq!(
+            hyperlink_underline(true, Some(false), Underline::Single),
+            Underline::Single
+        );
+        assert_eq!(
+            hyperlink_underline(false, Some(true), Underline::None),
+            Underline::Single
+        );
+        assert_eq!(
+            hyperlink_underline(false, Some(false), Underline::None),
+            Underline::None
+        );
+        assert_eq!(
+            hyperlink_underline(true, None, Underline::Single),
+            Underline::Double
+        );
     }
 }

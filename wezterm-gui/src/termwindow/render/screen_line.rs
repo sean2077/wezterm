@@ -196,38 +196,9 @@ impl crate::TermWindow {
         // * Reverse video attribute
         for item in shaped.iter() {
             let cluster = &item.cluster;
-            let attrs = &cluster.attrs;
             let cluster_width = cluster.width;
 
-            let bg_is_default = attrs.background() == ColorAttribute::Default;
-            let bg_color = params.palette.resolve_bg(attrs.background()).to_linear();
-
-            let fg_color = resolve_fg_color_attr(
-                &attrs,
-                attrs.foreground(),
-                &params.palette,
-                &params.config,
-                &Default::default(),
-            );
-
-            let (bg_color, bg_is_default) = {
-                let mut fg = fg_color;
-                let mut bg = bg_color;
-                let mut bg_default = bg_is_default;
-
-                // Check the line reverse_video flag and flip.
-                if attrs.reverse() == !params.dims.reverse_video {
-                    std::mem::swap(&mut fg, &mut bg);
-                    bg_default = false;
-                }
-
-                (
-                    bg.mul_alpha(self.config.text_background_opacity),
-                    bg_default,
-                )
-            };
-
-            if !bg_is_default {
+            if !item.bg_is_default {
                 let x = params.left_pixel_x
                     + if params.use_pixel_positioning {
                         item.x_pos
@@ -251,7 +222,7 @@ impl crate::TermWindow {
                 let rect = euclid::rect(x, params.top_pixel_y, width, cell_height);
                 if let Some(rect) = rect.intersection(&bounding_rect) {
                     let mut quad = self
-                        .filled_rectangle(layers, 0, rect, bg_color)
+                        .filled_rectangle(layers, 0, rect, item.bg_color)
                         .context("filled_rectangle")?;
                     quad.set_hsv(hsv);
                 }
@@ -778,7 +749,7 @@ impl crate::TermWindow {
                 .attrs
                 .hyperlink()
                 .and_then(|link| params.config.hyperlink_accent_for(link.uri()));
-            let accent_underline = accent.map_or(false, |rule| rule.underline);
+            let accent_underline = accent.map(|rule| rule.underline);
             let accent_fg = accent
                 .and_then(|rule| rule.foreground)
                 .map(|color| color.to_linear());
@@ -788,8 +759,7 @@ impl crate::TermWindow {
                 last_style.as_ref(),
                 Some(ClusterStyleCache { attrs, accent, .. })
                     if *attrs == &cluster.attrs && *accent == accent_key
-            )
-            {
+            ) {
                 let attrs = &cluster.attrs;
                 let style = self.fonts.match_style(params.config, attrs);
                 let hyperlink = attrs.hyperlink();
@@ -872,7 +842,7 @@ impl crate::TermWindow {
 
                 let glyph_color = fg_color;
                 let underline_color = match attrs.underline_color() {
-                    ColorAttribute::Default => accent_fg.unwrap_or(fg_color),
+                    ColorAttribute::Default => fg_color,
                     c => resolve_fg_color_attr(&attrs, c, &params.palette, &params.config, style),
                 };
 
@@ -894,6 +864,7 @@ impl crate::TermWindow {
                     accent: accent_key,
                     underline_tex_rect: underline_tex_rect.clone(),
                     bg_color,
+                    bg_is_default,
                     fg_color: glyph_color,
                     underline_color,
                 });
@@ -916,6 +887,7 @@ impl crate::TermWindow {
             shaped.push(LineToElementShape {
                 underline_tex_rect: style_params.underline_tex_rect,
                 bg_color: style_params.bg_color,
+                bg_is_default: style_params.bg_is_default,
                 fg_color: style_params.fg_color,
                 underline_color: style_params.underline_color,
                 pixel_width,

@@ -44,7 +44,7 @@ box model 末字丢失：`compute_element` 只保留放得下的字形，内容�
 
 自用清理补丁：GUI 正常退出会在 `listener.run()` 返回后删除自己的 `gui-sock-<pid>`（`wezterm-gui/src/main.rs`），但崩溃、强杀和隔离测试实例都不走这条路径；这些标记文件放在 `~/.local/share/wezterm`，重启电脑也不会清。上游只在自动更新路径调用 `discover_gui_socks()`，日常启动不调用，死文件会一直留着。补丁在 `async_run_terminal_gui` 开头调用一次 `discover_gui_socks()`；该函数只删除连接失败且超过 1 秒的 socket，正在启动的实例不受影响。同一个启动路径还会删除目标已不存在的 `agent.*` 符号链接（SSH agent 转发按 pane 创建一个，崩溃/强杀后留下断链）；有效链接和普通文件不动。旧命名 `sock` 不在清理范围。
 
-#8166 的影响：Windows 上 `TermWindow::update_text_cursor` 在每帧绘制时都调用 `ImmSetCandidateWindow`（Builtin preedit）或 `ImmSetCompositionWindow`（System preedit），而 IME 每次收到调用都会销毁并重建候选窗，于是组合输入时候选窗每敲一键闪一次（Google 日语输入法、微软 IME、Rime/Weasel 都如此；Claude Code、Codex CLI 这类高频重绘的 TUI 更明显）。补丁缓存上次上报给 IME 的光标矩形，位置不变就跳过调用；在 `WM_SETFOCUS`、`WM_IME_SETCONTEXT`、`WM_IME_STARTCOMPOSITION`、`WM_IME_ENDCOMPOSITION` 以及配置变化时清缓存，保证重新获得焦点、每次组合开始时至少重新上报一次。
+#8166 的影响：Windows 上 `TermWindow::update_text_cursor` 在每帧绘制时都调用 `ImmSetCandidateWindow`（Builtin preedit）或 `ImmSetCompositionWindow`（System preedit），而 IME 每次收到调用都会销毁并重建候选窗，于是组合输入时候选窗每敲一键闪一次（Google 日语输入法、微软 IME、Rime/Weasel 都如此；Claude Code、Codex CLI 这类高频重绘的 TUI 更明显）。补丁缓存上次成功上报给 IME 的光标矩形，位置不变就跳过调用；在 `WM_SETFOCUS`、`WM_IME_SETCONTEXT`、`WM_IME_STARTCOMPOSITION`、`WM_IME_ENDCOMPOSITION` 以及尺寸或配置变化时清缓存，保证重新获得焦点、每次组合开始时至少重新上报一次。
 
 alt screen 滚动条：WezTerm 在 `enable_scroll_bar` 打开时始终绘制右侧滚动条，包括 alternate screen；但 alternate screen 不保留 scrollback（`term/src/screen.rs` 的 `scrollback_size()` 对 alt screen 返回 0），滑块高度等于整条轨道，拖动没有可移动行程，表现为一条拖不动的色条。Claude Code 的 fullscreen 渲染器（`tui: fullscreen`）、`vim`、`less` 等全屏程序都在 alternate screen 中。补丁在 `wezterm-gui/src/termwindow/render/pane.rs` 的绘制条件里加上 `!pane.is_alt_screen_active()`，alt screen 下不绘制滚动条，也不注册 `ScrollThumb`/`AboveScrollThumb`/`BelowScrollThumb` 命中区；右侧 `window_padding` 保留，字符网格宽度不变，退出全屏程序后滚动条恢复。
 
@@ -52,13 +52,13 @@ alt screen 滚动条：WezTerm 在 `enable_scroll_bar` 打开时始终绘制右�
 
 `config.quake` 让一个专用 WezTerm 实例作为 Guake 式下拉终端：窗口在登录时隐藏启动，注册全局热键（例如 F3），按热键在“隐藏”和“工作区顶部矩形”之间切换；支持置顶、失焦收起、关闭即隐藏。实现位于 `window/src/os/windows/quake.rs`，使用 `RegisterHotKey` + `WM_HOTKEY`，窗口样式设为 `WS_EX_TOOLWINDOW`，因此不出现在任务栏或 Alt+Tab。
 
-用法：用 `--config-file` 指定一个 `quake.lua`，并用 `--class` 给专用实例一个独立类名。`quake.lua` 应设置 `config.quake`、`window_decorations = "NONE"`（外框与客户区一致，几何才准确）、`tab_bar_at_bottom = true`。热键注册失败时窗口会回落为可见状态，而不是留下隐形实例；`WM_CLOSE` 在 quake 模式下只收起窗口，显式退出仍用 `QuitApplication`。全屏状态由 `QuakeState` 在窗口进程内维护：quake 模式下原生的 `ToggleFullScreen` 动作改为在“配置的下拉矩形”和“整个显示器”之间切换，F3 收起再呼出后保持当前状态；Lua 只需绑定 `wezterm.action.ToggleFullScreen`，不需要计算几何或写 per-window override。
+用 `--config-file` 指定 `quake.lua`，以 `start --class <专用类名> --quake-instance` 确保该类只有一个 Quake 窗口。开始菜单再加 `--quake-show`，显示已有窗口或在首次启动后显示。普通窗口按 class 协调冷启动，后续启动等到首个实例发布 socket。Quake 按专用类名协调，等到原生窗口就绪。`quake.lua` 使用 `config.quake`、`window_decorations = "NONE"` 和 `tab_bar_at_bottom = true`。热键注册失败时窗口回落为可见状态。有热键时 `WM_CLOSE` 收起窗口，显式退出使用 `QuitApplication`。`ToggleFullScreen` 在下拉矩形与整个显示器之间切换，F3 收起和呼出会保留当前状态。
 
-`config.tab_bar_uniform_width = true` 让 fancy 标签栏的每个 tab 等宽，并把 `+` 按钮从均分分母中拿出来、按固定宽度布局；标题短于份额时补齐、超出时截断，标签栏几何不再随标题长度变化。均分预算优先使用 `terminal_size.pixel_width`，并扣除左右两侧状态栏和集成窗口按钮的占用。这些固定元素的实际宽度由 `fancy_side_widths` 统一计算，布局与标题预算共用同一份数字：状态栏文字按列宽加 0.5 格左内边距；左侧还有 0.5 格组内边距；自绘红绿灯按元素真实总宽（直径 + 3 个间距，含右边距）；Windows 字形按钮按 DPI 换算实际宽度（10pt 图标 + 17/18pt 左内边距 + 18pt 右内边距），不再按 3 列估算。`config.tab_bar_side_reserve_ratio`（默认 0.6）只缩放状态栏文字那部分预留，不再影响按钮宽度。
+`config.tab_bar_uniform_width = true` 让 fancy 标签栏的每个 tab 等宽。预算从扣除系统边框的客户区宽度出发，状态文字、窗口按钮和 `+` 各用统一的布局尺寸。`tab_bar_side_reserve_ratio`（默认 0.6）控制状态文字使用的宽度，`1.0` 保留完整状态文字。
 
 `config.tab_bar_tab_border_width` 控制 fancy 标签栏每个 tab 的四边边框宽度，默认 `1px`（与上游一致），支持 `"2px"`、`"1.5pt"` 等 Dimension 写法，`pt` 会按显示 DPI 缩放。上游只有非活动 tab 的右边框可见（颜色取 `colors.tab_bar.inactive_tab_edge`），其余三边使用 tab 自身背景色；调大后该分隔线随之加粗。hover 时这条边线现在也会保留，颜色改用此前已定义但从未被渲染读取的 `colors.tab_bar.inactive_tab_edge_hover`。改宽度只需改配置，不需要重新编译。
 
-`colors.tab_bar.waiting_tab_edge`（默认 `#ff9500`）让任意 pane 的 `agent_state` user var 为 `waiting`（可带 `:epoch` 后缀）的 tab 显示一圈细边框（线宽同 `tab_bar_tab_border_width`）；远离终端内容的一侧（顶部标签栏为上边）在两个圆角之间加一条约 3 逻辑像素的指示灯条，框外再画最多 3 层逐渐变淡的光晕（不透明度 0.5/0.26/0.12，每层约 1 逻辑像素，层数受 tab 与标签栏边缘之间的空间限制）。灯条和光晕的颜色由 `colors.tab_bar.waiting_tab_glow` 控制，默认与 `waiting_tab_edge` 相同。活动、非活动和 hover 三种状态都生效，`running`/`done`/`error` 不触发。判定与 Lua 徽章一致：遍历 mux tab 的真实 pane（`iter_panes_ignoring_zoom`，忽略 zoom 和 GUI overlay），任一 waiting 即高亮。状态变化会进入 `TabEntry` 并参与缓存比较，user var 更新后立即触发重绘。`config.tab_bar_waiting_ttl_seconds`（默认 0，关闭，保持上游行为）开启后，带 `:epoch` 的 waiting 值超过该秒数即不再点亮等待环；不带 epoch 的值不受影响。TTL 到期本身没有事件：每次重建标题时会记下最早的到期时刻（墙钟 `SystemTime`，不随重建漂移），数量变化才用 `promise::spawn` + `Timer::at` 排一个独立定时器，到点通过 `TermWindowNotif::Apply` 重新构建标签栏。这条路径不经过只在窗口聚焦时运行的动画帧调度，因此未聚焦（包括后台）的窗口也会按时熄灭；聚焦只会额外触发一次普通重建。
+`colors.tab_bar.waiting_tab_edge`（默认 `#ff9500`）让任意 pane 的 `agent_state` user var 为 `waiting`（可带 `:epoch` 后缀）的 tab 显示一圈细边框（线宽同 `tab_bar_tab_border_width`）；远离终端内容的一侧（顶部标签栏为上边）在两个圆角之间加一条约 3 逻辑像素的指示灯条，框外再画最多 3 层逐渐变淡的光晕（不透明度 0.5/0.26/0.12，每层约 1 逻辑像素，层数受 tab 与标签栏边缘之间的空间限制）。灯条和光晕的颜色由 `colors.tab_bar.waiting_tab_glow` 控制，默认与 `waiting_tab_edge` 相同。活动、非活动和 hover 三种状态都生效，`running`/`done`/`error` 不触发。判定与 Lua 徽章一致：遍历 mux tab 的真实 pane（`iter_panes_ignoring_zoom`，忽略 zoom 和 GUI overlay），任一 waiting 即高亮。状态变化会进入 `TabEntry` 并参与缓存比较，user var 更新后立即触发重绘。`config.tab_bar_waiting_ttl_seconds`（默认 0，关闭，保持上游行为）开启后，带 `:epoch` 的 waiting 值超过该秒数即不再点亮等待环；不带 epoch 的值不受影响。TTL 到期本身没有事件：每次重建标题时会记下最早的到期时刻（墙钟 `SystemTime`，不随重建漂移），最早的截止时刻变化时替换该窗口的独立定时器。无效时间戳会被忽略，到期时重新构建标签栏。这条路径不经过只在窗口聚焦时运行的动画帧调度，因此未聚焦（包括后台）的窗口也会按时熄灭；聚焦只会额外触发一次普通重建。
 
 `colors.tab_bar.active_tab_edge`（默认不设置，即保持上游外观）设置后，标签栏靠近终端内容的一侧画一条贯穿整个窗口的分隔线，并在活动 tab 处折成左、上、右三边的门框（Chrome 式）；底边断开，活动 tab 与内容区连在一起。活动 tab 同时处于 waiting 时，门框和整条分隔线都改用 `waiting_tab_edge` 的颜色（分隔线跟着门框变色，外张弧处没有色差），并加上灯条和光晕。门框两侧与分隔线相接处向外张开（Chrome 式）：tab 外侧各放一个边长为「半径 + 线宽」的方块，里面画一段等宽描边的四分之一圆环，圆心在 tab 外侧、远离内容的一角，分隔线的内沿沿弧线上弯，接到门柱外沿；分隔线和门柱都在切点截断。半径为标题字体格高的 0.3 倍，按线宽描边，不画任何背景色块，所以压在相邻 tab 的底角上也不会留下缺口。方块放不进标签栏的一侧（贴窗口边的 tab）退回直角。早先两版失败的做法：把 tab 自身底角切圆（方向反了）；用强调色方块叠一个标签栏背景色的四分之一圆挖空（圆心放错，只剩发丝，还在 tab 缝隙留下深色缺口）。`tab_bar_at_bottom = true` 时上下镜像。
 
@@ -66,7 +66,9 @@ alt screen 滚动条：WezTerm 在 `enable_scroll_bar` 打开时始终绘制右�
 
 这些线条都画在 zindex 20 的叠加层上（标签栏之上、模态浮层之下），不参与布局，`tab_bar_uniform_width` 的几何不变。tab 元素自身的边框保持填充色：box model 的圆角是用边框色填充的实心四分之一圆，边框一旦换色，圆角就会变成色块。所以门框和等待环的圆角不改边框色，而是叠两层实心四分之一圆：外层是线条色，内层是 tab 当前的填充色（悬停时取悬停色），同圆心、半径小一个线宽。圆角 glyph 的圆心在靠 tab 内侧的那个角（`TOP_LEFT_ROUNDED_CORNER` 在右下），内层方块必须锚在这个角上；锚错到外侧角时内层圆会把外层弧整个盖住，圆角看起来成了一个台阶缺口（`decoration_tests` 里断言了 glyph 圆心）。两条边缘都是抗锯齿填充，弧线和直线的粗细、亮度一致。1px 的描边弧线在实测中又淡又断，所以不用。填充色不是纯色时退回描边。光晕的弧线是半透明的，仍然用描边。tab 圆角改为宽高相同的像素半径（标题字体格高的 0.4 倍）：上游用 0.5 格宽 × 0.5 格高，格子高于宽，实际是椭圆，描边后看起来像斜切。几何计算在纯函数 `tab_bar_decorations` 中完成，单测位于 `fancy_tab_bar.rs` 的 `decoration_tests`。
 
-`format-tab-title` 的第 6 个参数（`max_width`）在 fancy bar 下现在按标题字体宽度和 tab 数换算成真实预算，不再是恒定的 `tab_max_width`；uniform 模式下第二遍渲染按像素计算精确预算：tab 份额减去 1 格水平内边距和两侧边框，再减去关闭按钮（格高的一半）与右浮动后缀的实际像素，剩下的按标题字体列宽向下取整，就是标题块能用的列数（回调声明的左块 U+001E 另计）。渲染时的行截断也用同一份列数，不会再用更小的估算值把省略号裁掉。非 uniform 模式保持原来的按列估算。回调可以用 U+001E 标记左块（索引/徽章）与标题块的分界。`window:set_config_override(key, value)` / `clear_config_override(key)` 用于增量修改 per-window override；hyperlink URI 中的 `$CWD` 在点击时展开为当前 pane 的工作目录；`update-status` / `update-right-status` 统一按 `status_update_interval` 调度，不再随高频标题变化每帧触发。
+`format-tab-title` 的第 6 个参数 `max_width` 在均宽模式下使用标签的实际标题预算。布局扣除内边距、边框、关闭按钮的完整宽度和右浮动后缀，再按标题列宽换算。U+001E 分隔索引/徽章与标题。链接的原始 URI 会直接交给 `open-uri`，相对文件链接可由该回调根据 pane 的工作目录解析。
+
+`window:update_config_overrides(values, keys_to_clear)` 原子清除指定键并应用新值。单键设置和清除接口也会跳过无变化的操作。状态更新按 `status_update_interval` 自行调度，Lua 的 `update-status` 与 `update-right-status` 回调可以只读观察。
 
 uniform 模式下 tab 的 hover 判定也改用像素：按同样的份额累计每个 tab 的像素区间，用鼠标在标签栏内的原始像素坐标比较（非 uniform 仍按标题列数）。短标题 tab 右侧的空白因此也能正确触发 hover 配色。
 
@@ -74,7 +76,7 @@ uniform 模式下 tab 的 hover 判定也改用像素：按同样的份额累计
 
 `config.integrated_title_button_style = "MacOsNative"` 原本只在 macOS 生效（按钮由系统绘制），现在任何平台都接受该值：macOS 仍由系统绘制，其他平台由 fork 自绘三个圆点（关=红 `#ff5f57`、最小化=黄 `#febc2e`、最大化=绿 `#28c840`），顺序按 `integrated_title_buttons`，位置按 `integrated_title_button_alignment`（默认右侧），悬停时同色相略提亮，并在圆点中央画出 macOS 式的深色符号（最小化 −、最大化 +、关闭 ×，墨色取各自色相的暗色），只看颜色认不出功能时可以悬停确认。符号通过 box model 新增的 `hover_overlay` 绘制：Poly 元素悬停时在同一位置叠画第二个 glyph。圆点直径约为标题字体格高的 0.7 倍（本机约 19px，接近 macOS 的 12pt 圆点），间距为直径的 0.4 倍，三个合计约 95px，仍明显窄于 Windows 字形按钮（每个约 46px，合计约 140px），右侧状态栏因此多出约 45px。fancy 标签栏按实际像素宽度为它们预留空间（`reserved_side_width`），均分 tab 不会压到按钮下面。`window_buttons_at_left` 的「macOS 按钮总在左边」逻辑、以及标签栏最左侧为原生按钮预留的 4 格边距，都只对真正的 macOS 生效；否则 tab 会被无谓地往右推。
 
-`tab_bar_close_button_on_hover = true`（默认 false）时，非活动 tab 的关闭按钮 × 只在鼠标悬停该 tab 时显示（Chrome 式），活动 tab 始终显示。实现是 box model 新增的 `reveal_on_parent_hover`：子元素只在父元素处于悬停态（父元素需有 `hover_colors`）时渲染。点击 × 必然先悬停，所以 UI 命中区域照常注册。悬停判定统一走 `is_element_hovered`，`tab_fill` 与 `render_element` 共用。
+`tab_bar_close_button_on_hover = true` 时，非活动 tab 在悬停时显示关闭按钮，活动 tab 常显。绘制和命中区域都裁剪在标签之内，空间不足时一起隐藏。
 
 `wezterm cli list` 增加 `tab_index`、`window_index`、`is_active_tab`（表格末尾的 `ACTIVE` 列）；新增 `wezterm cli activate-window --window-id <WINID>`，通过 `SetFocusedPane` 切到该窗口的活动 tab 并前台化。`ListPanesResponse` 增加了 `active_tab_ids` 字段，因此 `CODEC_VERSION` 升到 47；升级后需要重启所有 GUI 进程，避免新旧 codec 混用。
 
@@ -83,6 +85,10 @@ uniform 模式下 tab 的 hover 判定也改用像素：按同样的份额累计
 ## hyperlink accent（自用）
 
 上游只在鼠标悬停链接时画下划线，平时链接和普通文本没有区别。`config.hyperlink_accent_rules` 让 URI 以前缀匹配的链接在空闲时也保持强调样式：`prefix` 是字面前缀（区分大小写，空串不匹配），`underline`（默认 `true`）在链接自身没有下划线时补一条单下划线，`foreground` 设置文字颜色并兼作默认下划线颜色（程序显式设了 `underline_color` 时保留程序的值）。第一条命中的规则生效。规则对 `hyperlink_rules` 生成的隐式链接和程序输出的 OSC 8 链接都有效；渲染在 `wezterm-gui/src/termwindow/render/screen_line.rs` 的 cluster 样式计算里完成，`ClusterStyleCache` 把 accent 状态纳入缓存键，避免相邻同属性 cluster 复用错误样式。这项改动不涉及 mux/codec，不需要升 `CODEC_VERSION`。
+
+## Linux 桌面通知
+
+OSC 9 / OSC 777 的点击动作通过一个 D-Bus 工作线程和一条连接分发，通知服务更换 owner 时清除旧回调。点击后切换到来源 pane，必要时取消该标签的 zoom。在 Wayland 上使用通知服务提供的 activation token 请求前台激活，缺少 token 时仍切换来源 pane。
 
 ## 通用工作区持久化（自用）
 
@@ -96,9 +102,9 @@ wezterm cli set-user-var [--pane-id ID] --var NAME=VALUE [--var ...] [--unset NA
 wezterm cli set-user-var [--pane-id ID] --name NAME [--value VALUE | --unset]
 ```
 
-`--path` 的相对路径按 CLI 的当前目录解析，不按 mux server 的工作目录。`restore-workspace --replace` 在没有恢复出任何 tab 时会保留目标窗口；未给 `--window-id` 且存在多个窗口时报错；`scripts/wezterm-fork.ps1` 现在总是在恢复前从新 GUI 的 `cli list --format json` 选目标窗口并显式传 `--window-id`（只有一个窗口用它，多个时选包含最小 pane id 的窗口）。恢复后激活 `WindowState.active_tab` 对应的 tab。
+`--path` 相对于 CLI 的当前目录。`--replace` 通过保存文件里的首个窗口恢复到显式或唯一目标窗口。若目标中的任一 tab 或 pane 恢复失败，保留原 tab，清理新增的目标 tab。其他保存窗口独立恢复。成功替换时恢复目标的 workspace 名字，并优先激活保存时正在使用的 workspace。存在多个窗口时，`--replace` 需要 `--window-id`。
 
-会话文件 version 2 为每个 tab 保存 `panes`（前序：左/上先于右/下）和 `layout` 树；单 pane tab 的 `layout` 省略。分屏节点复用 mux 内部的 `SplitDirectionAndSize`（方向 + 两侧 `TerminalSize`），叶子用 `panes` 下标。保存时递归遍历 `TabInner.pane` 的 `bintree`（不受 zoom 影响），并剪掉没有本地 spawn 命令的叶子（ssh/tmux）：一侧为空时把另一侧提到父位置，全空则丢弃该 tab；活动 tab 下标在剪枝后按“原活动 tab 是否仍在”重算，活动 pane 与 zoom 下标按剪枝后的前序下标映射。恢复时先由最左/上叶子 spawn 出 tab 的初始 pane，再自顶向下用 `Mux::split_pane`（`target_is_second`、非 top-level）重建：节点尺寸仍等于保存值时用 `Cells`，窗口尺寸变了按比例用 `Percent`；节点不足 3 格、任一侧不足 1 格或单个 split 失败时只回退该子树（anchor 保持占据节点区域），不增加 `failed` 计数（`failed` 只统计整个 tab 创建失败，否则 CLI 非零退出会让重启 worker 在恢复后中止）。每个叶子都走 `command_for`（`agent.restore_argv` 替换、空 argv 默认 shell）并记录原始 spawn argv。全部 pane 建好后按保存的 `active_pane` 设活动 pane，再恢复 zoom。version 1 快照继续可读，按单 pane tab 处理；version 2 文件不被旧构建读取（预期）。
+会话文件 v3 保存每个标签的分屏树、前序 pane 列表、当前 pane 和 zoom，并记录原始 domain 与应用 domain 包装前的启动命令。目标尺寸改变时按比例计算分屏并限制在两侧可用格数内。分别报告失败的 tab 和 pane。旧 v1/v2 文件仍可读取，已包装的旧命令按原样启动，避免重复套用 ExecDomain 或 WSL。
 
 Agent 集成通过通用 user vars 完成：`agent.restore_argv`（JSON argv，**整条替换** pane 的启动命令）、`agent.shutdown`（非空表示参与优雅关闭）、`agent.session_id`（诊断用）。mux/CLI 不包含 Claude 专用字段。恢复命令由白名单重建：保留 argv[0] 与 `--settings`/`--effort`/`--model`/`--permission-mode`/`--dangerously-skip-permissions`/`--add-dir`（含 `=` 写法），最后追加 `--resume <id>`；`-c`、`--continue`、`--resume`、`--session-id`、`--fork-session`、位置 prompt 和未知 flag 一律丢弃，避免重复重启时累积 `--resume` 或重放首条 prompt。命令词是裸 `claude` 且未带权限 flag 时不加引号，交给交互式 zsh 的 `claude` alias 补上 `--dangerously-skip-permissions`（yolo 会话因此保持 yolo）；完整路径或已带权限 flag 的 argv 会加引号，避免 alias 再补一次造成重复。
 
@@ -106,15 +112,15 @@ Agent 集成通过通用 user vars 完成：`agent.restore_argv`（JSON argv，*
 
 `agent.resume_args` 已废弃：restore 忽略并记日志（同时存在 `agent.restore_argv` 时降为 debug，只有它单独存在时才 warning，因为那时会话无法恢复）。`--legacy-claude-pending` 一次性适配器已删除；旧 hook 记录的会话由 `session-tabs.sh republish` 在重启前转换成 `agent.restore_argv`（republish 只写这一个变量：旧 hook 已经写过 name/session_id/shutdown，给崩溃后的普通 shell 补 shutdown 会让 close-agent-sessions 空等超时）。
 
-`close-agent-sessions` 只处理带 `agent.shutdown` 的 pane，发送 Esc（全部 pane）→ 等待 → Ctrl+C（全部）→ 等待 → `/exit\r`（全部），不识别具体 agent 名称；`--timeout-seconds` 限制在 1..=3600，`--force` 只是超时后允许调用方继续，不会杀 pane。
+`close-agent-sessions` 批量发送 Esc → Ctrl+C → `/exit\r`。发送每一阶段前重新确认 pane、原会话和 `agent.shutdown`，会话退出后停止发送。`--timeout-seconds` 接受 1 到 3600。`--force` 允许调用方在超时时继续，关闭动作由调用方负责。
 
-本轮不改 `codec`（`CODEC_VERSION` 保持 48），新 CLI 仍可与正在运行的旧 GUI 通信；**下次修改 PDU 字段时必须升版本并重启所有实例**。`wezterm cli list` 的 `window_index` 按 `WindowId` 排序，`tab_index` 对应标签栏顺序。
+`CODEC_VERSION` 为 49。新 CLI 能使用旧协议连接 codec 48 的运行实例来保存、追加恢复及优雅关闭。安全替换要求服务端支持 codec 49。保存结果报告 `panes` 和 `skipped`，恢复结果报告 `failed`、`failed_panes` 和 `replaced`，部分恢复返回非零。`wezterm cli list` 的 `window_index` 按 `WindowId` 排序，`tab_index` 对应标签栏顺序。
 
-没有本地 spawn 命令的 pane（ssh/tmux 等）在保存时跳过并记 warning，不再静默恢复成本地 shell。
+没有本地 spawn 命令的 pane（如 SSH 或 tmux domain）在保存时剪枝并计入 `skipped`。若快照会漏掉所有 pane，保存失败并保留原文件。
 
 ## 日常维护入口
 
-日常维护由 dotfiles 仓库（`sean2077/dotfiles`）里的 `scripts/wezterm-fork.ps1` 完成。它负责回拉上游、merge、推送、构建、安装和切换启动入口；Windows 上每次同步配置时都会运行它。下面是它背后的手动步骤，用于脚本停下（例如 merge 冲突）时人工处理。
+日常维护入口是 dotfiles 仓库（`sean2077/dotfiles`）的 `scripts/wezterm-fork.py`。脚本同步分支和依赖，验证构建后推送并安装整组运行时文件，再修复启动入口。`patched` 上的 Fork checks 运行 Windows 和 Linux 构建与单测，Linux 还会用独立 mux server 运行 CLI 恢复回归。
 
 ## 回拉上游
 

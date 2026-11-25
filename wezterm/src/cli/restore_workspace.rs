@@ -1,5 +1,7 @@
 use clap::Parser;
-use codec::RestoreWorkspace;
+use codec::{
+    GetCodecVersion, RestoreWorkspace, RestoreWorkspaceDetailed, WORKSPACE_DETAILS_CODEC_VERSION,
+};
 use mux::window::WindowId;
 use std::path::PathBuf;
 use wezterm_client::client::Client;
@@ -16,9 +18,8 @@ pub struct RestoreWorkspaceCommand {
     #[arg(long)]
     window_id: Option<WindowId>,
 
-    /// Remove the target window's existing tabs after the restored tabs are
-    /// spawned. Use this after launching a fresh GUI with one startup pane.
-    /// Nothing is removed when no tab could be restored.
+    /// Replace the target window's tabs after all of its panes are restored.
+    /// Use this after launching a fresh GUI with one startup pane.
     #[arg(long)]
     replace: bool,
 }
@@ -28,19 +29,49 @@ impl RestoreWorkspaceCommand {
         let path = std::env::current_dir()
             .map(|cwd| cwd.join(&self.path))
             .unwrap_or_else(|_| self.path.clone());
-        let response = client
-            .restore_workspace(RestoreWorkspace {
-                path: path.to_string_lossy().to_string(),
-                window_id: self.window_id,
-                replace: self.replace,
-            })
-            .await?;
-        println!(
-            "WEZTERM-WORKSPACE: restored windows={} tabs={} failed={}",
-            response.windows, response.tabs, response.failed
-        );
-        if response.failed > 0 {
-            anyhow::bail!("{} tab(s) failed to restore", response.failed);
+        let path = path.to_string_lossy().into_owned();
+        let version = client.get_codec_version(GetCodecVersion {}).await?;
+        if version.codec_vers >= WORKSPACE_DETAILS_CODEC_VERSION {
+            let response = client
+                .restore_workspace_detailed(RestoreWorkspaceDetailed {
+                    path,
+                    window_id: self.window_id,
+                    replace: self.replace,
+                })
+                .await?;
+            println!(
+                "WEZTERM-WORKSPACE: restored windows={} tabs={} failed={} panes={} failed_panes={} replaced={}",
+                response.windows, response.tabs, response.failed, response.panes,
+                response.failed_panes, response.replaced
+            );
+            for detail in &response.diagnostics {
+                eprintln!("restore-workspace: {detail}");
+            }
+            if response.failed > 0 || response.failed_panes > 0 {
+                anyhow::bail!(
+                    "workspace restore incomplete: {} tab failure(s), {} missing pane(s)",
+                    response.failed,
+                    response.failed_panes
+                );
+            }
+        } else {
+            if self.replace {
+                anyhow::bail!("restore-workspace --replace requires an updated mux server");
+            }
+            let response = client
+                .restore_workspace(RestoreWorkspace {
+                    path,
+                    window_id: self.window_id,
+                    replace: false,
+                })
+                .await?;
+            println!(
+                "WEZTERM-WORKSPACE: restored windows={} tabs={} failed={}",
+                response.windows, response.tabs, response.failed
+            );
+            if response.failed > 0 {
+                anyhow::bail!("{} tab(s) failed to restore", response.failed);
+            }
         }
         Ok(())
     }

@@ -888,6 +888,7 @@ impl Domain for ClientDomain {
                 command,
                 command_dir,
             } => (command, command_dir, None),
+            SplitSource::Restore { .. } => bail!("cannot restore a local pane in a remote domain"),
             SplitSource::MovePane(move_pane_id) => (None, None, Some(move_pane_id)),
         };
 

@@ -18,13 +18,12 @@
 //!
 //! This keeps the native implementation reusable for any terminal program.
 //!
-//! Session version 2 stores every pane of a tab together with the split tree
-//! (direction, per-child sizes, preorder pane list); version 1 snapshots are
-//! still read and are treated as single-pane tabs.  Restore rebuilds splits
-//! top-down through the normal mux split path, so no additional PDU or codec
-//! change is involved.
+//! Version 3 records the active workspace and local domain alongside each pane's
+//! pre-fixup command. Version 2 layouts and version 1 single-pane tabs are still
+//! readable. Their already-adapted commands replay in the host domain.
 
 use crate::domain::SplitSource;
+use crate::localpane::LocalPane;
 use crate::pane::{CachePolicy, Pane, PaneId};
 use crate::tab::{SplitDirection, SplitRequest, SplitSize, TabLayoutNode};
 use crate::Mux;
@@ -43,6 +42,10 @@ pub const AGENT_RESTORE_ARGV: &str = "agent.restore_argv";
 /// Obsolete append-style resume variable; ignored on restore.
 pub const AGENT_RESUME_ARGS: &str = "agent.resume_args";
 pub const AGENT_SHUTDOWN: &str = "agent.shutdown";
+const AGENT_SESSION_ID: &str = "agent.session_id";
+const SESSION_VERSION: u32 = 3;
+const HOST_DOMAIN: &str = "local";
+const MAX_RESTORE_DIAGNOSTICS: usize = 16;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SpawnInfo {
@@ -50,6 +53,8 @@ pub struct SpawnInfo {
     pub cwd: Option<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    pub domain: String,
+    pub skip_domain_fixup: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -60,6 +65,12 @@ pub struct PaneState {
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    // Legacy commands that already passed through domain fixup still need to
+    // bypass it when saved again in the current format.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub skip_domain_fixup: bool,
     #[serde(default)]
     pub user_vars: BTreeMap<String, String>,
 }
@@ -116,6 +127,8 @@ pub struct WindowState {
 pub struct SessionState {
     pub version: u32,
     pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_workspace: Option<String>,
     #[serde(default)]
     pub windows: Vec<WindowState>,
 }
@@ -125,8 +138,9 @@ pub struct SaveSummary {
     pub path: PathBuf,
     pub windows: usize,
     pub tabs: usize,
-    /// Tabs that could not be represented because their pane has no local
-    /// spawn command (for example ssh or tmux client panes).
+    pub panes: usize,
+    /// Panes that could not be represented because they have no local spawn
+    /// command (for example ssh or tmux client panes).
     pub skipped: usize,
 }
 
@@ -135,6 +149,20 @@ pub struct RestoreSummary {
     pub windows: usize,
     pub tabs: usize,
     pub failed: usize,
+    pub panes: usize,
+    pub failed_panes: usize,
+    pub replaced: bool,
+    pub diagnostics: Vec<String>,
+}
+
+impl RestoreSummary {
+    fn report(&mut self, detail: String) {
+        log::warn!("restore workspace: {detail}");
+        if self.diagnostics.len() < MAX_RESTORE_DIAGNOSTICS {
+            let detail = detail.replace(['\r', '\n', '\x1b'], " ");
+            self.diagnostics.push(detail.chars().take(512).collect());
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -146,8 +174,9 @@ pub struct CloseSummary {
 impl SessionState {
     pub fn new() -> Self {
         Self {
-            version: 2,
+            version: SESSION_VERSION,
             created_at: Utc::now().to_rfc3339(),
+            active_workspace: None,
             windows: Vec::new(),
         }
     }
@@ -176,6 +205,8 @@ mod tests {
             argv: argv.iter().map(|arg| arg.to_string()).collect(),
             env: BTreeMap::new(),
             title: "agent".to_string(),
+            domain: None,
+            skip_domain_fixup: false,
             user_vars: vars
                 .iter()
                 .map(|(name, value)| (name.to_string(), value.to_string()))
@@ -199,7 +230,10 @@ mod tests {
             vec!["zsh", "-i", "-c", "claude --resume 123"]
         );
         // The recorded base argv must stay the original spawn command.
-        assert_eq!(command.base_argv, vec!["zsh", "-i"]);
+        assert_eq!(
+            restored_spawn_info(&pane, Some(&command)).unwrap().argv,
+            ["zsh", "-i"]
+        );
     }
 
     #[test]
@@ -237,17 +271,20 @@ mod tests {
 
     #[test]
     fn restore_records_an_empty_base_argv() {
-        let info = restored_spawn_info(true, Vec::new(), Some("/tmp".to_string())).unwrap();
+        let pane_state = pane_with_vars(&[], &[(AGENT_RESTORE_ARGV, r#"["agent"]"#)]);
+        let command = command_for(&pane_state).unwrap();
+        let info = restored_spawn_info(&pane_state, Some(&command)).unwrap();
         assert!(info.argv.is_empty());
         assert_eq!(info.cwd.as_deref(), Some("/tmp"));
-        assert!(restored_spawn_info(false, vec!["sh".to_string()], None).is_none());
+        assert!(restored_spawn_info(&pane_with_vars(&["sh"], &[]), None).is_none());
     }
 
     #[test]
     fn session_state_round_trips() {
         let state = SessionState {
-            version: 2,
+            version: SESSION_VERSION,
             created_at: "2026-01-01T00:00:00Z".to_string(),
+            active_workspace: Some("work".to_string()),
             windows: vec![WindowState {
                 workspace: "default".to_string(),
                 active_tab: 0,
@@ -259,6 +296,8 @@ mod tests {
                         argv: vec!["sh".to_string()],
                         env: BTreeMap::new(),
                         title: "sh".to_string(),
+                        domain: Some(HOST_DOMAIN.to_string()),
+                        skip_domain_fixup: false,
                         user_vars: BTreeMap::new(),
                     }],
                     layout: None,
@@ -419,30 +458,33 @@ mod tests {
     }
 
     #[test]
-    fn split_sizes_prefer_exact_cells_and_fall_back_to_percent() {
+    fn split_sizes_preserve_proportions_and_leave_room_for_both_panes() {
         // Same node size: exact cell count.
         assert_eq!(split_size_for(31, 10, 20), Some(SplitSize::Cells(20)));
         // A shrunken node keeps the proportion.
-        assert_eq!(split_size_for(15, 10, 20), Some(SplitSize::Percent(65)));
+        assert_eq!(split_size_for(15, 10, 20), Some(SplitSize::Cells(9)));
         // Too small on either side: collapse instead of a zero-size pane.
         assert_eq!(split_size_for(2, 10, 20), None);
         assert_eq!(split_size_for(10, 0, 9), None);
         // A 3-cell node keeps one cell on each side.
-        assert_eq!(split_size_for(3, 10, 20), Some(SplitSize::Percent(65)));
+        assert_eq!(split_size_for(3, 10, 20), Some(SplitSize::Cells(1)));
+        assert_eq!(split_size_for(80, 1, 148), Some(SplitSize::Cells(78)));
     }
 }
 
 fn path_string(url: &url::Url) -> Option<String> {
+    if url.scheme() != "file" {
+        return None;
+    }
     url.to_file_path()
         .ok()
-        .map(|path| path.to_string_lossy().to_string())
+        .map(|path| path.to_string_lossy().into_owned())
         .or_else(|| {
-            let path = url.path();
-            if path.is_empty() {
-                None
-            } else {
-                Some(path.to_string())
-            }
+            percent_encoding::percent_decode_str(url.path())
+                .decode_utf8()
+                .ok()
+                .filter(|path| !path.is_empty())
+                .map(|path| path.into_owned())
         })
 }
 
@@ -474,18 +516,12 @@ fn normalize_state(state: &mut SessionState) {
                 tab.layout = None;
                 tab.active_pane = 0;
                 tab.zoomed = false;
-            } else if tab.layout.is_none() && tab.panes.len() > 1 {
-                // A layout-less multi-pane tab cannot describe its
-                // arrangement; keep the first pane rather than silently
-                // opening every pane on top of each other.
-                log::warn!(
-                    "restore workspace: tab {:?} has {} panes but no layout; keeping the first",
-                    tab.title,
-                    tab.panes.len()
-                );
-                tab.panes.truncate(1);
-                tab.active_pane = 0;
-                tab.zoomed = false;
+            }
+            if state.version < SESSION_VERSION {
+                for pane in &mut tab.panes {
+                    pane.domain = Some(HOST_DOMAIN.to_string());
+                    pane.skip_domain_fixup = !pane.argv.is_empty();
+                }
             }
         }
     }
@@ -495,7 +531,7 @@ fn read_json(path: &Path) -> Result<SessionState> {
     let data = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     let mut state: SessionState = serde_json::from_slice(&data)
         .with_context(|| format!("parsing workspace {}", path.display()))?;
-    if state.version != 1 && state.version != 2 {
+    if !(1..=SESSION_VERSION).contains(&state.version) {
         return Err(anyhow!(
             "unsupported workspace version {} in {}",
             state.version,
@@ -508,6 +544,22 @@ fn read_json(path: &Path) -> Result<SessionState> {
 
 fn truthy(value: Option<&String>) -> bool {
     matches!(value.map(|v| v.as_str()), Some("1" | "true" | "yes"))
+}
+
+fn shutdown_identity(pane: &Arc<dyn Pane>) -> Option<(Option<String>, Option<String>)> {
+    if pane.is_dead() {
+        return None;
+    }
+    let mut vars = pane.copy_user_vars();
+    truthy(vars.get(AGENT_SHUTDOWN)).then(|| {
+        let session = vars.remove(AGENT_SESSION_ID);
+        let command = if session.is_none() {
+            vars.remove(AGENT_RESTORE_ARGV)
+        } else {
+            None
+        };
+        (session, command)
+    })
 }
 
 fn restore_argv(user_vars: &BTreeMap<String, String>) -> Option<Vec<String>> {
@@ -527,10 +579,6 @@ fn restore_argv(user_vars: &BTreeMap<String, String>) -> Option<Vec<String>> {
 
 struct RestoreCommand {
     command: portable_pty::CommandBuilder,
-    /// The pane's original spawn argv.  Restored panes must record this rather
-    /// than the replacement command so repeated save/restore cycles do not
-    /// accumulate arguments.
-    base_argv: Vec<String>,
     used_restore_argv: bool,
 }
 
@@ -555,13 +603,15 @@ fn command_for(pane: &PaneState) -> Option<RestoreCommand> {
     let replacement = restore_argv(&pane.user_vars);
     let used_restore_argv = replacement.is_some();
     let argv = replacement.unwrap_or_else(|| pane.argv.clone());
-    if argv.is_empty() {
-        return None;
-    }
-    let mut command = portable_pty::CommandBuilder::new(&argv[0]);
-    if argv.len() > 1 {
-        command.args(&argv[1..]);
-    }
+    let mut command = match argv.split_first() {
+        Some((program, args)) => {
+            let mut command = portable_pty::CommandBuilder::new(program);
+            command.args(args);
+            command
+        }
+        None if !pane.env.is_empty() => portable_pty::CommandBuilder::new_default_prog(),
+        None => return None,
+    };
     if let Some(cwd) = pane.cwd.as_deref().filter(|cwd| !cwd.is_empty()) {
         command.cwd(cwd);
     }
@@ -570,7 +620,6 @@ fn command_for(pane: &PaneState) -> Option<RestoreCommand> {
     }
     Some(RestoreCommand {
         command,
-        base_argv: pane.argv.clone(),
         used_restore_argv,
     })
 }
@@ -579,16 +628,24 @@ fn command_for(pane: &PaneState) -> Option<RestoreCommand> {
 /// from `agent.restore_argv`, the original spawn argv is recorded even when it
 /// is empty (the default-shell case): recording the replacement command would
 /// make the next save restore the old agent session again.
-fn restored_spawn_info(
-    used_restore_argv: bool,
-    base_argv: Vec<String>,
-    cwd: Option<String>,
-) -> Option<SpawnInfo> {
-    used_restore_argv.then(|| SpawnInfo {
-        argv: base_argv,
-        cwd,
-        env: BTreeMap::new(),
-    })
+fn restored_spawn_info(pane: &PaneState, command: Option<&RestoreCommand>) -> Option<SpawnInfo> {
+    command
+        .filter(|cmd| cmd.used_restore_argv)
+        .map(|_| SpawnInfo {
+            argv: pane.argv.clone(),
+            cwd: pane.cwd.clone(),
+            env: pane.env.clone(),
+            domain: pane.domain.as_deref().unwrap_or(HOST_DOMAIN).to_string(),
+            skip_domain_fixup: pane.skip_domain_fixup,
+        })
+}
+
+fn spawn_domain(pane: &PaneState) -> SpawnTabDomain {
+    SpawnTabDomain::DomainName(pane.domain.as_deref().unwrap_or(HOST_DOMAIN).to_string())
+}
+
+fn skip_domain_fixup(pane: &PaneState, command: Option<&RestoreCommand>) -> bool {
+    pane.skip_domain_fixup && command.is_some_and(|cmd| !cmd.used_restore_argv)
 }
 
 /// Serializable state for one pane, or `None` when the pane has no local
@@ -596,11 +653,18 @@ fn restored_spawn_info(
 /// replaced by the default shell.
 fn pane_state(pane: &Arc<dyn Pane>) -> Option<PaneState> {
     let spawn = pane.get_spawn_info()?;
-    let cwd = pane
-        .get_current_working_dir(CachePolicy::AllowStale)
-        .as_ref()
-        .and_then(path_string)
-        .or_else(|| spawn.cwd.clone());
+    // A named domain can map its working directory just like its argv.
+    // An OSC 7 path comes from inside the domain; a host process path may
+    // already have been transformed and should not be passed through again.
+    let cwd = if spawn.domain == HOST_DOMAIN {
+        pane.get_current_working_dir(CachePolicy::AllowStale)
+    } else {
+        pane.downcast_ref::<LocalPane>()
+            .and_then(LocalPane::reported_working_dir)
+    }
+    .as_ref()
+    .and_then(path_string)
+    .or_else(|| spawn.cwd.clone());
     let user_vars = pane
         .copy_user_vars()
         .into_iter()
@@ -610,6 +674,8 @@ fn pane_state(pane: &Arc<dyn Pane>) -> Option<PaneState> {
         argv: spawn.argv.clone(),
         env: spawn.env.clone(),
         title: pane.get_title(),
+        domain: Some(spawn.domain),
+        skip_domain_fixup: spawn.skip_domain_fixup,
         user_vars,
     })
 }
@@ -734,41 +800,48 @@ fn first_leaf(node: &LayoutNode) -> usize {
     }
 }
 
-/// Size request that rebuilds a split inside a node of `axis_total` cells.
-/// Exact cells are used when the node still has its saved size; otherwise the
-/// saved proportion is used.  `None` means the node is too small to split,
-/// in which case restore collapses the split instead of producing a zero-size
-/// pane.
+fn layout_minimum(node: &LayoutNode, axis: SplitDirection) -> usize {
+    match node {
+        LayoutNode::Leaf(_) => 1,
+        LayoutNode::Split {
+            direction,
+            first,
+            second,
+            ..
+        } => {
+            let first = layout_minimum(first, axis);
+            let second = layout_minimum(second, axis);
+            if *direction == axis {
+                first.saturating_add(second).saturating_add(1)
+            } else {
+                first.max(second)
+            }
+        }
+    }
+}
+
+/// Scale the saved second pane into the available cells and leave a separator
+/// and at least one cell for the first pane. A cell request avoids the rounding
+/// of the percent-based splitter for narrow or heavily asymmetric splits.
 fn split_size_for(axis_total: usize, first: usize, second: usize) -> Option<SplitSize> {
     if axis_total < 3 || first == 0 || second == 0 {
         return None;
     }
-    let saved_total = first + second + 1;
-    if saved_total == axis_total {
-        return Some(SplitSize::Cells(second));
-    }
-    let percent = ((second as f64) * 100.0 / (saved_total as f64)).round() as i64;
-    let percent = percent.clamp(1, 99) as usize;
-    // Match compute_split_size's integer arithmetic: the new pane targets
-    // `axis_total * percent / 100` cells (at least one); the first side must
-    // still get at least one cell plus the separator.
-    let target = (axis_total * percent / 100).max(1);
-    if axis_total.saturating_sub(target + 1) < 1 {
-        return None;
-    }
-    Some(SplitSize::Percent(percent as u8))
+    let saved_pane_total = first as u128 + second as u128;
+    let available = (axis_total - 1) as u128;
+    let second = (second as u128 * available + saved_pane_total / 2) / saved_pane_total;
+    Some(SplitSize::Cells((second as usize).clamp(1, axis_total - 2)))
 }
 
-/// Rebuild the splits below `anchor` top-down.  The anchor currently occupies
-/// the whole node area; the second subtree's first leaf is spawned into the
-/// new pane, then both subtrees recurse.  A failed split leaves the anchor in
-/// place and skips that subtree: the rest of the tab keeps working.
+/// Rebuild splits top-down. If the second branch cannot be placed, the
+/// first branch can still subdivide the entire area occupied by the anchor.
 fn build_layout_node<'a>(
     mux: &'a Mux,
     panes: &'a [PaneState],
     node: &'a LayoutNode,
     anchor: Arc<dyn Pane>,
-    leaf_pane_ids: &'a mut Vec<Option<PaneId>>,
+    leaf_pane_ids: &'a mut [Option<PaneId>],
+    errors: &'a mut Vec<String>,
 ) -> Pin<Box<dyn std::future::Future<Output = ()> + 'a>> {
     Box::pin(async move {
         let LayoutNode::Split {
@@ -783,78 +856,79 @@ fn build_layout_node<'a>(
         };
         let dims = anchor.get_dimensions();
         let (axis_total, first_axis, second_axis) = match direction {
-            SplitDirection::Horizontal => (
-                dims.cols,
-                first_size.cols as usize,
-                second_size.cols as usize,
-            ),
-            SplitDirection::Vertical => (
-                dims.viewport_rows,
-                first_size.rows as usize,
-                second_size.rows as usize,
-            ),
-        };
-        let Some(size) = split_size_for(axis_total, first_axis, second_axis) else {
-            log::warn!(
-                "restore workspace: collapsing a {direction:?} split that does not fit (axis={axis_total}, first={first_axis}, second={second_axis})"
-            );
-            return;
+            SplitDirection::Horizontal => (dims.cols, first_size.cols, second_size.cols),
+            SplitDirection::Vertical => (dims.viewport_rows, first_size.rows, second_size.rows),
         };
         let second_leaf = first_leaf(second);
-        let Some(second_state) = panes.get(second_leaf) else {
-            log::warn!("restore workspace: split leaf {second_leaf} is out of range");
-            return;
-        };
-        let (command, used_restore_argv, base_argv) = match command_for(second_state) {
-            Some(restore) => (
-                Some(restore.command),
-                restore.used_restore_argv,
-                restore.base_argv,
-            ),
-            None => (None, false, Vec::new()),
-        };
-        let outcome = mux
-            .split_pane(
-                anchor.pane_id(),
-                SplitRequest {
-                    direction: *direction,
-                    target_is_second: true,
-                    top_level: false,
-                    size,
-                },
-                SplitSource::Spawn {
-                    command,
-                    command_dir: second_state.cwd.clone(),
-                },
-                SpawnTabDomain::DefaultDomain,
-            )
-            .await;
-        match outcome {
-            Ok((new_pane, _size)) => {
-                if let Some(info) =
-                    restored_spawn_info(used_restore_argv, base_argv, second_state.cwd.clone())
-                {
-                    new_pane.set_spawn_info(Some(info));
+        let size = split_size_for(axis_total, first_axis, second_axis).map(|size| {
+            let min_second = layout_minimum(second, *direction);
+            let max_second = (axis_total - 1).saturating_sub(layout_minimum(first, *direction));
+            match size {
+                SplitSize::Cells(cells) if min_second <= max_second => {
+                    SplitSize::Cells(cells.clamp(min_second, max_second))
                 }
-                if let Some(slot) = leaf_pane_ids.get_mut(second_leaf) {
-                    *slot = Some(new_pane.pane_id());
-                }
-                build_layout_node(mux, panes, first, Arc::clone(&anchor), &mut *leaf_pane_ids)
-                    .await;
-                build_layout_node(mux, panes, second, new_pane, &mut *leaf_pane_ids).await;
+                _ => size,
+            }
+        });
+        let outcome = match (size, panes.get(second_leaf)) {
+            (Some(size), Some(second_state)) if leaf_pane_ids[second_leaf].is_none() => {
+                let command = command_for(second_state);
+                let skip_fixup = skip_domain_fixup(second_state, command.as_ref());
+                let spawn_info = restored_spawn_info(second_state, command.as_ref());
+                mux.split_pane(
+                    anchor.pane_id(),
+                    SplitRequest {
+                        direction: *direction,
+                        target_is_second: true,
+                        top_level: false,
+                        size,
+                    },
+                    SplitSource::Restore {
+                        command: command.map(|cmd| cmd.command),
+                        command_dir: nonempty_cwd(second_state),
+                        skip_domain_fixup: skip_fixup,
+                    },
+                    spawn_domain(second_state),
+                )
+                .await
+                .map(|(pane, _)| {
+                    if spawn_info.is_some() {
+                        pane.set_spawn_info(spawn_info);
+                    }
+                    pane
+                })
+            }
+            (None, _) => Err(anyhow!(
+                "{direction:?} split does not fit in {axis_total} cells"
+            )),
+            _ => Err(anyhow!("invalid or duplicate split leaf {second_leaf}")),
+        };
+        let second_pane = match outcome {
+            Ok(new_pane) => {
+                leaf_pane_ids[second_leaf] = Some(new_pane.pane_id());
+                Some(new_pane)
             }
             Err(err) => {
-                log::warn!(
-                    "restore workspace: could not rebuild a {direction:?} split (first={first_axis}, second={second_axis}, node={axis_total}); keeping the anchor pane: {err:#}"
-                );
+                errors.push(format!("pane {second_leaf}: {err:#}"));
+                None
             }
+        };
+        build_layout_node(mux, panes, first, anchor, leaf_pane_ids, errors).await;
+        if let Some(second_pane) = second_pane {
+            build_layout_node(mux, panes, second, second_pane, leaf_pane_ids, errors).await;
         }
     })
 }
 
+fn nonempty_cwd(pane: &PaneState) -> Option<String> {
+    pane.cwd.clone().filter(|cwd| !cwd.is_empty())
+}
+
 impl Mux {
-    pub fn save_workspace(&self, path: &Path) -> Result<SaveSummary> {
+    pub async fn save_workspace(&self, path: &Path) -> Result<SaveSummary> {
+        let _operation = self.session_operation.lock().await;
         let mut state = SessionState::new();
+        state.active_workspace = Some(self.active_workspace());
         let mut window_ids = self.iter_windows();
         window_ids.sort();
         let mut skipped = 0usize;
@@ -945,11 +1019,23 @@ impl Mux {
                 "save workspace: skipped {skipped} pane(s) without a local spawn command (ssh/tmux)"
             );
         }
+        if skipped > 0 && state.windows.is_empty() {
+            anyhow::bail!(
+                "no panes could be saved ({skipped} unsupported); keeping the prior snapshot"
+            );
+        }
+        let pane_count = state
+            .windows
+            .iter()
+            .flat_map(|window| &window.tabs)
+            .map(|tab| tab.panes.len())
+            .sum();
         write_json(path, &state)?;
         Ok(SaveSummary {
             path: path.to_path_buf(),
             windows: state.windows.len(),
             tabs: state.windows.iter().map(|window| window.tabs.len()).sum(),
+            panes: pane_count,
             skipped,
         })
     }
@@ -960,197 +1046,215 @@ impl Mux {
         target_window: Option<crate::window::WindowId>,
         replace: bool,
     ) -> Result<RestoreSummary> {
+        let _operation = self.session_operation.lock().await;
         let state = read_json(path)?;
         let target_window = match target_window {
             Some(id) => Some(id),
-            None => {
-                let windows = self.iter_windows();
-                if windows.len() == 1 {
-                    windows.first().copied()
-                } else if replace {
-                    return Err(anyhow!(
-                        "restore-workspace --replace requires --window-id when more than one window exists"
-                    ));
-                } else {
-                    None
-                }
-            }
+            None => match self.iter_windows().as_slice() {
+                [id] => Some(*id),
+                windows if replace && windows.len() > 1 => anyhow::bail!(
+                    "restore-workspace --replace requires --window-id when more than one window exists"
+                ),
+                _ => None,
+            },
         };
-        let old_tabs: Vec<_> = if replace {
-            target_window
-                .and_then(|id| self.get_window(id))
-                .map(|window| window.iter_tabs().map(|tab| tab.tab_id()).collect())
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-
+        let target_before = target_window
+            .map(|id| {
+                let window = self
+                    .get_window(id)
+                    .ok_or_else(|| anyhow!("no such window {id}"))?;
+                let tabs = window
+                    .iter_tabs()
+                    .map(|tab| tab.tab_id())
+                    .collect::<Vec<_>>();
+                let active = window.get_active_tab().map(|tab| tab.tab_id());
+                Ok::<_, anyhow::Error>((tabs, active))
+            })
+            .transpose()?;
         let mut summary = RestoreSummary::default();
-        let mut restored_any = false;
-        // Active tabs are applied after --replace removes the old tabs, so the
-        // index still points at the same restored tab.
-        let mut active_targets: Vec<(crate::window::WindowId, crate::tab::TabId)> = Vec::new();
+        let mut restored_workspaces = Vec::new();
+        let mut replacement_workspace = None;
         for (window_index, saved_window) in state.windows.iter().enumerate() {
             let mut current_window = if window_index == 0 {
                 target_window
             } else {
                 None
             };
-            let mut restored_tabs: Vec<(usize, crate::tab::TabId)> = Vec::new();
+            let replacing_here = replace && current_window.is_some();
+            let workspace = if saved_window.workspace.is_empty() {
+                crate::DEFAULT_WORKSPACE
+            } else {
+                &saved_window.workspace
+            };
+            let mut restored_tabs = Vec::new();
+            let mut window_panes = 0;
+            let mut complete = !saved_window.tabs.is_empty();
+            if saved_window.tabs.is_empty() {
+                summary.failed += 1;
+                summary.report(format!("window {window_index} has no tabs"));
+            }
             for (tab_index, saved_tab) in saved_window.tabs.iter().enumerate() {
-                if saved_tab.panes.is_empty() {
-                    log::error!(
-                        "restore workspace: window {window_index} tab {tab_index} ({:?}) has no panes",
-                        saved_tab.title
-                    );
-                    summary.failed += 1;
-                    continue;
-                }
-                // The tab's initial pane is the first leaf of the layout
-                // (left/top-most).  Empty argv means the default shell.
-                let root_leaf = match &saved_tab.layout {
-                    Some(layout) => first_leaf(layout),
-                    None => 0,
-                };
+                let root_leaf = saved_tab.layout.as_ref().map_or(0, first_leaf);
                 let Some(root_state) = saved_tab.panes.get(root_leaf) else {
-                    log::error!(
-                        "restore workspace: window {window_index} tab {tab_index} ({:?}) references missing pane {root_leaf}",
-                        saved_tab.title
-                    );
                     summary.failed += 1;
+                    summary.failed_panes += saved_tab.panes.len().max(1);
+                    complete = false;
+                    summary.report(format!(
+                        "window {window_index} tab {tab_index}: missing root pane {root_leaf}"
+                    ));
                     continue;
                 };
-                let (command, used_restore_argv, base_argv) = match command_for(root_state) {
-                    Some(restore) => (
-                        Some(restore.command),
-                        restore.used_restore_argv,
-                        restore.base_argv,
-                    ),
-                    None => {
-                        log::debug!(
-                            "restore workspace: tab {tab_index} ({:?}) has no spawn argv; using the default shell",
-                            saved_tab.title
-                        );
-                        (None, false, Vec::new())
-                    }
-                };
-                // The tab bar size comes from the target window; only a brand
-                // new window needs the configured initial size.
-                let size = current_window
-                    .and_then(|window_id| {
-                        self.get_window(window_id)
-                            .and_then(|window| window.get_active_tab().map(|tab| tab.get_size()))
-                    })
-                    .unwrap_or_else(|| config::configuration().initial_size(0, None));
-                let workspace = if saved_window.workspace.is_empty() {
-                    "default".to_string()
-                } else {
-                    saved_window.workspace.clone()
-                };
+                let command = command_for(root_state);
+                let skip_fixup = skip_domain_fixup(root_state, command.as_ref());
+                let spawn_info = restored_spawn_info(root_state, command.as_ref());
+                let size = config::configuration().initial_size(0, None);
                 let result = self
-                    .spawn_tab_or_window(
+                    .spawn_tab_for_restore(
                         current_window,
-                        SpawnTabDomain::DefaultDomain,
-                        command,
-                        root_state.cwd.clone(),
+                        spawn_domain(root_state),
+                        command.map(|cmd| cmd.command),
+                        nonempty_cwd(root_state),
                         size,
-                        None,
-                        workspace,
-                        None,
+                        workspace.to_string(),
+                        skip_fixup,
                     )
                     .await;
-                match result {
-                    Ok((tab, pane, window_id)) => {
-                        tab.set_title(&saved_tab.title);
-                        // Remember the pane's original spawn command, not the
-                        // replacement command, so repeated restore cycles
-                        // never accumulate arguments.  An empty base argv is
-                        // recorded as-is: it means "default shell", and
-                        // recording the replacement command would resurrect
-                        // the old session on the next save.
-                        if let Some(info) = restored_spawn_info(
-                            used_restore_argv,
-                            base_argv,
-                            root_state.cwd.clone(),
-                        ) {
-                            pane.set_spawn_info(Some(info));
-                        }
-                        let mut leaf_pane_ids = vec![None; saved_tab.panes.len()];
-                        leaf_pane_ids[root_leaf] = Some(pane.pane_id());
-                        if let Some(layout) = &saved_tab.layout {
-                            build_layout_node(
-                                self,
-                                &saved_tab.panes,
-                                layout,
-                                Arc::clone(&pane),
-                                &mut leaf_pane_ids,
-                            )
-                            .await;
-                        }
-                        // A failed split collapses its subtree, so resolve
-                        // the saved active leaf through the panes that were
-                        // actually created.
-                        let target = leaf_pane_ids
-                            .get(saved_tab.active_pane)
-                            .copied()
-                            .flatten()
-                            .or_else(|| leaf_pane_ids.iter().copied().flatten().next());
-                        if let Some(pane_id) = target {
-                            if let Some(position) = tab
-                                .iter_panes_ignoring_zoom()
-                                .iter()
-                                .position(|positioned| positioned.pane.pane_id() == pane_id)
-                            {
-                                tab.set_active_idx(position);
-                            }
-                        }
-                        if saved_tab.zoomed && tab.get_zoomed_pane().is_none() {
-                            tab.toggle_zoom();
-                        }
-                        if current_window.is_none() {
-                            current_window = Some(window_id);
-                        }
-                        restored_tabs.push((tab_index, tab.tab_id()));
-                        summary.tabs += 1;
-                        restored_any = true;
-                    }
+                let (tab, pane, window_id) = match result {
+                    Ok(result) => result,
                     Err(err) => {
-                        log::error!(
-                            "restore workspace: window {window_index} tab {tab_index} failed: {:#}",
-                            err
-                        );
+                        summary.failed += 1;
+                        summary.failed_panes += saved_tab.panes.len();
+                        complete = false;
+                        summary.report(format!(
+                            "window {window_index} tab {tab_index}: root pane {root_leaf}: {err:#}"
+                        ));
+                        continue;
+                    }
+                };
+                tab.set_title(&saved_tab.title);
+                if spawn_info.is_some() {
+                    pane.set_spawn_info(spawn_info);
+                }
+                let mut leaf_pane_ids = vec![None; saved_tab.panes.len()];
+                leaf_pane_ids[root_leaf] = Some(pane.pane_id());
+                let mut split_errors = Vec::new();
+                if let Some(layout) = &saved_tab.layout {
+                    build_layout_node(
+                        self,
+                        &saved_tab.panes,
+                        layout,
+                        pane,
+                        &mut leaf_pane_ids,
+                        &mut split_errors,
+                    )
+                    .await;
+                }
+                let pane_count = leaf_pane_ids.iter().flatten().count();
+                let missing = saved_tab.panes.len() - pane_count;
+                if missing > 0 || !split_errors.is_empty() {
+                    summary.failed_panes += missing;
+                    complete = false;
+                    if split_errors.is_empty() {
+                        summary.report(format!("window {window_index} tab {tab_index}: layout omitted {missing} pane(s)"));
+                    }
+                    for error in split_errors {
+                        summary.report(format!("window {window_index} tab {tab_index}: {error}"));
+                    }
+                    if missing == 0 {
                         summary.failed += 1;
                     }
                 }
-            }
-            if !restored_tabs.is_empty() {
-                // Prefer the tab that was active when saved; tabs before it
-                // may have failed, so match by the original index and fall
-                // back to the last restored tab.
-                let desired = restored_tabs
+                let target_pane = leaf_pane_ids
+                    .get(saved_tab.active_pane)
+                    .copied()
+                    .flatten()
+                    .or_else(|| leaf_pane_ids.iter().copied().flatten().next());
+                if let Some(position) = tab
+                    .iter_panes_ignoring_zoom()
                     .iter()
-                    .find(|(saved_idx, _)| *saved_idx == saved_window.active_tab)
-                    .map(|(_, tab_id)| *tab_id)
-                    .or_else(|| restored_tabs.last().map(|(_, tab_id)| *tab_id));
-                if let (Some(window_id), Some(tab_id)) = (current_window, desired) {
-                    active_targets.push((window_id, tab_id));
+                    .position(|positioned| Some(positioned.pane.pane_id()) == target_pane)
+                {
+                    tab.set_active_idx(position);
+                }
+                if saved_tab.zoomed && tab.get_zoomed_pane().is_none() {
+                    tab.toggle_zoom();
+                }
+                current_window = Some(window_id);
+                restored_tabs.push((tab_index, tab.tab_id()));
+                window_panes += pane_count;
+            }
+
+            let Some(window_id) = current_window else {
+                continue;
+            };
+            if replacing_here {
+                let (old_tabs, old_active) = target_before.as_ref().unwrap();
+                if restored_tabs
+                    .iter()
+                    .any(|(_, tab_id)| self.window_containing_tab(*tab_id) != Some(window_id))
+                {
+                    complete = false;
+                    summary.failed += 1;
+                    summary.report(format!(
+                        "a restored tab left window {window_id} before replacement"
+                    ));
+                }
+                if !complete {
+                    summary.failed_panes += window_panes;
+                    for (_, tab_id) in restored_tabs {
+                        if self.window_containing_tab(tab_id) == Some(window_id) {
+                            self.remove_tab(tab_id);
+                        }
+                    }
+                    if let (Some(mut window), Some(tab_id)) =
+                        (self.get_window_mut(window_id), old_active)
+                    {
+                        if let Some(index) = window.get_tab_idx_for_id(*tab_id) {
+                            window.remember_and_set_active_tab_idx(index);
+                        }
+                    }
+                    summary.report(format!("kept original tabs in window {window_id} because its restore was incomplete"));
+                    continue;
+                }
+                // Tabs may have been moved while a domain callback was pending.
+                // Replace only tabs still belonging to the original window.
+                for &tab_id in old_tabs {
+                    if self.window_containing_tab(tab_id) == Some(window_id) {
+                        self.remove_tab(tab_id);
+                    }
+                }
+                if let Some(mut window) = self.get_window_mut(window_id) {
+                    window.set_workspace(workspace);
+                }
+                replacement_workspace = Some(workspace);
+                summary.replaced = true;
+            }
+            if let Some((_, tab_id)) = restored_tabs
+                .iter()
+                .find(|(index, _)| *index == saved_window.active_tab)
+                .or_else(|| restored_tabs.last())
+            {
+                if let Some(mut window) = self.get_window_mut(window_id) {
+                    if let Some(index) = window.get_tab_idx_for_id(*tab_id) {
+                        window.remember_and_set_active_tab_idx(index);
+                    }
+                    restored_workspaces.push(window.get_workspace().to_string());
                 }
                 summary.windows += 1;
+                summary.tabs += restored_tabs.len();
+                summary.panes += window_panes;
             }
         }
 
-        // Never destroy the target window when nothing could be restored.
-        if replace && restored_any {
-            for tab_id in old_tabs {
-                self.remove_tab(tab_id);
-            }
-        }
-        for (window_id, tab_id) in active_targets {
-            if let Some(mut window) = self.get_window_mut(window_id) {
-                let idx = window.iter_tabs().position(|tab| tab.tab_id() == tab_id);
-                if let Some(idx) = idx {
-                    window.remember_and_set_active_tab_idx(idx);
-                }
+        self.recompute_pane_count();
+        if replace && (target_window.is_none() || summary.replaced) {
+            let activate = state
+                .active_workspace
+                .as_deref()
+                .filter(|workspace| restored_workspaces.iter().any(|name| name == *workspace))
+                .or(replacement_workspace);
+            if let Some(workspace) = activate {
+                self.set_active_workspace(workspace);
             }
         }
         self.prune_dead_windows();
@@ -1158,6 +1262,7 @@ impl Mux {
     }
 
     pub async fn close_agent_sessions(&self, timeout: Duration) -> Result<CloseSummary> {
+        let _operation = self.session_operation.lock().await;
         // Defend against absurd values from older clients even though the CLI
         // already validates the range.
         let timeout = timeout
@@ -1170,61 +1275,56 @@ impl Mux {
             };
             for tab in window.iter_tabs() {
                 for positioned in tab.iter_panes_ignoring_zoom() {
-                    let pane = positioned.pane;
-                    if truthy(pane.copy_user_vars().get(AGENT_SHUTDOWN)) {
-                        targets.push(pane);
+                    if let Some(identity) = shutdown_identity(&positioned.pane) {
+                        targets.push((positioned.pane.pane_id(), identity));
                     }
                 }
             }
         }
-        if targets.is_empty() {
-            return Ok(CloseSummary::default());
-        }
-
-        // Send each step to every pane before moving on, so a room full of
-        // agents sees the same sequence in parallel rather than one pane
-        // waiting for the previous pane's full 450ms.
-        for pane in &targets {
-            let mut writer = pane.writer();
-            let _ = writer.write_all(b"\x1b");
-            let _ = writer.flush();
-        }
-        smol::Timer::after(Duration::from_millis(200)).await;
-        for pane in &targets {
-            let mut writer = pane.writer();
-            let _ = writer.write_all(b"\x03");
-            let _ = writer.flush();
-        }
-        smol::Timer::after(Duration::from_millis(250)).await;
-        for pane in &targets {
-            let mut writer = pane.writer();
-            let _ = writer.write_all(b"/exit\r");
-            let _ = writer.flush();
-        }
-
         let deadline = Instant::now() + timeout;
-        loop {
-            let remaining: Vec<_> = targets
-                .iter()
-                .filter(|pane| {
-                    self.get_pane(pane.pane_id()).is_some()
-                        && truthy(pane.copy_user_vars().get(AGENT_SHUTDOWN))
+        let targeted = targets.len();
+        // Recheck identity immediately before each input. An Esc or Ctrl+C
+        // can exit an agent and expose its shell, or another session can take
+        // over the same pane before the next step.
+        for (input, delay) in [(b"\x1b".as_slice(), 200), (b"\x03", 250), (b"/exit\r", 0)] {
+            targets.retain(|(pane_id, identity)| {
+                self.get_pane(*pane_id).is_some_and(|pane| {
+                    if shutdown_identity(&pane).as_ref() != Some(identity) {
+                        return false;
+                    }
+                    let mut writer = pane.writer();
+                    if let Err(err) = writer.write_all(input).and_then(|()| writer.flush()) {
+                        log::warn!("close agent sessions: pane {pane_id}: {err:#}");
+                    }
+                    true
                 })
-                .collect();
-            if remaining.is_empty() {
+            });
+            if targets.is_empty() {
+                break;
+            }
+            if delay > 0 {
+                smol::Timer::after(
+                    Duration::from_millis(delay)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                )
+                .await;
+            }
+        }
+        loop {
+            targets.retain(|(pane_id, identity)| {
+                self.get_pane(*pane_id)
+                    .and_then(|pane| shutdown_identity(&pane))
+                    .as_ref()
+                    == Some(identity)
+            });
+            let wait = deadline.saturating_duration_since(Instant::now());
+            if targets.is_empty() || wait.is_zero() {
                 return Ok(CloseSummary {
-                    closed: targets.len(),
-                    remaining: 0,
+                    closed: targeted - targets.len(),
+                    remaining: targets.len(),
                 });
             }
-            if Instant::now() >= deadline {
-                let remaining_count = remaining.len();
-                return Ok(CloseSummary {
-                    closed: targets.len() - remaining_count,
-                    remaining: remaining_count,
-                });
-            }
-            smol::Timer::after(Duration::from_millis(500)).await;
+            smol::Timer::after(wait.min(Duration::from_millis(100))).await;
         }
     }
 

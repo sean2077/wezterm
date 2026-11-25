@@ -524,10 +524,7 @@ impl Pane for LocalPane {
     }
 
     fn get_current_working_dir(&self, policy: CachePolicy) -> Option<Url> {
-        self.terminal
-            .lock()
-            .get_current_dir()
-            .cloned()
+        self.reported_working_dir()
             .or_else(|| self.divine_current_working_dir(policy))
     }
 
@@ -1080,6 +1077,10 @@ impl LocalPane {
         }
 
         (*leader).clone().unwrap()
+    }
+
+    pub(crate) fn reported_working_dir(&self) -> Option<Url> {
+        self.terminal.lock().get_current_dir().cloned()
     }
 
     fn divine_current_working_dir(&self, policy: CachePolicy) -> Option<Url> {

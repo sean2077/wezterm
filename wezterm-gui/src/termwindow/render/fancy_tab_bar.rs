@@ -1,7 +1,7 @@
 use crate::color::LinearRgba;
 use crate::customglyph::*;
 use crate::quad::QuadTrait;
-use crate::tabbar::{TabBarItem, TabEntry};
+use crate::tabbar::{fancy_tab_metrics, parse_status_text, FancyTabMetrics, TabBarItem, TabEntry};
 use crate::termwindow::box_model::*;
 use crate::termwindow::render::corners::*;
 
@@ -12,7 +12,8 @@ use config::{Dimension, DimensionContext, TabBarColors};
 use std::rc::Rc;
 use wezterm_font::LoadedFont;
 use wezterm_term::color::{ColorAttribute, ColorPalette};
-use window::{IntegratedTitleButtonAlignment, IntegratedTitleButtonStyle, RectF};
+use wezterm_term::{CellAttributes, Line};
+use window::{IntegratedTitleButtonAlignment, RectF};
 
 /// Half a stroke in from the near edge / far edge of a corner glyph, so a
 /// stroke of `line_width` lands inside the tab's border pixels.
@@ -642,9 +643,126 @@ const PLUS_BUTTON: &[Poly] = &[
     },
 ];
 
+pub(crate) struct StatusWidthCache {
+    left: String,
+    right: String,
+    client_width: f32,
+    font: std::rc::Weak<LoadedFont>,
+    shape_generation: usize,
+    sizes: (f32, f32),
+}
+
 impl crate::TermWindow {
     pub fn invalidate_fancy_tab_bar(&mut self) {
         self.fancy_tab_bar.take();
+    }
+
+    pub(crate) fn fancy_bar_metrics(
+        &self,
+        font: &Rc<LoadedFont>,
+        metrics: &RenderMetrics,
+        palette: &ColorPalette,
+        client_width: f32,
+        tab_count: usize,
+    ) -> FancyTabMetrics {
+        let measure_status = |text: &str| {
+            let line = parse_status_text(text, CellAttributes::default());
+            if line.len() == 0 {
+                return 0.;
+            }
+            let element = status_element(font, &line, palette);
+            self.measure_bar_element(&element, metrics, client_width)
+                .unwrap_or_else(|| (line.len() as f32 + 0.5) * metrics.cell_size.width as f32)
+                .ceil()
+        };
+        let cached = self.fancy_status_widths.borrow();
+        let status_sizes = cached
+            .as_ref()
+            .filter(|entry| {
+                entry.left == self.left_status
+                    && entry.right == self.right_status
+                    && entry.shape_generation == self.shape_generation
+                    && entry.client_width == client_width
+                    && entry.font.ptr_eq(&Rc::downgrade(font))
+            })
+            .map(|entry| entry.sizes);
+        drop(cached);
+        let status_sizes = status_sizes.unwrap_or_else(|| {
+            let sizes = (
+                measure_status(&self.left_status),
+                measure_status(&self.right_status),
+            );
+            if self.render_state.is_some() && self.window.is_some() {
+                self.fancy_status_widths.replace(Some(StatusWidthCache {
+                    left: self.left_status.clone(),
+                    right: self.right_status.clone(),
+                    client_width,
+                    font: Rc::downgrade(font),
+                    shape_generation: self.shape_generation,
+                    sizes,
+                }));
+            }
+            sizes
+        });
+        fancy_tab_metrics(
+            &self.config,
+            metrics,
+            self.dimensions.dpi as f32,
+            client_width,
+            status_sizes,
+            if self.config.show_tabs_in_tab_bar {
+                tab_count
+            } else {
+                0
+            },
+            self.window_state.contains(window::WindowState::FULL_SCREEN),
+        )
+    }
+
+    pub(crate) fn measure_tab_suffix(
+        &self,
+        font: &Rc<LoadedFont>,
+        metrics: &RenderMetrics,
+        line: &Line,
+        palette: &ColorPalette,
+        client_width: f32,
+    ) -> f32 {
+        self.measure_bar_element(
+            &Element::with_line(font, line, palette),
+            metrics,
+            client_width,
+        )
+        .unwrap_or_else(|| line.len() as f32 * metrics.cell_size.width as f32)
+        .ceil()
+    }
+
+    fn measure_bar_element(
+        &self,
+        element: &Element,
+        metrics: &RenderMetrics,
+        client_width: f32,
+    ) -> Option<f32> {
+        let gl_state = self.render_state.as_ref()?;
+        self.window.as_ref()?;
+        let context = LayoutContext {
+            height: DimensionContext {
+                dpi: self.dimensions.dpi as f32,
+                pixel_max: self.dimensions.pixel_height as f32,
+                pixel_cell: metrics.cell_size.height as f32,
+            },
+            width: DimensionContext {
+                dpi: self.dimensions.dpi as f32,
+                pixel_max: client_width,
+                pixel_cell: metrics.cell_size.width as f32,
+            },
+            bounds: euclid::rect(0., 0., client_width, self.dimensions.pixel_height as f32),
+            gl_state,
+            metrics,
+            zindex: 10,
+        };
+        self.compute_element(&context, element)
+            .ok()
+            .map(|computed| computed.bounds.width())
     }
 
     pub fn build_fancy_tab_bar(&self, palette: &ColorPalette) -> anyhow::Result<ComputedElement> {
@@ -652,6 +770,15 @@ impl crate::TermWindow {
         let font = self.fonts.title_font()?;
         let metrics = RenderMetrics::with_font_metrics(&font.metrics());
         let items = self.tab_bar.items();
+        let border = self.get_os_border();
+        let client_width = (self.dimensions.pixel_width as f32
+            - (border.left + border.right).get() as f32)
+            .max(0.);
+        let tab_count = items
+            .iter()
+            .filter(|item| matches!(item.item, TabBarItem::Tab { .. }))
+            .count();
+        let layout = self.fancy_bar_metrics(&font, &metrics, palette, client_width, tab_count);
         let colors = self
             .config
             .colors
@@ -685,17 +812,7 @@ impl crate::TermWindow {
         } else {
             VerticalAlign::Bottom
         };
-        // Upstream hardcodes a 1px tab border. Make it configurable so the
-        // inactive-tab divider can be made heavier (and scale with DPI) to
-        // keep adjacent tabs visually distinct.
-        let border_width =
-            self.config
-                .tab_bar_tab_border_width
-                .evaluate_as_pixels(DimensionContext {
-                    dpi: self.dimensions.dpi as f32,
-                    pixel_max: self.dimensions.pixel_width as f32,
-                    pixel_cell: metrics.cell_size.width as f32,
-                });
+        let border_width = layout.border_px;
         // Upstream sizes the rounded tab corners as half a cell in each
         // direction, which is an ellipse (cells are taller than wide) and
         // reads as a chamfer once the corner is outlined. Use one pixel
@@ -730,23 +847,22 @@ impl crate::TermWindow {
             let is_bottom = self.config.tab_bar_at_bottom;
 
             match item.item {
-                TabBarItem::RightStatus | TabBarItem::LeftStatus | TabBarItem::None => element
-                    .item_type(UIItemType::TabBar(TabBarItem::None))
-                    .line_height(Some(1.75))
-                    .margin(BoxDimension {
-                        left: Dimension::Cells(0.),
-                        right: Dimension::Cells(0.),
-                        top: Dimension::Cells(0.0),
-                        bottom: Dimension::Cells(0.),
-                    })
-                    .padding(BoxDimension {
-                        left: Dimension::Cells(0.5),
-                        right: Dimension::Cells(0.),
-                        top: Dimension::Cells(0.),
-                        bottom: Dimension::Cells(0.),
-                    })
-                    .border(BoxDimension::new(Dimension::Pixels(0.)))
-                    .colors(bar_colors.clone()),
+                TabBarItem::RightStatus | TabBarItem::LeftStatus | TabBarItem::None => {
+                    let width = if item.item == TabBarItem::LeftStatus {
+                        layout.left_status_px
+                    } else {
+                        layout.right_status_px
+                    };
+                    let mut element =
+                        status_element(&font, &item.title, palette).colors(bar_colors.clone());
+                    // Pin label width to allocation even if clipping a wide glyph
+                    // leaves a little unused space at the end.
+                    element.max_width = Some(Dimension::Pixels(width));
+                    element.min_width = Some(Dimension::Pixels(
+                        (width - (layout.cell_px * 0.5).floor()).max(0.),
+                    ));
+                    element
+                }
                 TabBarItem::NewTabButton => Element::new(
                     &font,
                     ElementContent::Poly {
@@ -985,88 +1101,25 @@ impl crate::TermWindow {
             }
         };
 
-        let num_tabs: f32 = items
-            .iter()
-            .map(|item| match item.item {
-                TabBarItem::NewTabButton | TabBarItem::Tab { .. } => 1.,
-                _ => 0.,
-            })
-            .sum();
-        let tab_count = items
-            .iter()
-            .filter(|item| matches!(item.item, TabBarItem::Tab { .. }))
-            .count() as f32;
-        let window_buttons_at_left = self
-            .config
-            .window_decorations
-            .contains(window::WindowDecorations::INTEGRATED_BUTTONS)
-            && (self.config.integrated_title_button_alignment
-                == IntegratedTitleButtonAlignment::Left
-                // macOS reserves space for its native traffic lights; the
-                // fork-drawn ones follow the configured alignment instead.
-                || (self.config.integrated_title_button_style
-                    == IntegratedTitleButtonStyle::MacOsNative
-                    && cfg!(target_os = "macos")));
-        // The right status and the integrated window buttons float over the
-        // tab strip, so the uniform tab share must leave room for them.  The
-        // widths come from the same helper the title budget uses, so the
-        // reserved space and the callback's budget cannot disagree.
-        let side = crate::tabbar::fancy_side_widths(
-            &self.config,
-            &metrics,
-            self.dimensions.dpi as f32,
-            &self.left_status,
-            &self.right_status,
-        );
-        let new_tab_width = side.new_tab_px;
-        let reserved_side_width = side.left_px + side.right_px;
-        let uniform_width =
-            (self.dimensions.pixel_width as f32 - reserved_side_width - new_tab_width).max(0.);
-        let max_tab_width = if self.config.tab_bar_uniform_width && tab_count > 0. {
-            // Split the remaining bar between the tabs only. The new tab
-            // button and the side status/buttons have fixed sizes, so they
-            // must not consume one tab's share. Use the terminal's pixel width
-            // rather than dimensions.pixel_width: the latter can be a
-            // stale/window-frame value that is wider than the actual client
-            // area and makes the first tab claim too much.
-            (uniform_width / tab_count).max(0.)
-        } else {
-            ((self.dimensions.pixel_width as f32 / num_tabs)
-                - (1.5 * metrics.cell_size.width as f32))
-                .max(0.)
-        };
-
-        // Uniform mode consumes the remaining space as it walks the items, so
-        // every tab gets the same share instead of each one claiming a global
-        // estimate and squeezing the last tab.
-        let mut remaining_tabs = tab_count;
-        let mut remaining_width = uniform_width;
-
-        // Reserve space for the native titlebar buttons. Only macOS draws them
-        // in the window frame at the far left; the fork-drawn traffic lights
-        // follow integrated_title_button_alignment instead.
-        if self
-            .config
-            .window_decorations
-            .contains(::window::WindowDecorations::INTEGRATED_BUTTONS)
-            && self.config.integrated_title_button_style == IntegratedTitleButtonStyle::MacOsNative
-            && cfg!(target_os = "macos")
-            && !self.window_state.contains(window::WindowState::FULL_SCREEN)
-        {
+        if layout.native_button_margin > 0. {
             left_status.push(
-                Element::new(&font, ElementContent::Text("".to_string())).margin(BoxDimension {
-                    left: Dimension::Cells(4.0), // FIXME: determine exact width of macos ... buttons
-                    right: Dimension::Cells(0.),
-                    top: Dimension::Cells(0.),
-                    bottom: Dimension::Cells(0.),
+                Element::new(&font, ElementContent::Text(String::new())).margin(BoxDimension {
+                    left: Dimension::Pixels(layout.native_button_margin),
+                    ..BoxDimension::default()
                 }),
             );
         }
 
         for item in items {
             match item.item {
-                TabBarItem::LeftStatus => left_status.push(item_to_elem(item)),
-                TabBarItem::None | TabBarItem::RightStatus => right_eles.push(item_to_elem(item)),
+                TabBarItem::LeftStatus if layout.left_status_px > 0. => {
+                    left_status.push(item_to_elem(item))
+                }
+                TabBarItem::RightStatus if layout.right_status_px > 0. => {
+                    right_eles.push(item_to_elem(item))
+                }
+                TabBarItem::None | TabBarItem::LeftStatus | TabBarItem::RightStatus => {}
+                TabBarItem::NewTabButton if !layout.show_new_tab => {}
                 TabBarItem::WindowButton(_) => {
                     if self.config.integrated_title_button_alignment
                         == IntegratedTitleButtonAlignment::Left
@@ -1077,52 +1130,56 @@ impl crate::TermWindow {
                     }
                 }
                 TabBarItem::Tab { tab_idx, active } => {
+                    let tab_width = layout.tab_width(tab_idx);
+                    if tab_width == 0. {
+                        continue;
+                    }
+                    let (border_px, pad_px) = layout.chrome(tab_width);
+                    let content_width = layout.content_width(tab_width);
+                    let close_width = layout.close_width(content_width);
+                    let suffix_limit = content_width - close_width;
+                    let suffix = item.right_title.as_ref().and_then(|right| {
+                        let width = self
+                            .measure_tab_suffix(&font, &metrics, right, palette, client_width)
+                            .min(suffix_limit);
+                        (width > 0.).then_some((right, width))
+                    });
+                    let text_width = suffix_limit - suffix.map_or(0., |(_, width)| width);
                     let mut elem = item_to_elem(item);
-                    if self.config.tab_bar_uniform_width && remaining_tabs > 0. {
-                        let tab_width = (remaining_width / remaining_tabs).max(0.);
-                        remaining_width = (remaining_width - tab_width).max(0.);
-                        remaining_tabs -= 1.;
-                        // min_width is a content width; subtract the tab's
-                        // horizontal padding (1 cell) and borders (2 × width)
-                        // so the rendered element matches tab_width exactly.
-                        elem.min_width = Some(Dimension::Pixels(
-                            (tab_width - metrics.cell_size.width as f32 - 2. * border_width)
-                                .max(0.),
-                        ));
-                        elem.max_width = Some(Dimension::Pixels(tab_width));
-                    } else {
-                        elem.max_width = Some(Dimension::Pixels(max_tab_width));
+                    elem.border.left = Dimension::Pixels(border_px);
+                    elem.border.right = Dimension::Pixels(border_px);
+                    elem.padding.left = Dimension::Pixels(pad_px);
+                    elem.padding.right = Dimension::Pixels(pad_px);
+                    elem.max_width = Some(Dimension::Pixels(tab_width));
+                    elem.min_height = Some(Dimension::Pixels(metrics.cell_size.height as f32));
+                    if self.config.tab_bar_uniform_width {
+                        elem.min_width = Some(Dimension::Pixels(content_width));
                     }
                     let tab_colors = elem.colors.clone();
-                    elem.content = match elem.content {
-                        ElementContent::Text(_) => unreachable!(),
-                        ElementContent::Poly { .. } => unreachable!(),
-                        ElementContent::Children(mut kids) => {
-                            if self.config.show_close_tab_button_in_tabs {
-                                kids.push(
-                                    make_x_button(&font, &metrics, &colors, tab_idx, active)
-                                        .reveal_on_parent_hover(
-                                            !active && self.config.tab_bar_close_button_on_hover,
-                                        ),
-                                );
-                            }
-                            if let Some(right) = &item.right_title {
-                                // Float the callback's right-hand suffix before
-                                // the close button so it stays on the tab's
-                                // right edge regardless of proportional title
-                                // glyph widths.
-                                kids.push(
-                                    Element::with_line(&font, right, palette)
-                                        .vertical_align(tab_vertical_alignment)
-                                        .item_type(UIItemType::TabBar(item.item.clone()))
-                                        .float(Float::Right)
-                                        .zindex(1)
-                                        .colors(tab_colors),
-                                );
-                            }
-                            ElementContent::Children(kids)
-                        }
-                    };
+                    let mut children = Vec::with_capacity(3);
+                    if text_width > 0. {
+                        let mut title = Element::new(&font, elem.content);
+                        title.max_width = Some(Dimension::Pixels(text_width));
+                        children.push(title);
+                    }
+                    if close_width > 0. {
+                        children.push(
+                            make_x_button(&font, &metrics, &colors, tab_idx, active)
+                                .reveal_on_parent_hover(
+                                    !active && self.config.tab_bar_close_button_on_hover,
+                                ),
+                        );
+                    }
+                    if let Some((right, width)) = suffix {
+                        let mut suffix = Element::with_line(&font, right, palette)
+                            .vertical_align(tab_vertical_alignment)
+                            .float(Float::Right)
+                            .zindex(1)
+                            .colors(tab_colors);
+                        suffix.max_width = Some(Dimension::Pixels(width));
+                        children.push(suffix);
+                    }
+                    elem.content = ElementContent::Children(children);
                     left_eles.push(elem);
                 }
                 _ => left_eles.push(item_to_elem(item)),
@@ -1138,30 +1195,12 @@ impl crate::TermWindow {
             );
         }
 
-        let left_padding = if window_buttons_at_left {
-            if self.config.integrated_title_button_style == IntegratedTitleButtonStyle::MacOsNative
-                && cfg!(target_os = "macos")
-            {
-                // Only macOS draws its traffic lights in the window frame at
-                // the far left; the fork-drawn ones live in the bar itself.
-                if !self.window_state.contains(window::WindowState::FULL_SCREEN) {
-                    Dimension::Pixels(70.0)
-                } else {
-                    Dimension::Cells(0.5)
-                }
-            } else {
-                Dimension::Pixels(0.0)
-            }
-        } else {
-            Dimension::Cells(0.5)
-        };
-
         children.push(
             Element::new(&font, ElementContent::Children(left_eles))
                 .vertical_align(tab_vertical_alignment)
                 .colors(bar_colors.clone())
                 .padding(BoxDimension {
-                    left: left_padding,
+                    left: Dimension::Pixels(layout.left_padding),
                     right: Dimension::Cells(0.),
                     top: Dimension::Cells(0.),
                     bottom: Dimension::Cells(0.),
@@ -1179,12 +1218,10 @@ impl crate::TermWindow {
         let tabs = Element::new(&font, content)
             .display(DisplayType::Block)
             .item_type(UIItemType::TabBar(TabBarItem::None))
-            .min_width(Some(Dimension::Pixels(self.dimensions.pixel_width as f32)))
+            .min_width(Some(Dimension::Pixels(client_width)))
             .min_height(Some(Dimension::Pixels(tab_bar_height)))
             .vertical_align(tab_vertical_alignment)
             .colors(bar_colors);
-
-        let border = self.get_os_border();
 
         let mut computed = self.compute_element(
             &LayoutContext {
@@ -1195,15 +1232,10 @@ impl crate::TermWindow {
                 },
                 width: DimensionContext {
                     dpi: self.dimensions.dpi as f32,
-                    pixel_max: self.dimensions.pixel_width as f32,
+                    pixel_max: client_width,
                     pixel_cell: metrics.cell_size.width as f32,
                 },
-                bounds: euclid::rect(
-                    border.left.get() as f32,
-                    0.,
-                    self.dimensions.pixel_width as f32 - (border.left + border.right).get() as f32,
-                    tab_bar_height,
-                ),
+                bounds: euclid::rect(0., 0., client_width, tab_bar_height),
                 metrics: &metrics,
                 gl_state: self.render_state.as_ref().unwrap(),
                 zindex: 10,
@@ -1212,7 +1244,7 @@ impl crate::TermWindow {
         )?;
 
         computed.translate(euclid::vec2(
-            0.,
+            border.left.get() as f32,
             if self.config.tab_bar_at_bottom {
                 self.dimensions.pixel_height as f32
                     - (computed.bounds.height() + border.bottom.get() as f32)
@@ -1228,7 +1260,7 @@ impl crate::TermWindow {
         let computed = self.fancy_tab_bar.as_ref().ok_or_else(|| {
             anyhow::anyhow!("paint_fancy_tab_bar called but fancy_tab_bar is None")
         })?;
-        let ui_items = computed.ui_items();
+        let ui_items = computed.ui_items_with_hover(|element| self.is_element_hovered(element));
 
         let gl_state = self.render_state.as_ref().unwrap();
         self.render_element(&computed, gl_state, None)?;
@@ -1252,22 +1284,31 @@ impl crate::TermWindow {
             .and_then(|c| c.tab_bar.as_ref())
             .cloned()
             .unwrap_or_else(TabBarColors::default);
-        let tab_info = |idx: usize| -> (bool, Option<LinearRgba>) {
-            self.tab_bar
-                .items()
-                .iter()
-                .find(|item| matches!(item.item, TabBarItem::Tab { tab_idx, .. } if tab_idx == idx))
-                .map(|item| (item.agent_waiting, item.accent.map(|c| c.to_linear())))
-                .unwrap_or((false, None))
-        };
-        let any_waiting = self.tab_bar.items().iter().any(|item| item.agent_waiting);
         let active_edge = colors.active_tab_edge().map(|c| c.to_linear());
-        if active_edge.is_none() && !any_waiting {
+        if active_edge.is_none() && !self.tab_bar.items().iter().any(|item| item.agent_waiting) {
             return Ok(());
         }
-
+        // Tab indices follow the order of tab entries. The decorative pass
+        // consumes those entries once, alongside the layout.
+        let tab_metadata: Vec<_> = self
+            .tab_bar
+            .items()
+            .iter()
+            .filter(|item| matches!(item.item, TabBarItem::Tab { .. }))
+            .map(|item| {
+                (
+                    item.agent_waiting,
+                    item.accent.map(|color| color.to_linear()),
+                )
+            })
+            .collect();
         let mut tabs = vec![];
-        collect_tab_geoms(computed, &tab_info, &|e| self.tab_fill(e), &mut tabs);
+        collect_tab_geoms(
+            computed,
+            &|idx| tab_metadata.get(idx).copied().unwrap_or_default(),
+            &|e| self.tab_fill(e),
+            &mut tabs,
+        );
         let font = self.fonts.title_font()?;
         let metrics = RenderMetrics::with_font_metrics(&font.metrics());
         let px = |d: Dimension| {
@@ -1376,6 +1417,16 @@ impl crate::TermWindow {
             _ => None,
         }
     }
+}
+
+fn status_element(font: &Rc<LoadedFont>, line: &Line, palette: &ColorPalette) -> Element {
+    Element::with_line(font, line, palette)
+        .item_type(UIItemType::TabBar(TabBarItem::None))
+        .line_height(Some(1.75))
+        .padding(BoxDimension {
+            left: Dimension::Cells(0.5),
+            ..BoxDimension::default()
+        })
 }
 
 fn make_x_button(

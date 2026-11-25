@@ -203,17 +203,43 @@ impl UserData for GuiWin {
         methods.add_method(
             "set_config_override",
             |_, this, (key, value): (String, mlua::Value)| {
-                let value = lua_value_to_dynamic(value)?;
-                this.window
-                    .notify(TermWindowNotif::SetConfigOverride { key, value });
+                let mut values = wezterm_dynamic::Object::default();
+                values.insert(
+                    wezterm_dynamic::Value::String(key),
+                    lua_value_to_dynamic(value)?,
+                );
+                this.window.notify(TermWindowNotif::UpdateConfigOverrides {
+                    values,
+                    clear: vec![],
+                });
                 Ok(())
             },
         );
         methods.add_method("clear_config_override", |_, this, key: String| {
-            this.window
-                .notify(TermWindowNotif::ClearConfigOverride { key });
+            this.window.notify(TermWindowNotif::UpdateConfigOverrides {
+                values: wezterm_dynamic::Object::default(),
+                clear: vec![key],
+            });
             Ok(())
         });
+        methods.add_method(
+            "update_config_overrides",
+            |_, this, (updates, clear): (mlua::Table, Option<Vec<String>>)| {
+                let mut values = wezterm_dynamic::Object::default();
+                for update in updates.pairs::<String, mlua::Value>() {
+                    let (key, value) = update?;
+                    values.insert(
+                        wezterm_dynamic::Value::String(key),
+                        lua_value_to_dynamic(value)?,
+                    );
+                }
+                this.window.notify(TermWindowNotif::UpdateConfigOverrides {
+                    values,
+                    clear: clear.unwrap_or_default(),
+                });
+                Ok(())
+            },
+        );
         methods.add_async_method("is_focused", |_, this, _: ()| async move {
             let (tx, rx) = smol::channel::bounded(1);
             this.window

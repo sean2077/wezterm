@@ -3,9 +3,9 @@ use crate::termwindow::{PaneInformation, TabInformation, UIItem, UIItemType};
 use crate::utilsprites::RenderMetrics;
 use config::{ConfigHandle, DimensionContext, TabBarColors};
 use finl_unicode::grapheme_clusters::Graphemes;
-use mlua::FromLua;
+use mlua::{FromLua, IntoLua};
 use std::sync::LazyLock;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use termwiz::cell::{unicode_column_width, Cell, CellAttributes};
 use termwiz::color::{AnsiColor, ColorSpec, SrgbaTuple};
 use termwiz::escape::csi::Sgr;
@@ -61,9 +61,8 @@ struct TitleText {
     /// this as a right-floated element so it stays on the right edge even with
     /// a proportional title font.
     right: Option<Line>,
-    /// Width of the fixed left block (index + badge), marked by U+001E in the
-    /// callback result. Zero when the callback does not use the marker.
-    left_len: usize,
+    /// Fixed left block (index + badge) marked by U+001E.
+    left: Option<Line>,
     /// Foreground color in effect at the first U+001D marker.
     accent: Option<SrgbaTuple>,
 }
@@ -145,101 +144,131 @@ fn split_right(items: Vec<FormatItem>) -> (Vec<FormatItem>, Option<Vec<FormatIte
     )
 }
 
-fn call_format_tab_title(
-    tab: &TabInformation,
-    tab_info: &[TabInformation],
-    pane_info: &[PaneInformation],
-    config: &ConfigHandle,
-    hover: bool,
-    tab_max_width: usize,
-) -> Option<TitleText> {
-    match config::run_immediate_with_lua_config(|lua| {
-        if let Some(lua) = lua {
-            let tabs = lua.create_sequence_from(tab_info.iter().cloned())?;
-            let panes = lua.create_sequence_from(pane_info.iter().cloned())?;
+struct TabTitleCallback<'lua> {
+    lua: &'lua mlua::Lua,
+    tabs: Vec<mlua::AnyUserData<'lua>>,
+    panes: Vec<mlua::AnyUserData<'lua>>,
+    config: mlua::Value<'lua>,
+}
 
-            let v = config::lua::emit_sync_callback(
-                &*lua,
-                (
-                    "format-tab-title".to_string(),
-                    (
-                        tab.clone(),
-                        tabs,
-                        panes,
-                        (**config).clone(),
-                        hover,
-                        tab_max_width,
-                    ),
-                ),
-            )?;
-            match &v {
-                mlua::Value::Nil => Ok(None),
-                mlua::Value::Table(_) => {
-                    let items = <Vec<FormatItem>>::from_lua(v, &*lua)?;
-                    let (items, accent) = take_accent(items);
-                    let (left_items, right_items) = split_right(items);
-                    // U+001E separates the fixed left block (index + badge)
-                    // from the title. The tab bar measures the left block and
-                    // passes the rest of the share to the title as its budget.
-                    let (left_items, title_items, has_title_marker) =
-                        split_marker(left_items, TITLE_MARKER);
-                    let left_len = if has_title_marker {
-                        let esc = format_as_escapes(left_items.clone())?;
-                        parse_status_text(&esc, CellAttributes::default()).len()
-                    } else {
-                        0
-                    };
-                    let mut all_items = left_items;
-                    all_items.extend(title_items);
-                    let esc = format_as_escapes(all_items.clone())?;
-                    let line = parse_status_text(&esc, CellAttributes::default());
-                    let right = match right_items {
-                        Some(items) => {
-                            let esc = format_as_escapes(items)?;
-                            Some(parse_status_text(&esc, CellAttributes::default()))
-                        }
-                        None => None,
-                    };
+impl<'lua> TabTitleCallback<'lua> {
+    fn new(
+        lua: &'lua mlua::Lua,
+        tabs: &[TabInformation],
+        panes: &[PaneInformation],
+        config: &ConfigHandle,
+    ) -> mlua::Result<Self> {
+        Ok(Self {
+            lua,
+            tabs: tabs
+                .iter()
+                .map(|tab| lua.create_userdata(tab.clone()))
+                .collect::<mlua::Result<_>>()?,
+            panes: panes
+                .iter()
+                .map(|pane| lua.create_userdata(pane.clone()))
+                .collect::<mlua::Result<_>>()?,
+            config: (**config).clone().into_lua(lua)?,
+        })
+    }
 
-                    Ok(Some(TitleText {
-                        items: all_items,
-                        len: line.len(),
-                        has_indeterminate: false,
-                        right,
-                        left_len,
-                        accent,
-                    }))
-                }
-                _ => {
-                    let s = String::from_lua(v, &*lua)?;
-                    let (left, right) = match s.find(RIGHT_MARKER) {
-                        Some(pos) => (
-                            s[..pos].to_string(),
-                            Some(s[pos + RIGHT_MARKER.len_utf8()..].to_string()),
-                        ),
-                        None => (s, None),
-                    };
-                    let line = parse_status_text(&left, CellAttributes::default());
-                    let right = right.map(|r| parse_status_text(&r, CellAttributes::default()));
-                    Ok(Some(TitleText {
-                        len: line.len(),
-                        items: vec![FormatItem::Text(left)],
-                        has_indeterminate: false,
-                        right,
-                        left_len: 0,
-                        accent: None,
-                    }))
-                }
+    fn call(
+        &self,
+        tab: &TabInformation,
+        hover: bool,
+        tab_max_width: usize,
+    ) -> anyhow::Result<Option<TitleText>> {
+        let lua = self.lua;
+        // The arrays and config are mutable Lua tables. Give each invocation
+        // fresh tables while sharing the read-only tab and pane userdata.
+        let tabs = lua.create_sequence_from(self.tabs.iter().cloned())?;
+        let panes = lua.create_sequence_from(self.panes.iter().cloned())?;
+        let config = clone_lua_snapshot(lua, &self.config)?;
+        let v = config::lua::emit_sync_callback(
+            lua,
+            (
+                "format-tab-title".to_owned(),
+                (tab.clone(), tabs, panes, config, hover, tab_max_width),
+            ),
+        )?;
+        match &v {
+            mlua::Value::Nil => Ok(None),
+            mlua::Value::Table(_) => {
+                let items = <Vec<FormatItem>>::from_lua(v, lua)?;
+                let (items, accent) = take_accent(items);
+                let (left_items, right_items) = split_right(items);
+                // U+001E separates the fixed left block (index + badge)
+                // from the title. The tab bar measures the left block and
+                // passes the rest of the share to the title as its budget.
+                let (left_items, title_items, has_title_marker) =
+                    split_marker(left_items, TITLE_MARKER);
+                let left = if has_title_marker {
+                    let esc = format_as_escapes(left_items.clone())?;
+                    Some(parse_status_text(&esc, CellAttributes::default()))
+                } else {
+                    None
+                };
+                let mut all_items = left_items;
+                all_items.extend(title_items);
+                let esc = format_as_escapes(all_items.clone())?;
+                let line = parse_status_text(&esc, CellAttributes::default());
+                let right = match right_items {
+                    Some(items) => {
+                        let esc = format_as_escapes(items)?;
+                        Some(parse_status_text(&esc, CellAttributes::default()))
+                    }
+                    None => None,
+                };
+
+                Ok(Some(TitleText {
+                    items: all_items,
+                    len: line.len(),
+                    has_indeterminate: false,
+                    right,
+                    left,
+                    accent,
+                }))
             }
-        } else {
-            Ok(None)
+            _ => {
+                let s = String::from_lua(v, lua)?;
+                let (left, right) = match s.find(RIGHT_MARKER) {
+                    Some(pos) => (
+                        s[..pos].to_string(),
+                        Some(s[pos + RIGHT_MARKER.len_utf8()..].to_string()),
+                    ),
+                    None => (s, None),
+                };
+                let line = parse_status_text(&left, CellAttributes::default());
+                let right = right.map(|r| parse_status_text(&r, CellAttributes::default()));
+                Ok(Some(TitleText {
+                    len: line.len(),
+                    items: vec![FormatItem::Text(left)],
+                    has_indeterminate: false,
+                    right,
+                    left: None,
+                    accent: None,
+                }))
+            }
         }
-    }) {
-        Ok(s) => s,
-        Err(err) => {
-            log::warn!("format-tab-title: {}", err);
-            None
+    }
+}
+
+fn clone_lua_snapshot<'lua>(
+    lua: &'lua mlua::Lua,
+    value: &mlua::Value<'lua>,
+) -> mlua::Result<mlua::Value<'lua>> {
+    if let mlua::Value::Table(table) = value {
+        let copy = lua.create_table_with_capacity(table.raw_len(), 0)?;
+        for pair in table.clone().pairs::<mlua::Value, mlua::Value>() {
+            let (key, value) = pair?;
+            copy.raw_set(
+                clone_lua_snapshot(lua, &key)?,
+                clone_lua_snapshot(lua, &value)?,
+            )?;
         }
+        Ok(mlua::Value::Table(copy))
+    } else {
+        Ok(value.clone())
     }
 }
 
@@ -331,13 +360,18 @@ fn spinner_phase(tab_id: usize) -> u64 {
 
 fn compute_tab_title(
     tab: &TabInformation,
-    tab_info: &[TabInformation],
-    pane_info: &[PaneInformation],
     config: &ConfigHandle,
+    callback: Option<&TabTitleCallback>,
     hover: bool,
     tab_max_width: usize,
 ) -> TitleText {
-    let title = call_format_tab_title(tab, tab_info, pane_info, config, hover, tab_max_width);
+    let title = callback.and_then(|callback| match callback.call(tab, hover, tab_max_width) {
+        Ok(title) => title,
+        Err(err) => {
+            log::warn!("format-tab-title: {err:#}");
+            None
+        }
+    });
 
     match title {
         Some(title) => title,
@@ -422,7 +456,7 @@ fn compute_tab_title(
                 items,
                 has_indeterminate,
                 right: None,
-                left_len: 0,
+                left: None,
                 accent: None,
             }
         }
@@ -477,38 +511,80 @@ fn window_buttons_width(config: &ConfigHandle, metrics: &RenderMetrics, dpi: f32
     }
 }
 
-/// Widths of the fixed elements that share the fancy tab bar with the tabs.
-/// The tab layout (build_fancy_tab_bar) and the title budget / hover pass use
-/// the same numbers, so the callback's budget matches what is rendered.
-pub(crate) struct FancySideWidths {
-    /// Left group: leading padding, left status text and left-aligned window
-    /// buttons.  The tabs start after this.
+/// Pixel allocations shared by the Lua title budget and the fancy bar layout.
+pub(crate) struct FancyTabMetrics {
+    tab_pixels: usize,
+    tab_count: usize,
+    pub cell_px: f32,
+    pub border_px: f32,
+    close_px: f32,
     pub left_px: f32,
-    /// Right status text and right-floated window buttons.
-    pub right_px: f32,
-    /// The new-tab (`+`) button, which also consumes bar space.
-    pub new_tab_px: f32,
+    pub left_status_px: f32,
+    pub right_status_px: f32,
+    pub left_padding: f32,
+    pub native_button_margin: f32,
+    pub show_new_tab: bool,
 }
 
-pub(crate) fn fancy_side_widths(
+impl FancyTabMetrics {
+    pub fn tab_width(&self, index: usize) -> f32 {
+        if self.tab_count == 0 {
+            return 0.;
+        }
+        let base = self.tab_pixels / self.tab_count;
+        let extra = usize::from(index < self.tab_pixels % self.tab_count);
+        (base + extra) as f32
+    }
+
+    pub fn tab_start(&self, index: usize) -> f32 {
+        if self.tab_count == 0 {
+            return self.left_px;
+        }
+        let base = self.tab_pixels / self.tab_count;
+        let extra_before = index.min(self.tab_pixels % self.tab_count);
+        self.left_px + (base * index + extra_before) as f32
+    }
+
+    pub fn chrome(&self, tab_width: f32) -> (f32, f32) {
+        let border = self.border_px.min((tab_width * 0.5).floor());
+        let padding = (self.cell_px * 0.5)
+            .floor()
+            .min(((tab_width - 2. * border) * 0.5).floor());
+        (border, padding)
+    }
+
+    pub fn content_width(&self, tab_width: f32) -> f32 {
+        let (border, padding) = self.chrome(tab_width);
+        tab_width - 2. * (border + padding)
+    }
+
+    pub fn close_width(&self, content_width: f32) -> f32 {
+        if content_width >= self.close_px {
+            self.close_px
+        } else {
+            0.
+        }
+    }
+
+    fn title_columns(&self, index: usize, suffix_px: f32) -> usize {
+        let content = self.content_width(self.tab_width(index));
+        ((content - self.close_width(content) - suffix_px).max(0.) / self.cell_px).floor() as usize
+    }
+}
+
+pub(crate) fn fancy_tab_metrics(
     config: &ConfigHandle,
     metrics: &RenderMetrics,
     dpi: f32,
-    left_status: &str,
-    right_status: &str,
-) -> FancySideWidths {
-    let cell = metrics.cell_size.width as f32;
+    window_px: f32,
+    status_widths: (f32, f32),
+    tab_count: usize,
+    is_full_screen: bool,
+) -> FancyTabMetrics {
+    let cell_px = (metrics.cell_size.width as f32).max(1.);
     let cell_h = metrics.cell_size.height as f32;
-    let ratio = (config.tab_bar_side_reserve_ratio as f32).clamp(0.0, 1.0);
-    // Status elements render as a text run with 0.5 cell of left padding.
-    let status_px = |text: &str| {
-        if text.is_empty() {
-            0.
-        } else {
-            (parse_status_text(text, CellAttributes::default()).len() as f32 * cell + 0.5 * cell)
-                * ratio
-        }
-    };
+    let half_cell = (0.5 * cell_px).floor();
+    let quarter_cell = (0.25 * cell_px).floor();
     let integrated = config
         .window_decorations
         .contains(window::WindowDecorations::INTEGRATED_BUTTONS);
@@ -517,136 +593,191 @@ pub(crate) fn fancy_side_widths(
     } else {
         0.
     };
+    let native_mac = integrated
+        && config.integrated_title_button_style == IntegratedTitleButtonStyle::MacOsNative
+        && cfg!(target_os = "macos");
     let buttons_at_left = integrated
-        && config.integrated_title_button_alignment == IntegratedTitleButtonAlignment::Left
-        && !(config.integrated_title_button_style == IntegratedTitleButtonStyle::MacOsNative
-            && cfg!(target_os = "macos"));
-    // The left group always carries 0.5 cell of leading padding, except when
-    // the window buttons occupy that spot.
-    let leading = if buttons_at_left { 0. } else { 0.5 * cell };
-    let new_tab_px = if config.show_new_tab_button_in_tab_bar {
-        // Poly height/2 + 1 cell of horizontal padding + 2px border + 0.5 cell
-        // left margin, matching the NewTabButton element.
-        0.5 * cell_h + 1.5 * cell + 2.
+        && config.integrated_title_button_alignment == IntegratedTitleButtonAlignment::Left;
+    let (left_padding, native_button_margin) = if native_mac && !is_full_screen {
+        (70., (4. * cell_px).floor())
+    } else if buttons_at_left && !native_mac {
+        (0., 0.)
     } else {
-        0.
+        (half_cell, 0.)
     };
-    FancySideWidths {
-        left_px: leading + status_px(left_status) + if buttons_at_left { buttons_px } else { 0. },
-        right_px: status_px(right_status) + if buttons_at_left { 0. } else { buttons_px },
-        new_tab_px,
+    let new_tab_width = (0.5 * cell_h).floor() + 3. * half_cell + 2.;
+    let side_fixed = buttons_px + left_padding + native_button_margin;
+    let show_new_tab =
+        config.show_new_tab_button_in_tab_bar && window_px >= side_fixed + new_tab_width;
+    let free_pixels =
+        (window_px - side_fixed - if show_new_tab { new_tab_width } else { 0. }).max(0.);
+    let ratio = (config.tab_bar_side_reserve_ratio as f32).clamp(0.0, 1.0);
+    let mut left_status_px = (status_widths.0 * ratio).floor();
+    let mut right_status_px = (status_widths.1 * ratio).floor();
+    let status_total = left_status_px + right_status_px;
+    if status_total > free_pixels {
+        left_status_px = (left_status_px * free_pixels / status_total).floor();
+        right_status_px = (right_status_px * free_pixels / status_total).floor();
     }
-}
+    // The padding alone is wider than these allocations. Omit these labels.
+    if left_status_px <= half_cell {
+        left_status_px = 0.;
+    }
+    if right_status_px <= half_cell {
+        right_status_px = 0.;
+    }
+    let tab_pixels = (free_pixels - left_status_px - right_status_px).max(0.) as usize;
 
-/// Everything the tab builder needs to compute exact budgets and hover ranges
-/// for uniform tabs.  All widths are pixels measured from the left edge of
-/// the tab bar.
-pub(crate) struct FancyTabMetrics {
-    /// Outer width each tab receives in uniform mode.
-    pub share_px: f32,
-    /// Title-font cell width.
-    pub cell_px: f32,
-    /// Tab border width in pixels.
-    pub border_px: f32,
-    /// Close-button element width when shown.
-    pub close_px: f32,
-    /// Where the first tab starts (the left group's width).
-    pub left_px: f32,
-    /// Mouse x in tab-bar pixels, when the pointer is on the bar row.
-    pub mouse_px: Option<f32>,
-}
-
-pub(crate) fn fancy_tab_metrics(
-    config: &ConfigHandle,
-    metrics: &RenderMetrics,
-    dpi: f32,
-    window_px: f32,
-    left_status: &str,
-    right_status: &str,
-    tab_count: usize,
-    mouse_px: Option<f32>,
-) -> FancyTabMetrics {
-    let cell_px = (metrics.cell_size.width as f32).max(1.);
-    let side = fancy_side_widths(config, metrics, dpi, left_status, right_status);
-    let uniform = (window_px - side.left_px - side.right_px - side.new_tab_px).max(0.);
-    let share_px = if tab_count > 0 {
-        (uniform / tab_count as f32).max(0.)
-    } else {
-        0.
-    };
-    let border_px = config
-        .tab_bar_tab_border_width
-        .evaluate_as_pixels(DimensionContext {
-            dpi,
-            pixel_max: window_px,
-            pixel_cell: cell_px,
-        });
     FancyTabMetrics {
-        share_px,
+        tab_pixels,
+        tab_count,
         cell_px,
-        border_px,
-        close_px: metrics.cell_size.height as f32 / 2.,
-        left_px: side.left_px,
-        mouse_px,
+        border_px: config
+            .tab_bar_tab_border_width
+            .evaluate_as_pixels(DimensionContext {
+                dpi,
+                pixel_max: window_px,
+                pixel_cell: cell_px,
+            })
+            .max(0.),
+        close_px: if config.show_close_tab_button_in_tabs {
+            (0.5 * cell_h).floor() + half_cell + 2. * quarter_cell
+        } else {
+            0.
+        },
+        left_px: left_padding
+            + native_button_margin
+            + left_status_px
+            + if buttons_at_left { buttons_px } else { 0. },
+        left_status_px,
+        right_status_px,
+        left_padding,
+        native_button_margin,
+        show_new_tab,
     }
 }
 
-/// `agent_state` is written as `state` or `state:<unix-epoch>` by the
-/// notification helpers. Only the state prefix matters for the tab ring.
-/// Epoch carried by an `agent_state` value such as `waiting:1762500000`.
-pub(crate) fn agent_state_epoch(value: &str) -> Option<u64> {
-    value
-        .split_once(':')
-        .and_then(|(_, epoch)| epoch.parse::<u64>().ok())
-}
-
-/// True when the value says the pane is waiting for input and its optional
-/// `:epoch` timestamp has not exceeded `ttl_seconds`.  A zero TTL disables the
-/// expiry (upstream behavior); a value without a numeric epoch never expires.
-pub(crate) fn agent_state_is_waiting(value: &str, now_epoch: u64, ttl_seconds: u64) -> bool {
+/// Returns whether the pane is waiting and the time at which its ring expires.
+pub(crate) fn agent_waiting_state(
+    value: &str,
+    now: SystemTime,
+    ttl_seconds: u64,
+) -> (bool, Option<SystemTime>) {
     let Some((state, epoch)) = value.split_once(':') else {
-        return value == "waiting";
+        return (value == "waiting", None);
     };
     if state != "waiting" {
-        return false;
+        return (false, None);
     }
-    let Ok(epoch) = epoch.parse::<u64>() else {
-        return true;
-    };
     if ttl_seconds == 0 {
-        return true;
+        return (true, None);
     }
-    now_epoch < epoch.saturating_add(ttl_seconds)
+
+    // Preserve the untimed form used by callers without a numeric timestamp.
+    if epoch.is_empty() || !epoch.bytes().all(|b| b.is_ascii_digit()) {
+        return (true, None);
+    }
+    let Some(timestamp) = epoch
+        .parse::<u64>()
+        .ok()
+        .and_then(|epoch| UNIX_EPOCH.checked_add(Duration::from_secs(epoch)))
+    else {
+        return (false, None);
+    };
+    // Allow modest clock skew between the pane and GUI without scheduling a
+    // timer arbitrarily far into the future for a malformed terminal value.
+    if timestamp
+        .duration_since(now)
+        .is_ok_and(|d| d > Duration::from_secs(300))
+    {
+        return (false, None);
+    }
+    match timestamp.checked_add(Duration::from_secs(ttl_seconds)) {
+        Some(expiry) if expiry > now => (true, Some(expiry)),
+        _ => (false, None),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_state_epoch, agent_state_is_waiting, take_accent, FormatColor, FormatItem, SrgbaTuple,
+        agent_waiting_state, take_accent, Duration, FormatColor, FormatItem, SrgbaTuple, UNIX_EPOCH,
     };
+    use mlua::FromLua;
 
     #[test]
     fn detects_waiting_agent_state() {
-        assert!(agent_state_is_waiting("waiting", 100, 0));
-        assert!(agent_state_is_waiting("waiting:1762500000", 100, 0));
-        assert!(agent_state_is_waiting("waiting:100", 100, 10));
-        assert!(agent_state_is_waiting("waiting:100", 109, 10));
-        assert!(!agent_state_is_waiting("waiting:100", 110, 10));
-        // A non-numeric epoch cannot be aged out.
-        assert!(agent_state_is_waiting("waiting:soon", 1000, 10));
-        assert!(agent_state_is_waiting("waiting:", 1000, 10));
-        assert!(!agent_state_is_waiting("running:1762500000", 100, 0));
-        assert!(!agent_state_is_waiting("done:1762500000", 100, 0));
-        assert!(!agent_state_is_waiting("error:1762500000", 100, 0));
-        assert!(!agent_state_is_waiting("waiting-room", 100, 0));
-        assert!(!agent_state_is_waiting("", 100, 0));
+        let now = UNIX_EPOCH + Duration::from_secs(100);
+        let active = now + Duration::from_secs(10);
+        assert_eq!(agent_waiting_state("waiting", now, 0), (true, None));
+        assert_eq!(
+            agent_waiting_state("waiting:100", now, 10),
+            (true, Some(active))
+        );
+        assert_eq!(
+            agent_waiting_state("waiting:100", active, 10),
+            (false, None)
+        );
+        assert_eq!(
+            agent_waiting_state("waiting:105", now, 10),
+            (true, Some(active + Duration::from_secs(5)))
+        );
+        assert_eq!(agent_waiting_state("waiting:soon", now, 10), (true, None));
+        assert_eq!(agent_waiting_state("waiting:", now, 10), (true, None));
+        for value in ["running:100", "done:100", "error:100", "waiting-room", ""] {
+            assert_eq!(agent_waiting_state(value, now, 10), (false, None));
+        }
     }
 
     #[test]
-    fn extracts_the_agent_state_epoch() {
-        assert_eq!(agent_state_epoch("waiting:1762500000"), Some(1762500000));
-        assert_eq!(agent_state_epoch("waiting"), None);
-        assert_eq!(agent_state_epoch("waiting:soon"), None);
+    fn rejects_unrepresentable_or_far_future_waiting_expiry() {
+        let now = UNIX_EPOCH + Duration::from_secs(100);
+        assert_eq!(agent_waiting_state("waiting:500", now, 10), (false, None));
+        assert_eq!(
+            agent_waiting_state(&format!("waiting:{}", u64::MAX), now, 10),
+            (false, None)
+        );
+        assert_eq!(
+            agent_waiting_state("waiting:100", now, u64::MAX),
+            (false, None)
+        );
+    }
+
+    #[test]
+    fn narrow_tab_allocations_have_no_invisible_close_button() {
+        let layout = super::FancyTabMetrics {
+            tab_pixels: 38,
+            tab_count: 3,
+            cell_px: 9.,
+            border_px: 1.,
+            close_px: 16.,
+            left_px: 17.,
+            left_status_px: 5.,
+            right_status_px: 5.,
+            left_padding: 4.,
+            native_button_margin: 0.,
+            show_new_tab: true,
+        };
+        assert_eq!(layout.tab_width(0), 13.);
+        assert_eq!(layout.tab_start(1), 30.);
+        assert_eq!(layout.tab_start(2), 43.);
+        assert_eq!(layout.tab_start(3), 55.);
+        assert_eq!(layout.content_width(13.), 3.);
+        assert_eq!(layout.close_width(3.), 0.);
+        assert_eq!(layout.close_width(16.), 16.);
+        assert_eq!(layout.title_columns(2, 11.), 0);
+    }
+
+    #[test]
+    fn callback_config_snapshot_isolates_nested_mutations() -> mlua::Result<()> {
+        let lua = mlua::Lua::new();
+        let snapshot: mlua::Value = lua.load("return { nested = { value = 1 } }").eval()?;
+        let first = super::clone_lua_snapshot(&lua, &snapshot)?;
+        let second = super::clone_lua_snapshot(&lua, &snapshot)?;
+        let nested = |value| mlua::Table::from_lua(value, &lua)?.get::<_, mlua::Table>("nested");
+        nested(first)?.set("value", 2)?;
+        assert_eq!(nested(second)?.get::<_, i64>("value")?, 1);
+        Ok(())
     }
 
     fn fg(s: &str) -> FormatItem {
@@ -830,8 +961,55 @@ impl TabBarState {
         config: &ConfigHandle,
         left_status: &str,
         right_status: &str,
-        fancy_title_width: Option<usize>,
         fancy_tab: Option<&FancyTabMetrics>,
+        mouse_px: Option<f32>,
+        measure_suffix: impl Fn(&Line) -> f32,
+    ) -> Self {
+        let build = |callback: Option<&TabTitleCallback<'_>>| {
+            Self::build(
+                title_width,
+                mouse_x,
+                tab_info,
+                colors,
+                config,
+                left_status,
+                right_status,
+                fancy_tab,
+                mouse_px,
+                &measure_suffix,
+                callback,
+            )
+        };
+        if !config.show_tabs_in_tab_bar || tab_info.is_empty() {
+            return build(None);
+        }
+        match config::run_immediate_with_lua_config(|lua| {
+            let callback = lua
+                .as_deref()
+                .map(|lua| TabTitleCallback::new(lua, tab_info, pane_info, config))
+                .transpose()?;
+            Ok(build(callback.as_ref()))
+        }) {
+            Ok(state) => state,
+            Err(err) => {
+                log::warn!("format-tab-title: {err:#}");
+                build(None)
+            }
+        }
+    }
+
+    fn build(
+        title_width: usize,
+        mouse_x: Option<usize>,
+        tab_info: &[TabInformation],
+        colors: Option<&TabBarColors>,
+        config: &ConfigHandle,
+        left_status: &str,
+        right_status: &str,
+        fancy_tab: Option<&FancyTabMetrics>,
+        mouse_px: Option<f32>,
+        measure_suffix: &dyn Fn(&Line) -> f32,
+        callback: Option<&TabTitleCallback>,
     ) -> Self {
         let colors = colors.cloned().unwrap_or_else(TabBarColors::default);
 
@@ -870,52 +1048,10 @@ impl TabBarState {
 
         let mut active_tab_no = 0;
         let number_of_tabs = tab_info.len();
-        // The first pass needs a budget for format-tab-title. In fancy mode
-        // the callback used to receive config.tab_max_width regardless of the
-        // window size; use the title font's cell width to turn the real window
-        // width into a title-cell budget.
-        let first_pass_max = if config.use_fancy_tab_bar {
-            if config.tab_bar_uniform_width {
-                if let Some(fancy) = fancy_tab {
-                    // Uniform tabs: the real per-tab share in title cells.
-                    // The second pass charges padding, borders, the close
-                    // button and the right suffix exactly.
-                    let share_cells = (fancy.share_px / fancy.cell_px).floor() as usize;
-                    share_cells.saturating_sub(2).max(1)
-                } else {
-                    fancy_title_width.unwrap_or(config.tab_max_width).max(1)
-                }
-            } else {
-                // The title budget must exclude the left/right status text and
-                // the integrated window buttons; otherwise the padded title is
-                // wider than the actual tab and gets truncated.
-                let status_cells = parse_status_text(left_status, CellAttributes::default()).len()
-                    + parse_status_text(right_status, CellAttributes::default()).len();
-                let window_buttons = if config
-                    .window_decorations
-                    .contains(window::WindowDecorations::INTEGRATED_BUTTONS)
-                {
-                    3
-                } else {
-                    0
-                };
-                let close_button = if config.show_close_tab_button_in_tabs {
-                    3
-                } else {
-                    0
-                };
-                // Match the 0.6 side-reserve factor used by the fancy layout,
-                // plus roughly the new-tab button.
-                let reserved = (((status_cells + window_buttons) as f32)
-                    * (config.tab_bar_side_reserve_ratio as f32).clamp(0.0, 1.0))
-                    as usize
-                    + 2
-                    + close_button;
-                let width = fancy_title_width.unwrap_or(config.tab_max_width);
-                (width.saturating_sub(reserved) / number_of_tabs.max(1)).max(1)
-            }
-        } else {
-            config.tab_max_width
+        let first_pass_max = |index| {
+            fancy_tab.map_or(config.tab_max_width, |fancy| {
+                fancy.title_columns(index, 0.).max(1)
+            })
         };
 
         let tab_titles: Vec<TitleText> = if config.show_tabs_in_tab_bar {
@@ -925,7 +1061,7 @@ impl TabBarState {
                     if tab.is_active {
                         active_tab_no = tab.tab_index;
                     }
-                    compute_tab_title(tab, tab_info, pane_info, config, false, first_pass_max)
+                    compute_tab_title(tab, config, callback, false, first_pass_max(tab.tab_index))
                 })
                 .collect()
         } else {
@@ -935,18 +1071,12 @@ impl TabBarState {
 
         let available_cells =
             title_width.saturating_sub(number_of_tabs.saturating_sub(1) + new_tab.len());
-        let tab_width_max = if config.use_fancy_tab_bar {
-            first_pass_max
+        let retro_tab_width_max = (if available_cells >= titles_len {
+            usize::MAX
         } else {
-            (if available_cells >= titles_len {
-                // We can render each title with its full width
-                usize::MAX
-            } else {
-                // We need to clamp the length to balance them out
-                available_cells / number_of_tabs.max(1)
-            })
-            .min(config.tab_max_width)
-        };
+            available_cells / number_of_tabs.max(1)
+        })
+        .min(config.tab_max_width);
 
         let mut line = Line::with_width(0, SEQ_ZERO);
 
@@ -999,58 +1129,51 @@ impl TabBarState {
             line.append_line(left_status_line, SEQ_ZERO);
         }
 
-        // Uniform tabs have a fixed pixel share; track their true on-screen range so
-        // hover does not rely on title-cell counts.
-        let mut tab_x_px = fancy_tab.map(|fancy| fancy.left_px).unwrap_or(0.);
-
         for (tab_idx, tab_title) in tab_titles.iter().enumerate() {
+            let tab_width_max = if config.use_fancy_tab_bar {
+                first_pass_max(tab_idx)
+            } else {
+                retro_tab_width_max
+            };
             let tab_title_len = tab_title.len.min(tab_width_max);
             let active = tab_idx == active_tab_no;
             let hover = !active
                 && match fancy_tab {
-                    Some(fancy) if config.use_fancy_tab_bar && config.tab_bar_uniform_width => {
-                        fancy.mouse_px.map_or(false, |mouse| {
-                            mouse >= tab_x_px && mouse < tab_x_px + fancy.share_px
+                    Some(fancy) if config.tab_bar_uniform_width => {
+                        let start = fancy.tab_start(tab_idx);
+                        mouse_px.is_some_and(|mouse| {
+                            mouse >= start && mouse < start + fancy.tab_width(tab_idx)
                         })
                     }
                     _ => is_tab_hover(mouse_x, x, tab_title_len),
                 };
 
-            // Recompute the title so that it factors in both the hover state
-            // and the adjusted maximum tab width based on available space.
-            // Under uniform tabs the callback marks its fixed left block with
-            // U+001E; the share's content box, minus that block, the floated
-            // suffix and the close button, is the title's exact budget in
-            // title-font cells.  The same cells cap the rendered line, so the
-            // ellipsis is not clipped by a stricter cell count.
+            // Keep the fixed title prefix, suffix and close button inside the
+            // same pixel allocation used by layout.
             let (second_pass_max, line_cap) = match fancy_tab {
-                Some(fancy) if config.use_fancy_tab_bar && config.tab_bar_uniform_width => {
-                    let right_px = tab_title.right.as_ref().map(|r| r.len()).unwrap_or(0) as f32
-                        * fancy.cell_px;
-                    let close_px = if config.show_close_tab_button_in_tabs {
-                        fancy.close_px
-                    } else {
-                        0.
-                    };
-                    let content_px =
-                        (fancy.share_px - fancy.cell_px - 2. * fancy.border_px).max(0.);
-                    let inline_px = (content_px - close_px - right_px).max(0.);
-                    let inline_cells = (inline_px / fancy.cell_px).floor() as usize;
+                Some(fancy) => {
+                    let suffix_px = tab_title
+                        .right
+                        .as_ref()
+                        .map(&measure_suffix)
+                        .unwrap_or_default();
+                    let prefix_px = tab_title
+                        .left
+                        .as_ref()
+                        .map(&measure_suffix)
+                        .unwrap_or_default();
                     (
-                        inline_cells.saturating_sub(tab_title.left_len).max(1),
-                        inline_cells.max(1),
+                        fancy.title_columns(tab_idx, suffix_px + prefix_px).max(1),
+                        fancy.title_columns(tab_idx, suffix_px),
                     )
                 }
-                _ => (tab_title_len, tab_width_max),
+                None => (tab_title_len, tab_width_max),
             };
-            let tab_title = compute_tab_title(
-                &tab_info[tab_idx],
-                tab_info,
-                pane_info,
-                config,
-                hover,
-                second_pass_max,
-            );
+            let tab_title = if callback.is_some() {
+                compute_tab_title(&tab_info[tab_idx], config, callback, hover, second_pass_max)
+            } else {
+                tab_title.clone()
+            };
 
             let cell_attrs = if active {
                 &active_cell_attrs
@@ -1074,10 +1197,10 @@ impl TabBarState {
                 },
             );
 
-            let title = tab_line.clone();
             if tab_line.len() > line_cap {
                 tab_line.resize(line_cap, SEQ_ZERO);
             }
+            let title = tab_line.clone();
 
             let width = tab_line.len();
 
@@ -1093,11 +1216,6 @@ impl TabBarState {
 
             line.append_line(tab_line, SEQ_ZERO);
             x += width;
-            if let Some(fancy) = fancy_tab {
-                if config.use_fancy_tab_bar && config.tab_bar_uniform_width {
-                    tab_x_px += fancy.share_px;
-                }
-            }
         }
 
         // New tab button

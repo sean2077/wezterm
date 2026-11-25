@@ -20,12 +20,13 @@ use wezterm_uds::UnixStream;
 mod windows {
     use super::*;
     use std::io::Error as IoError;
+    use winapi::shared::winerror::WAIT_TIMEOUT;
     use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
     use winapi::um::memoryapi::{
         CreateFileMappingW, MapViewOfFile, OpenFileMappingW, UnmapViewOfFile, FILE_MAP_ALL_ACCESS,
     };
     use winapi::um::synchapi::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
-    use winapi::um::winbase::{INFINITE, WAIT_OBJECT_0};
+    use winapi::um::winbase::{INFINITE, WAIT_ABANDONED, WAIT_OBJECT_0};
     use winapi::um::winnt::{HANDLE, PAGE_READWRITE};
 
     const MAX_NAME: usize = 1024;
@@ -111,6 +112,35 @@ mod windows {
     struct NamedMutex {
         handle: HANDLE,
     }
+
+    struct HeldMutex<'a>(&'a NamedMutex);
+
+    impl Drop for HeldMutex<'_> {
+        fn drop(&mut self) {
+            unsafe { ReleaseMutex(self.0.handle) };
+        }
+    }
+
+    /// Serializes discovery through socket or window readiness for a GUI class.
+    /// Win32 mutexes must be released on the thread that acquired them.
+    pub struct GuiStartupGuard(NamedMutex);
+
+    impl GuiStartupGuard {
+        pub fn acquire(class_name: &str) -> anyhow::Result<Self> {
+            let mutex = NamedMutex::new(&format!(
+                "Local\\wezterm-start-{}",
+                class_name.to_lowercase()
+            ))?;
+            mutex.wait(30_000)?;
+            Ok(Self(mutex))
+        }
+    }
+
+    impl Drop for GuiStartupGuard {
+        fn drop(&mut self) {
+            unsafe { ReleaseMutex(self.0.handle) };
+        }
+    }
     impl Drop for NamedMutex {
         fn drop(&mut self) {
             unsafe {
@@ -138,14 +168,17 @@ mod windows {
         where
             F: FnOnce() -> anyhow::Result<T>,
         {
-            let res = unsafe { WaitForSingleObject(self.handle, INFINITE) };
-            if res != WAIT_OBJECT_0 {
-                return Err(IoError::last_os_error()).context("acquire mutex");
-            }
+            self.wait(INFINITE)?;
+            let _guard = HeldMutex(self);
+            func()
+        }
 
-            let res = func();
-            unsafe { ReleaseMutex(self.handle) };
-            res
+        fn wait(&self, timeout_ms: u32) -> anyhow::Result<()> {
+            match unsafe { WaitForSingleObject(self.handle, timeout_ms) } {
+                WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(()),
+                WAIT_TIMEOUT => anyhow::bail!("timed out waiting for the WezTerm GUI to start"),
+                _ => Err(IoError::last_os_error()).context("acquire mutex"),
+            }
         }
     }
 
@@ -252,6 +285,27 @@ mod windows {
             .chain(std::iter::once(0))
             .collect()
     }
+
+    #[test]
+    fn startup_guard_holds_the_class_until_ready() {
+        let class = format!("wezterm-test-{}", std::process::id());
+        let guard = GuiStartupGuard::acquire(&class).unwrap();
+        let contender_class = class.clone();
+        std::thread::spawn(move || {
+            let contender =
+                NamedMutex::new(&format!("Local\\wezterm-start-{contender_class}")).unwrap();
+            assert_eq!(
+                unsafe { WaitForSingleObject(contender.handle, 0) },
+                WAIT_TIMEOUT
+            );
+            let _other_class =
+                GuiStartupGuard::acquire(&format!("{contender_class}-other")).unwrap();
+        })
+        .join()
+        .unwrap();
+        drop(guard);
+        let _guard = GuiStartupGuard::acquire(&class).unwrap();
+    }
 }
 
 #[cfg(unix)]
@@ -325,7 +379,10 @@ mod unix {
 }
 
 #[cfg(windows)]
-pub use self::windows::NameHolder;
+pub use self::windows::{GuiStartupGuard, NameHolder};
+
+#[cfg(not(windows))]
+pub struct GuiStartupGuard;
 
 #[cfg(unix)]
 pub use self::unix::NameHolder;
@@ -579,7 +636,10 @@ mod tests {
         let dead_old = make("wezterm-gui.exe-log-111.txt", old);
         let live_old = make("wezterm.exe-log-222.txt", old);
         let dead_new = make("wezterm-gui.exe-log-333.txt", now);
-        let current = make(&format!("wezterm-gui.exe-log-{}.txt", std::process::id()), old);
+        let current = make(
+            &format!("wezterm-gui.exe-log-{}.txt", std::process::id()),
+            old,
+        );
         let other = dir.join("notes.txt");
         std::fs::write(&other, b"x").unwrap();
 

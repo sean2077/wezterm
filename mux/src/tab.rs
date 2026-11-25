@@ -2102,8 +2102,19 @@ impl TabInner {
                 (pane, existing_pane)
             };
 
-            pane1.resize(split_info.first)?;
-            pane2.resize(split_info.second.clone())?;
+            let resized = if request.target_is_second {
+                pane2
+                    .resize(split_info.second)
+                    .and_then(|()| pane1.resize(split_info.first))
+            } else {
+                pane1
+                    .resize(split_info.first)
+                    .and_then(|()| pane2.resize(split_info.second))
+            };
+            if let Err(err) = resized {
+                self.pane.replace(cursor.tree());
+                return Err(err);
+            }
 
             *cursor.leaf_mut().unwrap() = pane1;
 

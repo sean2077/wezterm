@@ -282,6 +282,10 @@ impl SessionHandler {
             send_response(f());
         }
 
+        let workspace_details = matches!(
+            &decoded.pdu,
+            Pdu::SaveWorkspaceDetailed(_) | Pdu::RestoreWorkspaceDetailed(_)
+        );
         match decoded.pdu {
             Pdu::Ping(Ping {}) => send_response(Ok(Pdu::Pong(Pong {}))),
             Pdu::SetWindowWorkspace(SetWindowWorkspace {
@@ -1006,28 +1010,42 @@ impl SessionHandler {
                 .detach();
             }
 
-            Pdu::SaveWorkspace(SaveWorkspace { path }) => {
-                spawn_into_main_thread(async move {
-                    catch(
-                        move || {
-                            let mux = Mux::get();
-                            let path = path
-                                .map(std::path::PathBuf::from)
-                                .unwrap_or_else(mux::session::default_workspace_path);
-                            let summary = mux.save_workspace(&path)?;
-                            Ok(Pdu::SaveWorkspaceResponse(SaveWorkspaceResponse {
-                                path: summary.path.to_string_lossy().to_string(),
+            Pdu::SaveWorkspace(SaveWorkspace { path })
+            | Pdu::SaveWorkspaceDetailed(SaveWorkspaceDetailed { path }) => {
+                promise::spawn::spawn(async move {
+                    let mux = Mux::get();
+                    let path = path
+                        .map(std::path::PathBuf::from)
+                        .unwrap_or_else(mux::session::default_workspace_path);
+                    let result = mux.save_workspace(&path).await;
+                    send_response(result.map(|summary| {
+                        let path = summary.path.to_string_lossy().into_owned();
+                        if workspace_details {
+                            Pdu::SaveWorkspaceDetailedResponse(SaveWorkspaceDetailedResponse {
+                                path,
                                 windows: summary.windows,
                                 tabs: summary.tabs,
-                            }))
-                        },
-                        send_response,
-                    )
+                                panes: summary.panes,
+                                skipped: summary.skipped,
+                            })
+                        } else {
+                            Pdu::SaveWorkspaceResponse(SaveWorkspaceResponse {
+                                path,
+                                windows: summary.windows,
+                                tabs: summary.tabs,
+                            })
+                        }
+                    }));
                 })
                 .detach();
             }
 
             Pdu::RestoreWorkspace(RestoreWorkspace {
+                path,
+                window_id,
+                replace,
+            })
+            | Pdu::RestoreWorkspaceDetailed(RestoreWorkspaceDetailed {
                 path,
                 window_id,
                 replace,
@@ -1038,11 +1056,25 @@ impl SessionHandler {
                         .restore_workspace(std::path::Path::new(&path), window_id, replace)
                         .await;
                     send_response(result.map(|summary| {
-                        Pdu::RestoreWorkspaceResponse(RestoreWorkspaceResponse {
-                            windows: summary.windows,
-                            tabs: summary.tabs,
-                            failed: summary.failed,
-                        })
+                        if workspace_details {
+                            Pdu::RestoreWorkspaceDetailedResponse(
+                                RestoreWorkspaceDetailedResponse {
+                                    windows: summary.windows,
+                                    tabs: summary.tabs,
+                                    failed: summary.failed,
+                                    panes: summary.panes,
+                                    failed_panes: summary.failed_panes,
+                                    replaced: summary.replaced,
+                                    diagnostics: summary.diagnostics,
+                                },
+                            )
+                        } else {
+                            Pdu::RestoreWorkspaceResponse(RestoreWorkspaceResponse {
+                                windows: summary.windows,
+                                tabs: summary.tabs,
+                                failed: summary.failed.max(usize::from(summary.failed_panes > 0)),
+                            })
+                        }
                     }));
                 })
                 .detach();
@@ -1103,6 +1135,8 @@ impl SessionHandler {
             | Pdu::GetClientListResponse { .. }
             | Pdu::SaveWorkspaceResponse { .. }
             | Pdu::RestoreWorkspaceResponse { .. }
+            | Pdu::SaveWorkspaceDetailedResponse { .. }
+            | Pdu::RestoreWorkspaceDetailedResponse { .. }
             | Pdu::CloseAgentSessionsResponse { .. }
             | Pdu::PaneRemoved { .. }
             | Pdu::PaneFocused { .. }

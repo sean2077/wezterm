@@ -1391,6 +1391,16 @@ impl Client {
     rpc!(adjust_pane_size, AdjustPaneSize, UnitResponse);
     rpc!(save_workspace, SaveWorkspace, SaveWorkspaceResponse);
     rpc!(
+        save_workspace_detailed,
+        SaveWorkspaceDetailed,
+        SaveWorkspaceDetailedResponse
+    );
+    rpc!(
+        restore_workspace_detailed,
+        RestoreWorkspaceDetailed,
+        RestoreWorkspaceDetailedResponse
+    );
+    rpc!(
         restore_workspace,
         RestoreWorkspace,
         RestoreWorkspaceResponse

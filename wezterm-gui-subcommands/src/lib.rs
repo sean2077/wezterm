@@ -71,6 +71,16 @@ pub struct StartCommand {
     #[arg(long = "class")]
     pub class: Option<String>,
 
+    /// On Windows, ensure that a native Quake window for --class is running.
+    #[cfg(windows)]
+    #[arg(long, requires = "class", conflicts_with_all = ["always_new_process", "new_tab", "position", "domain", "workspace", "cwd", "prog"])]
+    pub quake_instance: bool,
+
+    /// Show the native Quake window, starting it first if necessary.
+    #[cfg(windows)]
+    #[arg(long, requires = "quake_instance")]
+    pub quake_show: bool,
+
     /// Override the default workspace with the provided name.
     /// The default is "default".
     #[arg(long = "workspace")]
@@ -106,6 +116,31 @@ pub struct StartCommand {
     /// as if it were a login shell. [aliases: -e]
     #[arg(value_parser, value_hint=ValueHint::CommandWithArguments, num_args=1..)]
     pub prog: Vec<OsString>,
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn quake_launch_requires_a_class_and_never_spawns_a_command_in_an_existing_instance() {
+    assert!(StartCommand::try_parse_from(["start", "--quake-show"]).is_err());
+    assert!(StartCommand::try_parse_from(["start", "--quake-instance"]).is_err());
+    assert!(StartCommand::try_parse_from([
+        "start",
+        "--class",
+        "quake",
+        "--quake-instance",
+        "--",
+        "cmd.exe",
+    ])
+    .is_err());
+    let args = StartCommand::try_parse_from([
+        "start",
+        "--class",
+        "quake",
+        "--quake-instance",
+        "--quake-show",
+    ])
+    .unwrap();
+    assert!(args.quake_instance && args.quake_show);
 }
 
 #[derive(Debug, Parser, Clone)]

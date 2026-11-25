@@ -123,38 +123,39 @@ impl GuiFrontEnd {
                     if let Some((_domain, window_id, tab_id)) = mux.resolve_pane_id(pane_id) {
                         let config = config::configuration();
 
-                        if let Some((_fdomain, f_window, f_tab, f_pane)) =
-                            mux.resolve_focused_pane(&client_id)
-                        {
-                            let show = match config.notification_handling {
-                                NotificationHandling::NeverShow => false,
-                                NotificationHandling::AlwaysShow => true,
-                                NotificationHandling::SuppressFromFocusedPane => f_pane != pane_id,
-                                NotificationHandling::SuppressFromFocusedTab => f_tab != tab_id,
-                                NotificationHandling::SuppressFromFocusedWindow => {
-                                    f_window != window_id
-                                }
-                            };
-
-                            if show {
-                                let message = if title.is_none() { "" } else { &body };
-                                let title = title.as_ref().unwrap_or(&body);
-                                #[cfg(all(unix, not(target_os = "macos")))]
-                                if _focus {
-                                    persistent_toast_notification_with_click_action(
-                                        title,
-                                        message,
-                                        move |token| {
-                                            promise::spawn::spawn_into_main_thread(
-                                                Self::activate_notification_pane(pane_id, token),
-                                            )
-                                            .detach();
-                                        },
-                                    );
-                                    return true;
-                                }
-                                persistent_toast_notification(title, message);
+                        let focused = mux.resolve_focused_pane(&client_id);
+                        let show = match config.notification_handling {
+                            NotificationHandling::NeverShow => false,
+                            NotificationHandling::AlwaysShow => true,
+                            NotificationHandling::SuppressFromFocusedPane => {
+                                focused.is_none_or(|(_, _, _, focused)| focused != pane_id)
                             }
+                            NotificationHandling::SuppressFromFocusedTab => {
+                                focused.is_none_or(|(_, _, focused, _)| focused != tab_id)
+                            }
+                            NotificationHandling::SuppressFromFocusedWindow => {
+                                focused.is_none_or(|(_, focused, _, _)| focused != window_id)
+                            }
+                        };
+
+                        if show {
+                            let message = if title.is_none() { "" } else { &body };
+                            let title = title.as_ref().unwrap_or(&body);
+                            #[cfg(all(unix, not(target_os = "macos")))]
+                            if _focus {
+                                persistent_toast_notification_with_click_action(
+                                    title,
+                                    message,
+                                    move |token| {
+                                        promise::spawn::spawn_into_main_thread(
+                                            Self::activate_notification_pane(pane_id, token),
+                                        )
+                                        .detach();
+                                    },
+                                );
+                                return true;
+                            }
+                            persistent_toast_notification(title, message);
                         }
                     }
                 }
@@ -493,7 +494,7 @@ impl GuiFrontEnd {
         let Some(mux) = Mux::try_get() else {
             return;
         };
-        let Some((_, window_id, _)) = mux.resolve_pane_id(pane_id) else {
+        let Some((_, window_id, tab_id)) = mux.resolve_pane_id(pane_id) else {
             return;
         };
         let Some(workspace) = mux
@@ -502,6 +503,14 @@ impl GuiFrontEnd {
         else {
             return;
         };
+        if let Some(tab) = mux.get_tab(tab_id) {
+            if tab
+                .get_zoomed_pane()
+                .is_some_and(|pane| pane.pane_id() != pane_id)
+            {
+                tab.toggle_zoom();
+            }
+        }
         if let Err(err) = mux.focus_pane_and_containing_tab(pane_id) {
             log::debug!("Cannot activate notification pane: {err:#}");
             return;

@@ -492,30 +492,47 @@ impl ComputedElement {
     }
 
     pub fn ui_items(&self) -> Vec<UIItem> {
+        self.ui_items_with_hover(|_| false)
+    }
+
+    pub fn ui_items_with_hover(&self, is_hovered: impl Fn(&Self) -> bool) -> Vec<UIItem> {
         let mut items = vec![];
-        self.ui_item_impl(&mut items);
+        self.ui_item_impl(&mut items, self.bounds, &is_hovered);
         items
     }
 
-    fn ui_item_impl(&self, items: &mut Vec<UIItem>) {
+    fn ui_item_impl(
+        &self,
+        items: &mut Vec<UIItem>,
+        clip: RectF,
+        is_hovered: &dyn Fn(&Self) -> bool,
+    ) {
+        let Some(visible) = self.bounds.intersection(&clip) else {
+            return;
+        };
         if let Some(item_type) = &self.item_type {
-            items.push(UIItem {
-                x: self.bounds.min_x().max(0.) as usize,
-                y: self.bounds.min_y().max(0.) as usize,
-                width: self.bounds.width().max(0.) as usize,
-                height: self.bounds.height().max(0.) as usize,
-                item_type: item_type.clone(),
-            });
+            let x = visible.min_x().max(0.) as usize;
+            let y = visible.min_y().max(0.) as usize;
+            let width = (visible.max_x().max(0.) as usize).saturating_sub(x);
+            let height = (visible.max_y().max(0.) as usize).saturating_sub(y);
+            if width > 0 && height > 0 {
+                items.push(UIItem {
+                    x,
+                    y,
+                    width,
+                    height,
+                    item_type: item_type.clone(),
+                });
+            }
         }
 
-        match &self.content {
-            ComputedElementContent::Text(_) => {}
-            ComputedElementContent::Children(kids) => {
-                for kid in kids {
-                    kid.ui_item_impl(items);
+        if let ComputedElementContent::Children(kids) = &self.content {
+            let parent_hovered = self.hover_colors.is_some() && is_hovered(self);
+            for kid in kids {
+                if !kid.reveal_on_parent_hover || parent_hovered {
+                    kid.ui_item_impl(items, visible, is_hovered);
                 }
             }
-            ComputedElementContent::Poly { .. } => {}
         }
     }
 }
@@ -638,7 +655,8 @@ impl super::TermWindow {
             }
             None => context.bounds.width() - border_and_padding_width,
         }
-        .min((context.width.pixel_max - context.bounds.min_x()) - border_and_padding_width);
+        .min((context.width.pixel_max - context.bounds.min_x()) - border_and_padding_width)
+        .max(0.);
 
         match &element.content {
             ElementContent::Text(s) => {
@@ -667,7 +685,7 @@ impl super::TermWindow {
                         .next()
                         .ok_or_else(|| anyhow!("info.cluster didn't map into string"))?;
                     if let Some(key) = BlockKey::from_str(grapheme) {
-                        if pixel_width + context.width.pixel_cell >= max_x {
+                        if x_pos + context.width.pixel_cell > max_x {
                             break;
                         }
                         pixel_width += context.width.pixel_cell;
@@ -690,10 +708,10 @@ impl super::TermWindow {
                         if let Some(texture) = glyph.texture.as_ref() {
                             let x_pos = x_pos + (glyph.x_offset + glyph.bearing_x).get() as f32;
                             let width = texture.coords.size.width as f32 * glyph.scale as f32;
-                            if x_pos + width >= max_x {
+                            if x_pos + width > max_x {
                                 break;
                             }
-                        } else if x_pos + glyph.x_advance.get() as f32 >= max_x {
+                        } else if x_pos + glyph.x_advance.get() as f32 > max_x {
                             break;
                         }
 
@@ -752,14 +770,14 @@ impl super::TermWindow {
                         Float::None => euclid::rect(
                             block_pixel_width,
                             y_coord,
-                            context.bounds.max_x() - (context.bounds.min_x() + block_pixel_width),
-                            context.bounds.max_y() - (context.bounds.min_y() + y_coord),
+                            (max_width - block_pixel_width).max(0.),
+                            (context.bounds.height() - y_coord).max(0.),
                         ),
                         Float::Right => euclid::rect(
                             0.,
                             y_coord,
-                            context.bounds.width(),
-                            context.bounds.max_y() - (context.bounds.min_y() + y_coord),
+                            (max_width - float_width).max(0.),
+                            (context.bounds.height() - y_coord).max(0.),
                         ),
                     };
                     let kid = self.compute_element(
@@ -771,7 +789,11 @@ impl super::TermWindow {
                             width: DimensionContext {
                                 dpi: context.width.dpi,
                                 pixel_cell: context.width.pixel_cell,
-                                pixel_max: max_width,
+                                pixel_max: if child.float == Float::Right {
+                                    bounds.width()
+                                } else {
+                                    max_width
+                                },
                             },
                             zindex: context.zindex + element.zindex,
                         },
@@ -779,7 +801,7 @@ impl super::TermWindow {
                     )?;
                     match child.float {
                         Float::Right => {
-                            float_width += float_width.max(kid.bounds.width());
+                            float_width += kid.bounds.width();
                         }
                         Float::None => {
                             block_pixel_width += kid.bounds.width();
@@ -1006,9 +1028,9 @@ impl super::TermWindow {
                 let mouse_x = event.coords.x as f32;
                 let mouse_y = event.coords.y as f32;
                 mouse_x >= element.bounds.min_x()
-                    && mouse_x <= element.bounds.max_x()
+                    && mouse_x < element.bounds.max_x()
                     && mouse_y >= element.bounds.min_y()
-                    && mouse_y <= element.bounds.max_y()
+                    && mouse_y < element.bounds.max_y()
             }
             None => false,
         };
@@ -1362,5 +1384,61 @@ mod paint_overflow_tests {
     fn a_whole_cell_past_the_box_still_overflows() {
         assert!(paint_overflows(100., 10., 105.));
         assert!(!paint_overflows(100., 10., 110.));
+    }
+}
+
+#[cfg(test)]
+mod hit_tests {
+    use super::*;
+    use crate::tabbar::TabBarItem;
+
+    fn element(bounds: RectF, item_type: UIItemType) -> ComputedElement {
+        let colors = ElementColors {
+            border: BorderColor::default(),
+            bg: InheritableColor::Inherited,
+            text: InheritableColor::Inherited,
+        };
+        ComputedElement {
+            item_type: Some(item_type),
+            zindex: 0,
+            bounds,
+            border_rect: bounds,
+            border: PixelDimension {
+                top: 0.,
+                left: 0.,
+                right: 0.,
+                bottom: 0.,
+            },
+            border_corners: None,
+            hover_colors: Some(colors.clone()),
+            colors,
+            hover_overlay: None,
+            reveal_on_parent_hover: false,
+            padding: bounds,
+            content_rect: bounds,
+            baseline: 0.,
+            content: ComputedElementContent::Text(vec![]),
+        }
+    }
+
+    #[test]
+    fn close_button_hit_area_follows_parent_hover_and_bounds() {
+        let mut tab = element(
+            euclid::rect(20., 0., 14., 20.),
+            UIItemType::TabBar(TabBarItem::Tab {
+                tab_idx: 1,
+                active: false,
+            }),
+        );
+        let mut close = element(euclid::rect(12., 1., 13., 12.), UIItemType::CloseTab(1));
+        close.reveal_on_parent_hover = true;
+        tab.content = ComputedElementContent::Children(vec![close]);
+        assert_eq!(tab.ui_items().len(), 1);
+        let items = tab.ui_items_with_hover(|_| true);
+        let close = &items[1];
+        assert_eq!(close.item_type, UIItemType::CloseTab(1));
+        assert!(close.hit_test(20, 2));
+        assert!(!close.hit_test(19, 2));
+        assert!(!close.hit_test(25, 2));
     }
 }

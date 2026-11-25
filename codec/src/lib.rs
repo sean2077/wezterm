@@ -442,7 +442,9 @@ macro_rules! pdu {
 /// The overall version of the codec.
 /// This must be bumped when backwards incompatible changes
 /// are made to the types and protocol.
-pub const CODEC_VERSION: usize = 48;
+pub const CODEC_VERSION: usize = 49;
+/// Workspace CLI requests and replies carrying pane counts were added here.
+pub const WORKSPACE_DETAILS_CODEC_VERSION: usize = 49;
 
 // Defines the Pdu enum.
 // Each struct has an explicit identifying number.
@@ -510,6 +512,10 @@ pdu! {
     CloseAgentSessions: 67,
     CloseAgentSessionsResponse: 68,
     SetUserVar: 69,
+    SaveWorkspaceDetailed: 70,
+    SaveWorkspaceDetailedResponse: 71,
+    RestoreWorkspaceDetailed: 72,
+    RestoreWorkspaceDetailedResponse: 73,
 }
 
 impl Pdu {
@@ -636,6 +642,38 @@ pub struct RestoreWorkspaceResponse {
     pub windows: usize,
     pub tabs: usize,
     pub failed: usize,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct SaveWorkspaceDetailed {
+    pub path: Option<String>,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct SaveWorkspaceDetailedResponse {
+    pub path: String,
+    pub windows: usize,
+    pub tabs: usize,
+    pub panes: usize,
+    pub skipped: usize,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct RestoreWorkspaceDetailed {
+    pub path: String,
+    pub window_id: Option<WindowId>,
+    pub replace: bool,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct RestoreWorkspaceDetailedResponse {
+    pub windows: usize,
+    pub tabs: usize,
+    pub failed: usize,
+    pub panes: usize,
+    pub failed_panes: usize,
+    pub replaced: bool,
+    pub diagnostics: Vec<String>,
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Debug)]

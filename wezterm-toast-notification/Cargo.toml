@@ -13,6 +13,7 @@ log.workspace = true
 wezterm-open-url.workspace = true
 
 [target.'cfg(all(not(windows), not(target_os="macos")))'.dependencies]
+async-channel.workspace = true
 async-io.workspace = true
 futures-util.workspace = true
 zbus.workspace = true

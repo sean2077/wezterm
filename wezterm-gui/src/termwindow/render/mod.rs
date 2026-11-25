@@ -95,6 +95,7 @@ pub struct LineToElementParams<'a> {
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
 pub struct LineToEleShapeCacheKey {
     pub shape_hash: [u8; 16],
+    pub reverse_video: bool,
     pub composing: Option<(usize, String)>,
     pub shape_generation: usize,
 }
@@ -112,6 +113,7 @@ pub struct LineToElementShape {
     pub underline_tex_rect: TextureRect,
     pub fg_color: LinearRgba,
     pub bg_color: LinearRgba,
+    pub bg_is_default: bool,
     pub underline_color: LinearRgba,
     pub x_pos: f32,
     pub pixel_width: f32,
@@ -219,10 +221,11 @@ pub struct ClusterStyleCache<'a> {
     /// The accent rule state (underline, foreground) applied to this
     /// cluster, so a neighbouring cluster with equal attrs but a different
     /// hyperlink accent is not served from this cache entry.
-    accent: (bool, Option<LinearRgba>),
+    accent: (Option<bool>, Option<LinearRgba>),
     underline_tex_rect: TextureRect,
     fg_color: LinearRgba,
     bg_color: LinearRgba,
+    bg_is_default: bool,
     underline_color: LinearRgba,
 }
 

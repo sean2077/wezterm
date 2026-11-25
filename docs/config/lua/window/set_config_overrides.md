@@ -11,11 +11,7 @@ This can be used to override configuration on a per-window basis;
 this is only useful for options that apply to the GUI window, such
 as rendering the GUI.
 
-Each call to `window:set_config_overrides` will emit the
-[window-config-reloaded](../window-events/window-config-reloaded.md) event for
-the window.  If you are calling this method from inside the handler
-for `window-config-reloaded` you should take care to only call `window:set_config_overrides`
-if the actual override values have changed to avoid a loop.
+A change to the effective override values emits the [window-config-reloaded](../window-events/window-config-reloaded.md) event for the window. If the override values fail validation, WezTerm logs the error and keeps the previous values.
 
 In this example, a key assignment (`CTRL-SHIFT-E`) is used to toggle the use of
 ligatures in the current window:
@@ -115,3 +111,17 @@ return {
 }
 ```
 
+
+
+## Merging and clearing overrides
+
+The fork also provides `window:update_config_overrides(updates, clear)`. Pass a table of keys to set and an optional list of keys to clear. WezTerm clears the listed keys first, then sets the new values, validates the complete result, and reloads the window configuration once if the result changed. Keys absent from both arguments keep their existing override values.
+
+```lua
+window:update_config_overrides(
+  { enable_tab_bar = false },
+  { 'background' }
+)
+```
+
+`window:set_config_override(key, value)` and `window:clear_config_override(key)` apply the same rules to a single key.

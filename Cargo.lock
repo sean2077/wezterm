@@ -7367,6 +7367,7 @@ dependencies = [
 name = "wezterm-toast-notification"
 version = "0.1.0"
 dependencies = [
+ "async-channel",
  "async-io",
  "block2",
  "futures-util",

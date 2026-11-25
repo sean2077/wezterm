@@ -14,9 +14,105 @@ use std::sync::{LazyLock, Mutex};
 use wezterm_input_types::{KeyCode, Modifiers};
 use winapi::shared::minwindef::*;
 use winapi::shared::windef::*;
+use winapi::um::winnt::HANDLE;
 use winapi::um::winuser::*;
 
 const QUAKE_HOTKEY_ID: i32 = 1;
+
+pub(super) static SHOW_QUAKE_MESSAGE: LazyLock<UINT> = LazyLock::new(|| unsafe {
+    RegisterWindowMessageW(super::wide_string("org.wezfurlong.wezterm.quake.show").as_ptr())
+});
+static QUAKE_PROPERTY: LazyLock<Vec<u16>> =
+    LazyLock::new(|| super::wide_string("org.wezfurlong.wezterm.quake.instance"));
+
+pub(super) fn clear_instance(hwnd: HWND) {
+    unsafe { RemovePropW(hwnd, QUAKE_PROPERTY.as_ptr()) };
+}
+
+fn instance_window(class: &str) -> HWND {
+    let class = super::wide_string(class);
+    let mut previous = std::ptr::null_mut();
+    let mut legacy = std::ptr::null_mut();
+    unsafe {
+        loop {
+            let hwnd = FindWindowExW(
+                std::ptr::null_mut(),
+                previous,
+                class.as_ptr(),
+                std::ptr::null(),
+            );
+            if hwnd.is_null() {
+                return legacy;
+            }
+            if !GetPropW(hwnd, QUAKE_PROPERTY.as_ptr()).is_null() {
+                return hwnd;
+            }
+            // Earlier builds used the tool-window style after registering F3.
+            // Deduplicate against those builds while their windows are still open.
+            if legacy.is_null()
+                && GetWindowLongW(hwnd, GWL_EXSTYLE) as DWORD & WS_EX_TOOLWINDOW != 0
+            {
+                legacy = hwnd;
+            }
+            previous = hwnd;
+        }
+    }
+}
+
+/// Has this instance's explicit Quake class already created a window?
+/// Optionally ask the owner to reveal it using the regular Quake placement code.
+pub(super) fn find_instance(class: &str, show: bool) -> anyhow::Result<bool> {
+    let hwnd = instance_window(class);
+    if hwnd.is_null() || !show {
+        return Ok(!hwnd.is_null());
+    }
+
+    let message = *SHOW_QUAKE_MESSAGE;
+    anyhow::ensure!(message != 0, "could not register the Quake show message");
+    unsafe {
+        let mut pid = 0;
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        if pid != 0 {
+            AllowSetForegroundWindow(pid);
+        }
+        let mut handled = 0;
+        anyhow::ensure!(
+            SendMessageTimeoutW(hwnd, message, 0, 0, SMTO_ABORTIFHUNG, 2000, &mut handled) != 0,
+            "the existing Quake window did not respond"
+        );
+        match handled {
+            0 => {
+                // A Quake build from before the show message can still own the class.
+                anyhow::ensure!(
+                    ShowWindowAsync(hwnd, SW_SHOW) != 0,
+                    "could not show the older Quake window"
+                );
+                SetForegroundWindow(hwnd);
+            }
+            1 => {}
+            _ => anyhow::bail!("the existing Quake window could not apply its configured bounds"),
+        }
+    }
+    Ok(true)
+}
+
+pub(super) fn show_instance(hwnd: HWND) -> Option<LRESULT> {
+    let inner = rc_from_hwnd(hwnd)?;
+    let (config, fullscreen) = {
+        let inner = inner.borrow();
+        if !inner.config.quake.enabled {
+            return None;
+        }
+        (inner.config.quake.clone(), inner.quake.fullscreen)
+    };
+    match show_quake(hwnd, &config, fullscreen) {
+        Ok(()) => Some(1),
+        Err(err) => {
+            log::error!("quake: {err}");
+            Some(2)
+        }
+    }
+}
 
 /// Windows (by HWND) that currently own the global quake hotkey.  The
 /// registration itself is per-window, so the "available" answer must be too:
@@ -71,6 +167,11 @@ struct Bounds {
 /// the tool-window style in sync. Safe to call with `WindowInner` borrowed:
 /// it never calls a function that can synchronously re-enter the window proc.
 pub(super) fn sync_hotkey(inner: &mut WindowInner) {
+    if inner.config.quake.enabled {
+        unsafe { SetPropW(inner.hwnd.0, QUAKE_PROPERTY.as_ptr(), 1 as HANDLE) };
+    } else {
+        clear_instance(inner.hwnd.0);
+    }
     if inner.quake.config_fullscreen != inner.config.quake.fullscreen {
         inner.quake.config_fullscreen = inner.config.quake.fullscreen;
         inner.quake.fullscreen = inner.config.quake.fullscreen;

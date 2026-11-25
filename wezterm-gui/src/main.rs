@@ -175,7 +175,7 @@ async fn async_run_ssh(opts: SshCommand) -> anyhow::Result<()> {
     mux.set_default_domain(&domain);
 
     let should_publish = false;
-    async_run_terminal_gui(cmd, start_command, should_publish).await
+    async_run_terminal_gui(cmd, start_command, should_publish, None).await
 }
 
 fn run_ssh(opts: SshCommand) -> anyhow::Result<()> {
@@ -226,7 +226,7 @@ async fn async_run_serial(opts: SerialCommand) -> anyhow::Result<()> {
     mux.add_domain(&domain);
 
     let should_publish = false;
-    async_run_terminal_gui(cmd, start_command, should_publish).await
+    async_run_terminal_gui(cmd, start_command, should_publish, None).await
 }
 
 fn run_serial(config: config::ConfigHandle, opts: SerialCommand) -> anyhow::Result<()> {
@@ -409,6 +409,7 @@ async fn async_run_terminal_gui(
     cmd: Option<CommandBuilder>,
     opts: StartCommand,
     should_publish: bool,
+    startup_guard: Option<wezterm_client::discovery::GuiStartupGuard>,
 ) -> anyhow::Result<()> {
     // Instances that crash or are killed skip the remove_file below and leave
     // their gui-sock-* marker behind forever. Prune them when a new GUI starts:
@@ -432,6 +433,18 @@ async fn async_run_terminal_gui(
     if let Err(err) = spawn_mux_server(unix_socket_path, should_publish) {
         log::warn!("{:#}", err);
     }
+
+    // A normal GUI can receive work once its socket is published. Quake uses
+    // its native window as the rendezvous point, so wait for that below.
+    #[cfg(windows)]
+    let quake_startup_guard = if opts.quake_instance {
+        startup_guard
+    } else {
+        drop(startup_guard);
+        None
+    };
+    #[cfg(not(windows))]
+    let _ = startup_guard;
 
     if !opts.no_auto_connect {
         connect_to_auto_connect_domains().await?;
@@ -502,7 +515,21 @@ async fn async_run_terminal_gui(
             trigger_and_log_gui_attached(MuxDomain(domain.domain_id())).await;
         }
     }
-    spawn_tab_in_domain_if_mux_is_empty(cmd, is_connecting, domain, opts.workspace).await
+    spawn_tab_in_domain_if_mux_is_empty(cmd, is_connecting, domain, opts.workspace).await?;
+
+    #[cfg(windows)]
+    if let Some(_guard) = quake_startup_guard {
+        let class = crate::termwindow::get_window_class();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !::window::find_quake_instance(&class, opts.quake_show)? {
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "Quake window did not start"
+            );
+            smol::Timer::after(std::time::Duration::from_millis(25)).await;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -667,23 +694,28 @@ fn spawn_mux_server(unix_socket_path: PathBuf, should_publish: bool) -> anyhow::
             socket_path: Some(unix_socket_path.clone()),
             ..Default::default()
         })?;
+    let (ready, published) = std::sync::mpsc::sync_channel(0);
     std::thread::spawn(move || {
-        let name_holder;
-        if should_publish {
-            name_holder = wezterm_client::discovery::publish_gui_sock_path(
+        let name_holder = should_publish.then(|| {
+            wezterm_client::discovery::publish_gui_sock_path(
                 &unix_socket_path,
                 &crate::termwindow::get_window_class(),
-            );
-            if let Err(err) = &name_holder {
-                log::warn!("{:#}", err);
-            }
-        }
+            )
+        });
+        let result = match &name_holder {
+            Some(Err(err)) => Err(anyhow!("publishing the GUI socket: {err:#}")),
+            _ => Ok(()),
+        };
+        let _ = ready.send(result);
 
         listener.run();
+        drop(name_holder);
         std::fs::remove_file(unix_socket_path).ok();
     });
 
-    Ok(())
+    published
+        .recv()
+        .context("waiting for GUI socket publication")?
 }
 
 fn setup_mux(
@@ -766,6 +798,43 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
         opts.workspace.as_deref(),
     )?;
 
+    #[cfg(windows)]
+    let startup_guard = {
+        use wezterm_client::discovery::GuiStartupGuard;
+
+        let class = crate::termwindow::get_window_class();
+        if opts.quake_instance {
+            anyhow::ensure!(
+                !opts.always_new_process,
+                "Quake instance reuse requires start"
+            );
+            anyhow::ensure!(
+                config.quake.enabled,
+                "--quake-instance requires quake.enabled"
+            );
+            anyhow::ensure!(
+                !class.eq_ignore_ascii_case(wezterm_gui_subcommands::DEFAULT_WINDOW_CLASS),
+                "--quake-instance requires a dedicated window class"
+            );
+            let guard = GuiStartupGuard::acquire(&class)?;
+            if ::window::find_quake_instance(&class, opts.quake_show)? {
+                return Ok(());
+            }
+            Some(guard)
+        } else if !opts.always_new_process
+            && opts.position.is_none()
+            && !config::is_config_overridden()
+            && mux.default_domain().domain_name()
+                == config.default_domain.as_deref().unwrap_or("local")
+        {
+            Some(GuiStartupGuard::acquire(&class)?)
+        } else {
+            None
+        }
+    };
+    #[cfg(not(windows))]
+    let startup_guard = None;
+
     // First, let's see if we can ask an already running wezterm to do this.
     // We must do this before we start the gui frontend as the scheduler
     // requirements are different.
@@ -774,6 +843,10 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
         &config,
         opts.always_new_process || opts.position.is_some(),
     );
+    #[cfg(windows)]
+    if opts.quake_instance {
+        publish = Publish::NoConnectNoPublish;
+    }
     log::trace!("{:?}", publish);
     if publish.try_spawn(
         cmd.clone(),
@@ -792,7 +865,9 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
     let activity = Activity::new();
 
     promise::spawn::spawn(async move {
-        if let Err(err) = async_run_terminal_gui(cmd, opts, publish.should_publish()).await {
+        if let Err(err) =
+            async_run_terminal_gui(cmd, opts, publish.should_publish(), startup_guard).await
+        {
             terminate_with_error(err);
         }
         drop(activity);
@@ -1279,9 +1354,7 @@ fn run() -> anyhow::Result<()> {
                 new_tab: connect.new_tab,
                 always_new_process: true,
                 attach: true,
-                _cmd: false,
-                no_auto_connect: false,
-                cwd: None,
+                ..StartCommand::default()
             },
             Some(connect.domain_name),
         ),

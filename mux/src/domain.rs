@@ -44,6 +44,11 @@ pub enum SplitSource {
         command: Option<CommandBuilder>,
         command_dir: Option<String>,
     },
+    Restore {
+        command: Option<CommandBuilder>,
+        command_dir: Option<String>,
+        skip_domain_fixup: bool,
+    },
     MovePane(PaneId),
 }
 
@@ -62,14 +67,19 @@ pub trait Domain: Downcast + Send + Sync {
             .await
             .context("spawn")?;
 
-        let tab = Arc::new(Tab::new(&size));
-        tab.assign_pane(&pane);
+        add_pane_as_tab(size, &pane, window)
+    }
 
-        let mux = Mux::get();
-        mux.add_tab_and_active_pane(&tab)?;
-        mux.add_tab_to_window(&tab, window)?;
-
-        Ok(tab)
+    /// A workspace restore needs the real spawn result. Normal local spawn
+    /// deliberately presents process errors in a terminal pane.
+    async fn spawn_pane_for_restore(
+        &self,
+        _size: TerminalSize,
+        _command: Option<CommandBuilder>,
+        _command_dir: Option<String>,
+        _skip_domain_fixup: bool,
+    ) -> anyhow::Result<Arc<dyn Pane>> {
+        bail!("domain '{}' cannot restore local panes", self.domain_name());
     }
 
     async fn split_pane(
@@ -99,6 +109,7 @@ pub trait Domain: Downcast + Send + Sync {
             None => anyhow::bail!("invalid pane index {}", pane_index),
         };
 
+        let restoring = matches!(&source, SplitSource::Restore { .. });
         let pane = match source {
             SplitSource::Spawn {
                 command,
@@ -106,6 +117,19 @@ pub trait Domain: Downcast + Send + Sync {
             } => {
                 self.spawn_pane(split_size.second, command, command_dir)
                     .await?
+            }
+            SplitSource::Restore {
+                command,
+                command_dir,
+                skip_domain_fixup,
+            } => {
+                self.spawn_pane_for_restore(
+                    split_size.second,
+                    command,
+                    command_dir,
+                    skip_domain_fixup,
+                )
+                .await?
             }
             SplitSource::MovePane(src_pane_id) => {
                 let (_domain, _window, src_tab) = mux
@@ -129,16 +153,20 @@ pub trait Domain: Downcast + Send + Sync {
         };
 
         // pane_index may have changed if src_pane was also in the same tab
-        let final_pane_index = match tab
-            .iter_panes_ignoring_zoom()
-            .iter()
-            .find(|p| p.pane.pane_id() == pane_id)
-        {
-            Some(p) => p.index,
-            None => anyhow::bail!("invalid pane id {}", pane_id),
-        };
-
-        tab.split_and_insert(final_pane_index, split_request, Arc::clone(&pane))?;
+        let result: anyhow::Result<()> = (|| {
+            let final_pane_index = tab
+                .iter_panes_ignoring_zoom()
+                .iter()
+                .find(|p| p.pane.pane_id() == pane_id)
+                .map(|p| p.index)
+                .ok_or_else(|| anyhow::anyhow!("invalid pane id {}", pane_id))?;
+            tab.split_and_insert(final_pane_index, split_request, Arc::clone(&pane))?;
+            Ok(())
+        })();
+        if result.is_err() && restoring {
+            mux.remove_pane(pane.pane_id());
+        }
+        result?;
         Ok(pane)
     }
 
@@ -199,6 +227,23 @@ pub trait Domain: Downcast + Send + Sync {
     fn state(&self) -> DomainState;
 }
 impl_downcast!(Domain);
+
+pub(crate) fn add_pane_as_tab(
+    size: TerminalSize,
+    pane: &Arc<dyn Pane>,
+    window: WindowId,
+) -> anyhow::Result<Arc<Tab>> {
+    let tab = Arc::new(Tab::new(&size));
+    tab.assign_pane(pane);
+
+    let mux = Mux::get();
+    mux.add_tab_and_active_pane(&tab)?;
+    if let Err(err) = mux.add_tab_to_window(&tab, window) {
+        mux.remove_tab(tab.tab_id());
+        return Err(err);
+    }
+    Ok(tab)
+}
 
 pub struct LocalDomain {
     pty_system: Mutex<Box<dyn PtySystem + Send>>,
@@ -427,27 +472,13 @@ impl LocalDomain {
             }
             cmd.clear_cwd();
             log::trace!("made: {cmd:#?}");
-        } else if let Some(dir) = cmd.get_cwd() {
-            // I'm not normally a fan of existence checking, but not checking here
-            // can be painful; in the case where a tab is local but has connected
-            // to a remote system and that remote has used OSC 7 to set a path
-            // that doesn't exist on the local system, process spawning can fail.
-            // Another situation is `sudo -i` has the pane with set to a cwd
-            // that is not accessible to the user.
-            if let Err(err) = Path::new(&dir).read_dir() {
-                log::warn!(
-                    "Directory {:?} is not readable and will not be \
-                     used for the command we are spawning: {:#}",
-                    dir,
-                    err
-                );
-                cmd.clear_cwd();
-            }
+        } else {
+            validate_local_cwd(cmd);
         }
         Ok(())
     }
 
-    async fn build_command(
+    fn build_command(
         &self,
         command: Option<CommandBuilder>,
         command_dir: Option<String>,
@@ -484,8 +515,27 @@ impl LocalDomain {
         if let Some(agent) = Mux::get().agent.as_ref() {
             cmd.env("SSH_AUTH_SOCK", agent.path());
         }
-        self.fixup_command(&mut cmd).await?;
         Ok(cmd)
+    }
+}
+
+fn validate_local_cwd(cmd: &mut CommandBuilder) {
+    if let Some(dir) = cmd.get_cwd() {
+        // I'm not normally a fan of existence checking, but not checking here
+        // can be painful; in the case where a tab is local but has connected
+        // to a remote system and that remote has used OSC 7 to set a path
+        // that doesn't exist on the local system, process spawning can fail.
+        // Another situation is `sudo -i` has the pane with set to a cwd
+        // that is not accessible to the user.
+        if let Err(err) = Path::new(&dir).read_dir() {
+            log::warn!(
+                "Directory {:?} is not readable and will not be \
+                     used for the command we are spawning: {:#}",
+                dir,
+                err
+            );
+            cmd.clear_cwd();
+        }
     }
 }
 
@@ -586,19 +636,45 @@ impl portable_pty::ChildKiller for FailedProcessSpawn {
     }
 }
 
-#[async_trait(?Send)]
-impl Domain for LocalDomain {
-    async fn spawn_pane(
+impl LocalDomain {
+    async fn spawn_pane_impl(
         &self,
         size: TerminalSize,
         command: Option<CommandBuilder>,
         command_dir: Option<String>,
+        strict: bool,
+        skip_domain_fixup: bool,
     ) -> anyhow::Result<Arc<dyn Pane>> {
         let pane_id = alloc_pane_id();
-        let cmd = self
+        let mut cmd = self
             .build_command(command, command_dir, pane_id)
-            .await
             .context("build_command")?;
+        let can_restore = {
+            let pty_system = self.pty_system.lock();
+            let pty_system: &dyn PtySystem = &**pty_system;
+            pty_system
+                .downcast_ref::<portable_pty::serial::SerialTty>()
+                .is_none()
+        };
+        let spawn_info = can_restore.then(|| SpawnInfo {
+            argv: cmd
+                .get_argv()
+                .iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect(),
+            cwd: cmd.get_cwd().map(|cwd| cwd.to_string_lossy().into_owned()),
+            env: Default::default(),
+            domain: self.name.clone(),
+            skip_domain_fixup,
+        });
+        if strict && spawn_info.is_none() {
+            bail!("domain '{}' cannot restore local panes", self.name);
+        }
+        if skip_domain_fixup {
+            validate_local_cwd(&mut cmd);
+        } else {
+            self.fixup_command(&mut cmd).await?;
+        }
         let pair = self
             .pty_system
             .lock()
@@ -616,16 +692,10 @@ impl Domain for LocalDomain {
             },
             self.name
         );
-        let spawn_info = Some(SpawnInfo {
-            argv: cmd
-                .get_argv()
-                .iter()
-                .map(|arg| arg.to_string_lossy().into_owned())
-                .collect(),
-            cwd: cmd.get_cwd().map(|cwd| cwd.to_string_lossy().into_owned()),
-            env: Default::default(),
-        });
-        let child_result = pair.slave.spawn_command(cmd);
+        let child_result = match pair.slave.spawn_command(cmd) {
+            Err(err) if strict => return Err(err).context(command_description),
+            result => result,
+        };
         let mut writer = WriterWrapper::new(pair.master.take_writer()?);
 
         let mut terminal = wezterm_term::Terminal::new(
@@ -648,7 +718,7 @@ impl Domain for LocalDomain {
                 Box::new(writer),
                 self.id,
                 command_description,
-                spawn_info.clone(),
+                spawn_info,
             )),
             Err(err) => {
                 // Show the error to the user in the new pane
@@ -674,6 +744,30 @@ impl Domain for LocalDomain {
         mux.add_pane(&pane)?;
 
         Ok(pane)
+    }
+}
+
+#[async_trait(?Send)]
+impl Domain for LocalDomain {
+    async fn spawn_pane(
+        &self,
+        size: TerminalSize,
+        command: Option<CommandBuilder>,
+        command_dir: Option<String>,
+    ) -> anyhow::Result<Arc<dyn Pane>> {
+        self.spawn_pane_impl(size, command, command_dir, false, false)
+            .await
+    }
+
+    async fn spawn_pane_for_restore(
+        &self,
+        size: TerminalSize,
+        command: Option<CommandBuilder>,
+        command_dir: Option<String>,
+        skip_domain_fixup: bool,
+    ) -> anyhow::Result<Arc<dyn Pane>> {
+        self.spawn_pane_impl(size, command, command_dir, true, skip_domain_fixup)
+            .await
     }
 
     fn domain_id(&self) -> DomainId {

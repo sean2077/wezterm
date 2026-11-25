@@ -15,7 +15,7 @@ use crate::scripting::guiwin::GuiWin;
 use crate::scrollbar::*;
 use crate::selection::Selection;
 use crate::shapecache::*;
-use crate::tabbar::{agent_state_epoch, agent_state_is_waiting, TabBarItem, TabBarState};
+use crate::tabbar::{agent_waiting_state, TabBarItem, TabBarState};
 use crate::termwindow::background::{
     load_background_image, reload_background_image, LoadedBackgroundLayer,
 };
@@ -137,12 +137,9 @@ pub enum TermWindowNotif {
     },
     GetConfigOverrides(Sender<wezterm_dynamic::Value>),
     SetConfigOverrides(wezterm_dynamic::Value),
-    SetConfigOverride {
-        key: String,
-        value: wezterm_dynamic::Value,
-    },
-    ClearConfigOverride {
-        key: String,
+    UpdateConfigOverrides {
+        values: wezterm_dynamic::Object,
+        clear: Vec<String>,
     },
     CancelOverlayForPane(PaneId),
     CancelOverlayForTab {
@@ -150,7 +147,7 @@ pub enum TermWindowNotif {
         pane_id: Option<PaneId>,
     },
     MuxNotification(MuxNotification),
-    EmitStatusUpdate,
+    EmitStatusUpdate(Instant),
     Apply(Box<dyn FnOnce(&mut TermWindow) + Send + Sync>),
     SwitchToMuxWindow(MuxWindowId),
     SetInnerSize {
@@ -181,9 +178,9 @@ pub struct UIItem {
 impl UIItem {
     pub fn hit_test(&self, x: isize, y: isize) -> bool {
         x >= self.x as isize
-            && x <= (self.x + self.width) as isize
+            && x < (self.x + self.width) as isize
             && y >= self.y as isize
-            && y <= (self.y + self.height) as isize
+            && y < (self.y + self.height) as isize
     }
 }
 
@@ -404,6 +401,7 @@ pub struct TermWindow {
     show_scroll_bar: bool,
     tab_bar: TabBarState,
     fancy_tab_bar: Option<box_model::ComputedElement>,
+    fancy_status_widths: RefCell<Option<render::fancy_tab_bar::StatusWidthCache>>,
     pub right_status: String,
     pub left_status: String,
     last_ui_item: Option<UIItem>,
@@ -444,13 +442,13 @@ pub struct TermWindow {
 
     line_quad_cache: RefCell<LfuCache<LineQuadCacheKey, LineQuadCacheValue>>,
 
-    last_status_call: Instant,
+    status_timer: Option<(Instant, promise::spawn::Task<()>)>,
     /// Wall-clock expiry of the earliest waiting agent state.  The timer armed
     /// for it rebuilds the tab bar even while the window is unfocused, unlike
     /// the animation-frame scheduling, which only runs when focused.  Stored
     /// as SystemTime so repeated title updates see the same value and do not
     /// re-arm the timer every time.
-    waiting_expiry_timer: Option<SystemTime>,
+    waiting_expiry_timer: Option<(SystemTime, promise::spawn::Task<()>)>,
     cursor_blink_state: RefCell<ColorEase>,
     blink_state: RefCell<ColorEase>,
     rapid_blink_state: RefCell<ColorEase>,
@@ -732,6 +730,7 @@ impl TermWindow {
             show_scroll_bar: config.enable_scroll_bar,
             tab_bar: TabBarState::default(),
             fancy_tab_bar: None,
+            fancy_status_widths: RefCell::new(None),
             right_status: String::new(),
             left_status: String::new(),
             last_mouse_coords: (0, -1),
@@ -773,7 +772,7 @@ impl TermWindow {
                 |config| config.line_to_ele_shape_cache_size,
                 &config,
             )),
-            last_status_call: Instant::now(),
+            status_timer: None,
             waiting_expiry_timer: None,
             cursor_blink_state: RefCell::new(ColorEase::new(
                 config.cursor_blink_rate,
@@ -1209,28 +1208,11 @@ impl TermWindow {
                     .context("send GetConfigOverrides response")?;
             }
             TermWindowNotif::SetConfigOverrides(value) => {
-                if value != self.config_overrides {
-                    self.config_overrides = value;
-                    self.config_was_reloaded();
-                }
+                self.apply_config_overrides(value);
             }
-            TermWindowNotif::SetConfigOverride { key, value } => {
-                let mut object = match std::mem::take(&mut self.config_overrides) {
-                    wezterm_dynamic::Value::Object(object) => object,
-                    _ => wezterm_dynamic::Object::default(),
-                };
-                object.insert(wezterm_dynamic::Value::String(key), value);
-                self.config_overrides = wezterm_dynamic::Value::Object(object);
-                self.config_was_reloaded();
-            }
-            TermWindowNotif::ClearConfigOverride { key } => {
-                let mut object = match std::mem::take(&mut self.config_overrides) {
-                    wezterm_dynamic::Value::Object(object) => object,
-                    _ => wezterm_dynamic::Object::default(),
-                };
-                object.remove(&wezterm_dynamic::Value::String(key));
-                self.config_overrides = wezterm_dynamic::Value::Object(object);
-                self.config_was_reloaded();
+            TermWindowNotif::UpdateConfigOverrides { values, clear } => {
+                let value = merge_config_overrides(&self.config_overrides, values, clear);
+                self.apply_config_overrides(value);
             }
             TermWindowNotif::CancelOverlayForPane(pane_id) => {
                 self.cancel_overlay_for_pane(pane_id);
@@ -1363,8 +1345,16 @@ impl TermWindow {
                 | MuxNotification::Empty
                 | MuxNotification::WindowCreated(_) => {}
             },
-            TermWindowNotif::EmitStatusUpdate => {
-                self.emit_status_event();
+            TermWindowNotif::EmitStatusUpdate(deadline) => {
+                if self
+                    .status_timer
+                    .as_ref()
+                    .is_some_and(|(pending, _)| *pending == deadline)
+                {
+                    self.status_timer.take();
+                    self.emit_status_event();
+                    self.schedule_next_status_update();
+                }
             }
             TermWindowNotif::GetSelectionForPane { pane_id, tx } => {
                 let mux = Mux::get();
@@ -1606,8 +1596,13 @@ impl TermWindow {
     }
 
     fn emit_status_event(&mut self) {
-        self.emit_window_event("update-right-status", None);
-        self.emit_window_event("update-status", None);
+        for name in ["update-right-status", "update-status"] {
+            // A slow callback gets another chance on the next interval after
+            // it finishes. Periodic ticks should not queue back-to-back calls.
+            if matches!(self.event_states.get(name), None | Some(EventState::None)) {
+                self.emit_window_event(name, None);
+            }
+        }
     }
 
     fn schedule_window_event(&mut self, name: &str, pane_id: Option<PaneId>) {
@@ -1760,6 +1755,62 @@ impl TermWindow {
     }
 }
 
+fn merge_config_overrides(
+    current: &Value,
+    values: wezterm_dynamic::Object,
+    clear: Vec<String>,
+) -> Value {
+    let mut merged = match current {
+        Value::Object(object) => object.clone(),
+        _ => wezterm_dynamic::Object::default(),
+    };
+    for key in clear {
+        merged.remove(&Value::String(key));
+    }
+    merged.extend(values);
+    if merged.is_empty() && !matches!(current, Value::Object(_)) {
+        return current.clone();
+    }
+    Value::Object(merged)
+}
+
+#[cfg(test)]
+mod override_tests {
+    use super::*;
+
+    #[test]
+    fn merging_overrides_clears_then_sets_and_preserves_unrelated_values() {
+        let mut values = wezterm_dynamic::Object::default();
+        values.insert(Value::String("enable_tab_bar".into()), Value::Bool(false));
+        values.insert(Value::String("enable_scroll_bar".into()), Value::Bool(true));
+        let original = Value::Object(values);
+
+        assert_eq!(
+            merge_config_overrides(
+                &original,
+                wezterm_dynamic::Object::default(),
+                vec!["absent".into()]
+            ),
+            original
+        );
+        let mut changes = wezterm_dynamic::Object::default();
+        changes.insert(Value::String("enable_tab_bar".into()), Value::Bool(true));
+        let Value::Object(merged) =
+            merge_config_overrides(&original, changes, vec!["enable_tab_bar".into()])
+        else {
+            panic!("expected an override object");
+        };
+        assert_eq!(
+            merged.get_by_str("enable_tab_bar"),
+            Some(&Value::Bool(true))
+        );
+        assert_eq!(
+            merged.get_by_str("enable_scroll_bar"),
+            Some(&Value::Bool(true))
+        );
+    }
+}
+
 impl TermWindow {
     fn palette(&mut self) -> &ColorPalette {
         if self.palette.is_none() {
@@ -1769,24 +1820,36 @@ impl TermWindow {
         self.palette.as_ref().unwrap()
     }
 
+    fn apply_config_overrides(&mut self, value: Value) {
+        if value == self.config_overrides {
+            return;
+        }
+        match config::overridden_config(&value) {
+            Ok(config) => {
+                self.config_overrides = value;
+                self.reload_window_config(config);
+            }
+            Err(err) => log::error!("Failed to apply config overrides to window: {err:#}"),
+        }
+    }
+
     pub fn config_was_reloaded(&mut self) {
-        log::debug!(
-            "config was reloaded, overrides: {:?}",
-            self.config_overrides
-        );
-        self.key_table_state.clear_stack();
-        self.connection_name = Connection::get().unwrap().name();
         let config = match config::overridden_config(&self.config_overrides) {
             Ok(config) => config,
             Err(err) => {
-                log::error!(
-                    "Failed to apply config overrides to window: {:#}: {:?}",
-                    err,
-                    self.config_overrides
-                );
+                log::error!("Failed to reload config overrides for window: {err:#}");
                 configuration()
             }
         };
+        self.reload_window_config(config);
+    }
+
+    fn reload_window_config(&mut self, config: ConfigHandle) {
+        self.key_table_state.clear_stack();
+        self.connection_name = Connection::get().unwrap().name();
+        if self.config.status_update_interval != config.status_update_interval {
+            self.status_timer.take();
+        }
         self.config = config.clone();
         self.palette.take();
 
@@ -1884,6 +1947,7 @@ impl TermWindow {
         );
 
         self.invalidate_modal();
+        self.schedule_next_status_update();
         self.emit_window_event("window-config-reloaded", None);
     }
 
@@ -2021,76 +2085,55 @@ impl TermWindow {
         let border = self.get_os_border();
         let tab_bar_height = self.tab_bar_pixel_height().unwrap_or(0.);
         let tab_bar_y = if self.config.tab_bar_at_bottom {
-            ((self.dimensions.pixel_height as f32) - (tab_bar_height + border.bottom.get() as f32))
+            (self.dimensions.pixel_height as f32 - tab_bar_height - border.bottom.get() as f32)
                 .max(0.)
         } else {
             border.top.get() as f32
         };
-
-        let tab_bar_height = self.tab_bar_pixel_height().unwrap_or(0.);
-
-        let hovering_in_tab_bar = match &self.current_mouse_event {
-            Some(event) => {
-                let mouse_y = event.coords.y as f32;
-                mouse_y >= tab_bar_y as f32 && mouse_y < tab_bar_y as f32 + tab_bar_height
-            }
-            None => false,
+        let hover_x = self.current_mouse_event.as_ref().and_then(|event| {
+            let y = event.coords.y as f32;
+            (y >= tab_bar_y
+                && y < tab_bar_y + tab_bar_height
+                && matches!(self.current_mouse_capture, None | Some(MouseCapture::UI)))
+            .then_some(event.coords.x)
+        });
+        let client_width = (self.dimensions.pixel_width as f32
+            - (border.left + border.right).get() as f32)
+            .max(0.);
+        let title_font = if self.config.use_fancy_tab_bar {
+            self.fonts.title_font().ok()
+        } else {
+            None
         };
-
-        let title_metrics = self.fonts.title_font().ok().map(|font| {
-            // Use the same metrics as build_fancy_tab_bar. font.metrics()
-            // .cell_width is not the rendered title cell width for a
-            // proportional font such as Segoe UI, and made the budget far too
-            // small.
-            crate::utilsprites::RenderMetrics::with_font_metrics(&font.metrics())
-        });
-        let fancy_title_width = title_metrics.as_ref().map(|metrics| {
-            let cell_width = (metrics.cell_size.width as f32).max(1.0);
-            // dimensions.pixel_width is the physical tab-bar width used by the
-            // layout; terminal_size.pixel_width is a logical/scaled value.
-            (self.dimensions.pixel_width as f32 / cell_width) as usize
-        });
-        let fancy_tab_metrics =
-            if self.config.use_fancy_tab_bar && self.config.tab_bar_uniform_width {
-                title_metrics.as_ref().map(|metrics| {
-                    let mouse_px = if hovering_in_tab_bar {
-                        self.current_mouse_event.as_ref().map(|event| {
-                            // The tab bar spans the client area inside the OS
-                            // border; coords are window pixels.
-                            (event.coords.x - border.left.get() as isize).max(0) as f32
-                        })
-                    } else {
-                        None
-                    };
-                    crate::tabbar::fancy_tab_metrics(
-                        &self.config,
-                        metrics,
-                        self.dimensions.dpi as f32,
-                        self.dimensions.pixel_width as f32,
-                        &self.left_status,
-                        &self.right_status,
-                        tabs.len(),
-                        mouse_px,
-                    )
-                })
-            } else {
-                None
-            };
+        let title_metrics = title_font
+            .as_ref()
+            .map(|font| RenderMetrics::with_font_metrics(&font.metrics()));
+        let palette = self.palette().clone();
+        let fancy_tab = title_font
+            .as_ref()
+            .zip(title_metrics.as_ref())
+            .map(|(font, metrics)| {
+                self.fancy_bar_metrics(font, metrics, &palette, client_width, tabs.len())
+            });
         let new_tab_bar = TabBarState::new(
             self.dimensions.pixel_width / self.render_metrics.cell_size.width as usize,
-            if hovering_in_tab_bar {
-                Some(self.last_mouse_coords.0)
-            } else {
-                None
-            },
+            hover_x.map(|_| self.last_mouse_coords.0),
             &tabs,
             &panes,
             self.config.resolved_palette.tab_bar.as_ref(),
             &self.config,
             &self.left_status,
             &self.right_status,
-            fancy_title_width,
-            fancy_tab_metrics.as_ref(),
+            fancy_tab.as_ref(),
+            hover_x.map(|x| x as f32 - border.left.get() as f32),
+            |line| {
+                title_font
+                    .as_ref()
+                    .zip(title_metrics.as_ref())
+                    .map_or(0., |(font, metrics)| {
+                        self.measure_tab_suffix(font, metrics, line, &palette, client_width)
+                    })
+            },
         );
         if new_tab_bar != self.tab_bar {
             self.tab_bar = new_tab_bar;
@@ -2182,56 +2225,56 @@ impl TermWindow {
     }
 
     fn schedule_next_status_update(&mut self) {
-        if let Some(window) = self.window.as_ref() {
-            let now = Instant::now();
-            if self.last_status_call <= now {
-                let interval = Duration::from_millis(self.config.status_update_interval);
-                let target = now + interval;
-                self.last_status_call = target;
-
-                let window = window.clone();
-                promise::spawn::spawn(async move {
-                    Timer::at(target).await;
-                    window.notify(TermWindowNotif::EmitStatusUpdate);
-                })
-                .detach();
-            }
+        if self.status_timer.is_some() {
+            return;
         }
+        let interval = Duration::from_millis(self.config.status_update_interval.max(1));
+        let (Some(window), Some(deadline)) =
+            (self.window.clone(), Instant::now().checked_add(interval))
+        else {
+            return;
+        };
+        let task = promise::spawn::spawn(async move {
+            Timer::at(deadline).await;
+            window.notify(TermWindowNotif::EmitStatusUpdate(deadline));
+        });
+        self.status_timer = Some((deadline, task));
     }
 
-    /// Rebuild the tab bar when the earliest waiting agent's TTL expires.
-    /// Unlike the animation-frame scheduling, this timer is not gated on the
-    /// window having focus, so an unfocused window also drops the ring.  The
-    /// expiry is the stable wall-clock value from `get_tab_information`, so
-    /// title updates that do not change it keep the same armed timer.
+    /// Keep one timer for the nearest waiting-ring expiry, including when
+    /// the window is unfocused.
     fn schedule_waiting_expiry(&mut self, expiry: Option<SystemTime>) {
-        if self.waiting_expiry_timer == expiry {
+        if self
+            .waiting_expiry_timer
+            .as_ref()
+            .map(|(pending, _)| *pending)
+            == expiry
+        {
             return;
         }
-        let Some(expiry) = expiry else {
-            self.waiting_expiry_timer = None;
+        self.waiting_expiry_timer.take();
+        let (Some(expiry), Some(window)) = (expiry, self.window.clone()) else {
             return;
         };
-        let Some(window) = self.window.as_ref() else {
+        let delay = expiry.duration_since(SystemTime::now()).unwrap_or_default();
+        let Some(deadline) = Instant::now().checked_add(delay) else {
             return;
         };
-        self.waiting_expiry_timer = Some(expiry);
-        let window = window.clone();
-        let delay = expiry
-            .duration_since(SystemTime::now())
-            .unwrap_or_default();
-        promise::spawn::spawn(async move {
-            Timer::at(Instant::now() + delay).await;
+        let task = promise::spawn::spawn(async move {
+            Timer::at(deadline).await;
             window.notify(TermWindowNotif::Apply(Box::new(move |tw| {
-                // A newer expiry may have been armed while this timer was
-                // pending; only clear the mark this timer owns.
-                if tw.waiting_expiry_timer == Some(expiry) {
-                    tw.waiting_expiry_timer = None;
+                // A notification queued just before cancellation can still arrive.
+                if tw
+                    .waiting_expiry_timer
+                    .as_ref()
+                    .is_some_and(|(pending, _)| *pending == expiry)
+                {
+                    tw.waiting_expiry_timer.take();
+                    tw.update_title();
                 }
-                tw.update_title();
             })));
-        })
-        .detach();
+        });
+        self.waiting_expiry_timer = Some((expiry, task));
     }
 
     fn update_text_cursor(&mut self, pos: &PositionedPane) {
@@ -3300,17 +3343,7 @@ impl TermWindow {
         // perform below; here we allow the user to define an `open-uri` event
         // handler that can bypass the normal `open_url` functionality.
         if let Some(link) = self.current_highlight.as_ref().cloned() {
-            // Expand $CWD in hyperlink formats at click time, when the pane's
-            // current working directory is available. format-time expansion
-            // cannot see the pane and leaves relative paths for Lua to repair.
-            let cwd = pane
-                .get_current_working_dir(CachePolicy::AllowStale)
-                .and_then(|url| url.to_file_path().ok())
-                .map(|p| p.to_string_lossy().replace('\\', "/"));
-            let link = match cwd {
-                Some(cwd) => link.uri().to_string().replace("$CWD", &cwd),
-                None => link.uri().to_string(),
-            };
+            let link = link.uri().to_owned();
             let window = GuiWin::new(self);
             let pane = MuxPane(pane.pane_id());
 
@@ -3571,21 +3604,6 @@ impl TermWindow {
         }
     }
 
-    fn pane_waiting_state(
-        pane: &Arc<dyn Pane>,
-        now_epoch: u64,
-        ttl_seconds: u64,
-    ) -> (bool, Option<u64>) {
-        let vars = pane.copy_user_vars();
-        let Some(value) = vars.get("agent_state") else {
-            return (false, None);
-        };
-        (
-            agent_state_is_waiting(value, now_epoch, ttl_seconds),
-            agent_state_epoch(value),
-        )
-    }
-
     fn pos_pane_to_pane_info(pos: &PositionedPane) -> PaneInformation {
         PaneInformation {
             pane_id: pos.pane.pane_id(),
@@ -3612,11 +3630,7 @@ impl TermWindow {
             _ => return (vec![], None),
         };
         let tab_index = window.get_active_tab_idx();
-        let now_wall = std::time::SystemTime::now();
-        let now_epoch = now_wall
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_secs())
-            .unwrap_or(0);
+        let now_wall = SystemTime::now();
         let ttl_seconds = self.config.tab_bar_waiting_ttl_seconds;
         let mut next_waiting_expiry: Option<SystemTime> = None;
 
@@ -3624,7 +3638,11 @@ impl TermWindow {
             .iter_tabs()
             .enumerate()
             .map(|(idx, tab)| {
-                let panes = self.get_pos_panes_for_tab(tab);
+                let active_pane = self
+                    .get_pos_panes_for_tab(tab)
+                    .iter()
+                    .find(|p| p.is_active)
+                    .map(Self::pos_pane_to_pane_info);
 
                 // Inspect the real panes of the mux tab, not the
                 // overlay-substituted PositionedPane list.  The Lua
@@ -3633,25 +3651,22 @@ impl TermWindow {
                 // ring is meant to catch exactly that hidden case.
                 let mut agent_waiting = false;
                 for positioned in tab.iter_panes_ignoring_zoom() {
-                    let (waiting, epoch) =
-                        Self::pane_waiting_state(&positioned.pane, now_epoch, ttl_seconds);
-                    if !waiting {
-                        continue;
-                    }
-                    agent_waiting = true;
-                    // Keep the wall-clock expiry of the earliest waiting
-                    // state; update_title_impl arms an independent timer for
-                    // it so the ring goes away even while unfocused.  Storing
-                    // SystemTime (not Instant) keeps the value stable across
-                    // rebuilds, so the timer is not re-armed on every update.
-                    if ttl_seconds > 0 {
-                        if let Some(epoch) = epoch {
-                            let expiry = std::time::UNIX_EPOCH
-                                + std::time::Duration::from_secs(epoch.saturating_add(ttl_seconds));
-                            if expiry > now_wall {
-                                next_waiting_expiry =
-                                    Some(next_waiting_expiry.map_or(expiry, |cur| cur.min(expiry)));
-                            }
+                    let other_vars;
+                    let vars = match &active_pane {
+                        Some(active) if active.pane_id == positioned.pane.pane_id() => {
+                            &active.user_vars
+                        }
+                        _ => {
+                            other_vars = positioned.pane.copy_user_vars();
+                            &other_vars
+                        }
+                    };
+                    if let Some(value) = vars.get("agent_state") {
+                        let (waiting, expiry) = agent_waiting_state(value, now_wall, ttl_seconds);
+                        agent_waiting |= waiting;
+                        if let Some(expiry) = expiry {
+                            next_waiting_expiry =
+                                Some(next_waiting_expiry.map_or(expiry, |cur| cur.min(expiry)));
                         }
                     }
                 }
@@ -3666,10 +3681,7 @@ impl TermWindow {
                         .unwrap_or(false),
                     window_id: self.mux_window_id,
                     tab_title: tab.get_title(),
-                    active_pane: panes
-                        .iter()
-                        .find(|p| p.is_active)
-                        .map(Self::pos_pane_to_pane_info),
+                    active_pane,
                     agent_waiting,
                 }
             })

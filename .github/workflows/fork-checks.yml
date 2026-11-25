@@ -1,0 +1,58 @@
+name: Fork checks
+
+on:
+  push:
+    branches: [patched]
+  pull_request:
+    branches: [patched]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-checks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          ./get-deps
+          sudo apt-get install -y dbus-daemon
+      - name: Select native Windows Perl
+        if: runner.os == 'Windows'
+        run: |
+          test -f /c/Strawberry/perl/bin/perl.exe
+          echo 'C:\Strawberry\perl\bin' >> "$GITHUB_PATH"
+      - name: Build runtime
+        run: cargo build --locked --release -p wezterm -p wezterm-gui -p wezterm-mux-server -p strip-ansi-escapes
+      - name: Test fork components
+        run: >-
+          cargo test --locked --release --lib --bins
+          -p codec -p config -p mux -p wezterm -p wezterm-client
+          -p wezterm-gui -p wezterm-gui-subcommands -p wezterm-mux-server-impl
+          -p wezterm-term -p wezterm-toast-notification -p window
+      - name: Exercise workspace through the mux server and CLI
+        if: runner.os == 'Linux'
+        run: python3 ci/test-workspace.py target/release/wezterm target/release/wezterm-mux-server
+      - name: Exercise desktop-notification clicks on a private bus
+        if: runner.os == 'Linux'
+        run: >-
+          dbus-run-session -- env WEZTERM_TEST_NOTIFICATIONS_DBUS=1
+          cargo test --locked --release -p wezterm-toast-notification immediate_click -- --ignored
