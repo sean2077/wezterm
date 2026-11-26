@@ -299,7 +299,15 @@ impl EarlySignals {
         }
         self.entries.push_back(entry);
         if self.entries.len() > MAX_PENDING_ACTIONS {
-            self.entries.pop_front();
+            // A drained click cannot be replayed, so drop an entry that has
+            // not accepted one first. A burst of signals for other
+            // notifications must not discard an action we already saw.
+            let evict = self
+                .entries
+                .iter()
+                .position(|(_, _, entry)| entry.invoked.is_empty())
+                .unwrap_or(0);
+            self.entries.remove(evict);
         }
         Ok(())
     }
@@ -651,6 +659,31 @@ mod tests {
                 })),
             },
         );
+        assert!(pending.0.is_empty());
+    }
+
+    #[test]
+    fn early_click_survives_eviction_from_a_signal_burst() {
+        let mut pending = PendingActions::default();
+        let mut early = EarlySignals::default();
+        let (send, recv) = std::sync::mpsc::channel();
+        early
+            .receive(&mut pending, early_signal("ActionInvoked", 42, "default"))
+            .unwrap();
+        for id in 100..100 + MAX_PENDING_ACTIONS as u32 * 2 {
+            early
+                .receive(&mut pending, early_signal("ActivationToken", id, "token"))
+                .unwrap();
+        }
+        early.finish(
+            &mut pending,
+            PostedAction {
+                owner: ":1.1".into(),
+                id: 42,
+                action: Action::Activate(Box::new(move |token| send.send(token).unwrap())),
+            },
+        );
+        assert_eq!(recv.try_recv().unwrap(), None);
         assert!(pending.0.is_empty());
     }
 
