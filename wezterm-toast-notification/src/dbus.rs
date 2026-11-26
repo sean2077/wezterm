@@ -381,10 +381,9 @@ async fn run_connection(requests: &Receiver<Request>, first: Request) -> zbus::R
     let connection = zbus::Connection::session().await?;
     let dbus = DBusProxy::new(&connection).await?;
     let service = NotificationsProxy::new(&connection).await?;
-    let mut signals = MessageStream::from(&connection);
-    signals.set_max_queued(MAX_REQUESTS);
-    // Use a single stream so owner changes, activations, tokens and closes
-    // are observed in bus order, including signals queued during Notify.
+    // Register matches before activating the bounded message stream. No
+    // notification has been posted yet, and an undrained stream could otherwise
+    // block the reply to the second AddMatch during a signal burst.
     dbus.add_match_rule(
         MatchRule::builder()
             .msg_type(Type::Signal)
@@ -405,6 +404,10 @@ async fn run_connection(requests: &Receiver<Request>, first: Request) -> zbus::R
     )
     .await?;
 
+    // Use a single stream so owner changes, activations, tokens and closes
+    // are observed in bus order, including signals queued during Notify.
+    let mut signals = MessageStream::from(&connection);
+    signals.set_max_queued(MAX_REQUESTS);
     let mut pending = PendingActions::default();
     let mut first = Some(first);
     loop {
