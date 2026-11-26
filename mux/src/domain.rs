@@ -238,11 +238,41 @@ pub(crate) fn add_pane_as_tab(
 
     let mux = Mux::get();
     mux.add_tab_and_active_pane(&tab)?;
-    if let Err(err) = mux.add_tab_to_window(&tab, window) {
+    let index = mux
+        .get_window(window)
+        .map(|window| {
+            tab_insert_index(
+                configuration().new_tab_position,
+                window.count_tabs(),
+                window.get_active_tab_idx(),
+            )
+        })
+        .unwrap_or(None);
+    let result = match index {
+        Some(index) => mux.add_tab_to_window_at_idx(&tab, window, index),
+        None => mux.add_tab_to_window(&tab, window),
+    };
+    if let Err(err) = result {
         mux.remove_tab(tab.tab_id());
         return Err(err);
     }
     Ok(tab)
+}
+
+/// Where a newly spawned tab should be inserted in the window's tab bar.
+///
+/// `None` means append at the end. `AfterCurrent` inserts immediately after
+/// the active tab; an empty window has no active tab, so it appends.
+fn tab_insert_index(
+    position: config::NewTabPosition,
+    tab_count: usize,
+    active_tab_idx: usize,
+) -> Option<usize> {
+    match position {
+        config::NewTabPosition::End => None,
+        config::NewTabPosition::AfterCurrent if tab_count > 0 => Some(active_tab_idx + 1),
+        config::NewTabPosition::AfterCurrent => None,
+    }
 }
 
 pub struct LocalDomain {
@@ -834,5 +864,25 @@ impl Domain for LocalDomain {
 
     fn state(&self) -> DomainState {
         DomainState::Attached
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tab_insert_index;
+    use config::NewTabPosition;
+
+    #[test]
+    fn new_tab_position_controls_insert_index() {
+        assert_eq!(tab_insert_index(NewTabPosition::End, 3, 1), None);
+        assert_eq!(tab_insert_index(NewTabPosition::AfterCurrent, 0, 0), None);
+        assert_eq!(
+            tab_insert_index(NewTabPosition::AfterCurrent, 3, 0),
+            Some(1)
+        );
+        assert_eq!(
+            tab_insert_index(NewTabPosition::AfterCurrent, 3, 2),
+            Some(3)
+        );
     }
 }

@@ -1008,12 +1008,38 @@ impl Mux {
     }
 
     pub fn add_tab_to_window(&self, tab: &Arc<Tab>, window_id: WindowId) -> anyhow::Result<()> {
+        self.add_tab_to_window_inner(tab, window_id, None)
+    }
+
+    /// Insert the tab at `index` (clamped to the current tab count) instead of
+    /// appending it to the end of the window's tab bar.
+    pub fn add_tab_to_window_at_idx(
+        &self,
+        tab: &Arc<Tab>,
+        window_id: WindowId,
+        index: usize,
+    ) -> anyhow::Result<()> {
+        self.add_tab_to_window_inner(tab, window_id, Some(index))
+    }
+
+    fn add_tab_to_window_inner(
+        &self,
+        tab: &Arc<Tab>,
+        window_id: WindowId,
+        index: Option<usize>,
+    ) -> anyhow::Result<()> {
         let tab_id = tab.tab_id();
         {
             let mut window = self
                 .get_window_mut(window_id)
                 .ok_or_else(|| anyhow!("add_tab_to_window: no such window_id {}", window_id))?;
-            window.push_tab(tab);
+            match index {
+                Some(index) => {
+                    let index = index.min(window.count_tabs());
+                    window.insert_tab_at_idx(index, tab);
+                }
+                None => window.push_tab(tab),
+            }
         }
         self.recompute_pane_count();
         self.notify(MuxNotification::TabAddedToWindow { tab_id, window_id });

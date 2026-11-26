@@ -134,6 +134,11 @@ pub struct Config {
     #[dynamic(default)]
     pub switch_to_last_active_tab_when_closing_tab: bool,
 
+    /// Controls where a tab that is spawned into an existing window is
+    /// placed within that window's tab bar.
+    #[dynamic(default)]
+    pub new_tab_position: NewTabPosition,
+
     /// When true, launching a new wezterm instance will prefer
     /// to spawn a new tab into an existing instance.
     /// Otherwise, it will spawn a new window.
@@ -2223,6 +2228,30 @@ fn default_line_quad_cache_size() -> usize {
 
 fn default_line_to_ele_shape_cache_size() -> usize {
     1024
+}
+
+#[derive(Debug, ToDynamic, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NewTabPosition {
+    /// Append new tabs at the end of the window's tab bar
+    #[default]
+    End,
+    /// Insert new tabs immediately after the window's active tab
+    AfterCurrent,
+}
+
+impl FromDynamic for NewTabPosition {
+    fn from_dynamic(
+        value: &wezterm_dynamic::Value,
+        options: wezterm_dynamic::FromDynamicOptions,
+    ) -> Result<Self, wezterm_dynamic::Error> {
+        match String::from_dynamic(value, options)?.as_str() {
+            "End" => Ok(Self::End),
+            "AfterCurrent" => Ok(Self::AfterCurrent),
+            s => Err(wezterm_dynamic::Error::Message(format!(
+                "`{s}` is not valid, use one of `End` or `AfterCurrent`"
+            ))),
+        }
+    }
 }
 
 #[derive(Debug, ToDynamic, Clone, Copy, PartialEq, Eq, Default)]

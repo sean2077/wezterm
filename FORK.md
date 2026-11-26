@@ -28,6 +28,7 @@
 | gui: draw macOS-style traffic light window buttons | 自用 | — | 上游在非 macOS 平台支持 `integrated_title_button_style = "MacOsNative"` 时可删 |
 | gui: hover symbols on traffic lights, hover-only close buttons, waiting separator | 自用 | — | 依赖上面两条；上游提供悬停显示关闭按钮的选项后可删其中对应部分 |
 | cli: report tab/window indices and focus the owning GUI window | 自用 | — | 上游的 `list` 输出索引且 `activate-*` 会前台化窗口后可删 |
+| mux: place new tabs after the active tab (`new_tab_position`) | 自用 | — | 上游实现新 tab 位置配置（[#909](https://github.com/wezterm/wezterm/issues/909)）后可删 |
 | mux: generic workspace save/restore and agent user vars | 自用 | — | 上游提供等价的 session persistence/CLI 后可删 |
 | mux: persist per-tab split layouts (session v2) | 自用 | — | 上游提供等价的分屏持久化后可删；与上一行一起删 |
 | mux: restore agent commands from agent.restore_argv | 自用 | — | 与上一行一起删；替代已废弃的 `agent.resume_args` 追加语义，`agent.*` 由宿主保留 |
