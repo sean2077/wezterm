@@ -1,6 +1,7 @@
-use anyhow::anyhow;
+use anyhow::{anyhow, Context};
 use clap::Parser;
 use std::ffi::OsString;
+use std::path::Path;
 use wezterm_client::client::Client;
 
 mod activate_pane;
@@ -241,14 +242,108 @@ pub fn run_cli(opts: &crate::Opt, cli: CliCommand) -> anyhow::Result<()> {
 }
 
 pub fn resolve_relative_cwd(cwd: Option<OsString>) -> anyhow::Result<Option<String>> {
-    match cwd {
-        None => Ok(None),
-        Some(cwd) => Ok(Some(
-            std::env::current_dir()?
-                .join(cwd)
-                .to_str()
-                .ok_or_else(|| anyhow!("path is not representable as String"))?
-                .to_string(),
-        )),
+    cwd.map(|cwd| resolve_relative_path(Path::new(&cwd)))
+        .transpose()
+}
+
+fn resolve_relative_path(path: &Path) -> anyhow::Result<String> {
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        #[cfg(windows)]
+        let resolved = resolve_windows_relative(path);
+        #[cfg(not(windows))]
+        let resolved = std::env::current_dir().map(|cwd| cwd.join(path));
+        resolved.context("resolving path relative to the CLI's current directory")?
+    };
+    // The mux protocol carries paths as UTF-8 strings. Lossy conversion can
+    // silently save to (or restore from) a different file.
+    path.into_os_string()
+        .into_string()
+        .map_err(|_| anyhow!("path is not valid UTF-8 and cannot be sent to the mux server"))
+}
+
+/// Resolve a Windows relative path in the CLI process. Ordinary relative
+/// paths stay joined to the CLI directory so the OS resolves `.` and `..`
+/// with normal filesystem semantics, including junctions and symlinks. Only
+/// paths with a prefix or root (`C:file`, `\file`) need lexical expansion:
+/// a mux server would otherwise resolve them against its own per-drive
+/// working directories.
+#[cfg(windows)]
+fn resolve_windows_relative(path: &Path) -> std::io::Result<std::path::PathBuf> {
+    let needs_lexical_resolution = path.has_root()
+        || matches!(
+            path.components().next(),
+            Some(std::path::Component::Prefix(_))
+        );
+    if needs_lexical_resolution {
+        std::path::absolute(path)
+    } else {
+        std::env::current_dir().map(|cwd| cwd.join(path))
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+
+    #[test]
+    fn relative_paths_use_the_cli_directory() {
+        let relative = Path::new("workspace snapshots").join("session.json");
+        let expected = std::env::current_dir().unwrap().join(&relative);
+        assert_eq!(
+            resolve_relative_path(&relative).unwrap(),
+            expected.to_str().unwrap()
+        );
+        assert_eq!(resolve_relative_cwd(None).unwrap(), None);
+    }
+
+    #[test]
+    fn absolute_paths_are_preserved() {
+        let absolute = std::env::current_exe().unwrap();
+        assert_eq!(
+            resolve_relative_path(&absolute).unwrap(),
+            absolute.to_str().unwrap()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn drive_relative_paths_are_resolved_in_the_cli_process() {
+        use std::path::{Component, Prefix};
+        let cwd = std::env::current_dir().unwrap();
+        let drive = match cwd.components().next().unwrap() {
+            Component::Prefix(prefix) => match prefix.kind() {
+                Prefix::Disk(drive) | Prefix::VerbatimDisk(drive) => drive,
+                _ => panic!("test requires a local drive working directory"),
+            },
+            _ => panic!("working directory must be absolute"),
+        };
+        let relative = format!("{}:session.json", char::from(drive));
+        let resolved = resolve_relative_path(Path::new(&relative)).unwrap();
+        assert!(Path::new(&resolved).is_absolute());
+        assert_eq!(Path::new(&resolved), cwd.join("session.json"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ordinary_relative_paths_keep_os_resolution() {
+        // `..` must reach the OS unnormalized so junctions and symlinks
+        // resolve the same way they do in the user's shell.
+        let relative = Path::new("nested").join("..").join("session.json");
+        let expected = std::env::current_dir().unwrap().join(&relative);
+        assert_eq!(
+            resolve_relative_path(&relative).unwrap(),
+            expected.to_str().unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn paths_that_cannot_round_trip_through_the_protocol_are_rejected() {
+        use std::os::unix::ffi::OsStringExt;
+        let invalid = OsString::from_vec(b"session-\xff.json".to_vec());
+        assert!(resolve_relative_path(Path::new(&invalid)).is_err());
+        assert!(resolve_relative_cwd(Some(invalid)).is_err());
     }
 }

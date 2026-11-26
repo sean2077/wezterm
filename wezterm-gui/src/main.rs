@@ -413,8 +413,8 @@ async fn async_run_terminal_gui(
 ) -> anyhow::Result<()> {
     // Instances that crash or are killed skip the remove_file below and leave
     // their gui-sock-* marker behind forever. Prune them when a new GUI starts:
-    // the helper only drops sockets that fail to connect and are older than a
-    // second, so an instance still starting up is never mistaken for a dead one.
+    // the helper only drops old sockets with a definite connection failure.
+    // Busy listeners, access errors and probe timeouts are left intact.
     let _ = wezterm_client::discovery::discover_gui_socks();
     let pruned_agent_links = wezterm_client::discovery::prune_dead_agent_links();
     if pruned_agent_links > 0 {

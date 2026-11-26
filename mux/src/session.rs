@@ -32,6 +32,7 @@ use chrono::Utc;
 use config::keyassignment::SpawnTabDomain;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -489,20 +490,209 @@ fn path_string(url: &url::Url) -> Option<String> {
 }
 
 fn write_json(path: &Path, state: &SessionState) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
-    if path.exists() {
-        let backup = PathBuf::from(format!("{}.bak", path.display()));
-        let _ = std::fs::copy(path, backup);
-    }
-    let temp = PathBuf::from(format!("{}.tmp-{}", path.display(), std::process::id()));
     let data = serde_json::to_vec_pretty(state).context("serializing workspace")?;
-    std::fs::write(&temp, data).with_context(|| format!("writing {}", temp.display()))?;
-    std::fs::rename(&temp, path)
-        .with_context(|| format!("renaming {} to {}", temp.display(), path.display()))?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    config::create_user_owned_dirs(parent)
+        .with_context(|| format!("creating {}", parent.display()))?;
+
+    // Stage on the destination filesystem so both replacements are atomic.
+    // NamedTempFile uses exclusive creation and private permissions (0600 on
+    // Unix); snapshots can contain credentials in argv, env and user vars.
+    let mut temp = tempfile::NamedTempFile::new_in(parent).with_context(|| {
+        format!(
+            "creating a workspace temporary file in {}",
+            parent.display()
+        )
+    })?;
+    temp.write_all(&data)
+        .context("writing the workspace temporary file")?;
+    temp.as_file().sync_all().context("syncing workspace")?;
+
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            anyhow::ensure!(
+                metadata.file_type().is_file(),
+                "workspace destination {} is not a regular file",
+                path.display()
+            );
+            let mut options = std::fs::OpenOptions::new();
+            options.read(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.custom_flags(libc::O_NOFOLLOW);
+            }
+            let mut previous = options
+                .open(path)
+                .with_context(|| format!("opening prior workspace {}", path.display()))?;
+            let mut backup_path = path.as_os_str().to_os_string();
+            backup_path.push(".bak");
+            let backup_path = PathBuf::from(backup_path);
+            let mut backup = tempfile::NamedTempFile::new_in(parent)
+                .context("creating the workspace backup temporary file")?;
+            std::io::copy(&mut previous, &mut backup)
+                .with_context(|| format!("backing up {}", path.display()))?;
+            backup
+                .as_file()
+                .sync_all()
+                .context("syncing workspace backup")?;
+            // Never follow an existing backup symlink or truncate the previous
+            // backup in place. If backup creation fails, keep the live snapshot.
+            backup
+                .persist(&backup_path)
+                .map_err(|err| err.error)
+                .with_context(|| format!("replacing workspace backup {}", backup_path.display()))?;
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err).with_context(|| format!("checking {}", path.display())),
+    }
+    temp.persist(path)
+        .map_err(|err| err.error)
+        .with_context(|| format!("replacing workspace {}", path.display()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod snapshot_write_tests {
+    use super::*;
+
+    fn snapshot(label: &str) -> SessionState {
+        let mut state = SessionState::new();
+        state.created_at = label.to_string();
+        state
+    }
+
+    fn assert_snapshot(path: &Path, expected: &SessionState) {
+        let bytes = std::fs::read(path).unwrap();
+        let actual: SessionState = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(&actual, expected);
+    }
+
+    #[test]
+    fn writes_and_replaces_complete_snapshot_and_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workspace.json");
+        let backup = dir.path().join("workspace.json.bak");
+        let first = snapshot("first");
+        let second = snapshot("second");
+        let third = snapshot("third");
+        write_json(&path, &first).unwrap();
+        assert!(!backup.exists());
+        write_json(&path, &second).unwrap();
+        assert_snapshot(&path, &second);
+        assert_snapshot(&backup, &first);
+        write_json(&path, &third).unwrap();
+        assert_snapshot(&path, &third);
+        assert_snapshot(&backup, &second);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn failed_backup_keeps_prior_snapshot_and_cleans_temporary_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workspace.json");
+        let backup = dir.path().join("workspace.json.bak");
+        let first = snapshot("first");
+        write_json(&path, &first).unwrap();
+        // A directory cannot be atomically replaced with the backup file.
+        std::fs::create_dir(&backup).unwrap();
+        assert!(write_json(&path, &snapshot("second")).is_err());
+        assert_snapshot(&path, &first);
+        assert!(backup.is_dir());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_and_backup_are_private_even_when_replacing_a_public_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workspace.json");
+        let backup = dir.path().join("workspace.json.bak");
+        write_json(&path, &snapshot("first")).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_json(&path, &snapshot("second")).unwrap();
+        for file in [&path, &backup] {
+            assert_eq!(
+                std::fs::metadata(file).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_backup_and_legacy_temporary_symlinks_cannot_overwrite_other_files() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workspace.json");
+        let backup = dir.path().join("workspace.json.bak");
+        let legacy_temp = dir
+            .path()
+            .join(format!("workspace.json.tmp-{}", std::process::id()));
+        let victim = dir.path().join("unrelated");
+        std::fs::write(&victim, "keep me").unwrap();
+        let first = snapshot("first");
+        write_json(&path, &first).unwrap();
+        symlink(&victim, &backup).unwrap();
+        symlink(&victim, &legacy_temp).unwrap();
+        write_json(&path, &snapshot("second")).unwrap();
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep me");
+        assert_snapshot(&backup, &first);
+        assert!(!std::fs::symlink_metadata(&backup)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(std::fs::symlink_metadata(&legacy_temp)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_workspace_symlinks_including_dangling_ones() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workspace.json");
+        let target = dir.path().join("unrelated");
+        symlink(&target, &path).unwrap();
+        assert!(write_json(&path, &snapshot("first")).is_err());
+        assert!(!target.exists());
+        std::fs::write(&target, "keep me").unwrap();
+        assert!(write_json(&path, &snapshot("second")).is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep me");
+        assert!(std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_preserves_non_utf8_path_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(std::ffi::OsString::from_vec(
+            b"workspace-\xff.json".to_vec(),
+        ));
+        let backup = dir.path().join(std::ffi::OsString::from_vec(
+            b"workspace-\xff.json.bak".to_vec(),
+        ));
+        let first = snapshot("first");
+        write_json(&path, &first).unwrap();
+        write_json(&path, &snapshot("second")).unwrap();
+        assert_snapshot(&backup, &first);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
 }
 
 fn normalize_state(state: &mut SessionState) {

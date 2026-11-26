@@ -16,12 +16,11 @@ pub struct SaveWorkspaceCommand {
 
 impl SaveWorkspaceCommand {
     pub async fn run(&self, client: Client) -> anyhow::Result<()> {
-        let path = self.path.as_ref().map(|path| {
-            std::env::current_dir()
-                .map(|cwd| cwd.join(path))
-                .unwrap_or_else(|_| path.clone())
-        });
-        let path = path.map(|path| path.to_string_lossy().into_owned());
+        let path = self
+            .path
+            .as_deref()
+            .map(super::resolve_relative_path)
+            .transpose()?;
         let version = client.get_codec_version(GetCodecVersion {}).await?;
         if version.codec_vers >= WORKSPACE_DETAILS_CODEC_VERSION {
             let response = client

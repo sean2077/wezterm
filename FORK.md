@@ -43,7 +43,7 @@ box model 末字丢失：`compute_element` 只保留放得下的字形，内容�
 
 #4456 的影响：Windows 上 GUI 只把 `gui-sock-<pid>` 这个文件名发布到共享内存，新启动的 `wezterm-gui` 和 `wezterm cli` 按自己的工作目录去解析，于是任务栏、开始菜单、右键菜单每次启动都会新开一个进程（每个进程有几百 MB 的基础开销），在 WezTerm 外运行 `wezterm cli` 也会连不上。
 
-自用清理补丁：GUI 正常退出会在 `listener.run()` 返回后删除自己的 `gui-sock-<pid>`（`wezterm-gui/src/main.rs`），但崩溃、强杀和隔离测试实例都不走这条路径；这些标记文件放在 `~/.local/share/wezterm`，重启电脑也不会清。上游只在自动更新路径调用 `discover_gui_socks()`，日常启动不调用，死文件会一直留着。补丁在 `async_run_terminal_gui` 开头调用一次 `discover_gui_socks()`；该函数只删除连接失败且超过 1 秒的 socket，正在启动的实例不受影响。同一个启动路径还会删除目标已不存在的 `agent.*` 符号链接（SSH agent 转发按 pane 创建一个，崩溃/强杀后留下断链）；有效链接和普通文件不动。旧命名 `sock` 不在清理范围。
+自用清理补丁：GUI 正常退出会在 `listener.run()` 返回后删除自己的 `gui-sock-<pid>`（`wezterm-gui/src/main.rs`），但崩溃、强杀和隔离测试实例都不走这条路径；这些标记文件放在 `~/.local/share/wezterm`，重启电脑也不会清。上游只在自动更新路径调用 `discover_gui_socks()`，日常启动不调用，死文件会一直留着。补丁在 `async_run_terminal_gui` 开头调用一次 `discover_gui_socks()`；该函数只删除明确返回不存在或拒绝连接、且超过 1 秒的 socket；权限错误、超时或队列繁忙均保留。Unix 探测最多等待 50 ms，避免已有监听队列拥塞时阻塞 GUI 启动；Windows 沿用其原生 socket 连接方式。正在启动的实例不受影响。同一个启动路径还会删除目标已不存在的 `agent.*` 符号链接（SSH agent 转发按 pane 创建一个，崩溃/强杀后留下断链）；有效链接和普通文件不动。旧命名 `sock` 不在清理范围。
 
 #8166 的影响：Windows 上 `TermWindow::update_text_cursor` 在每帧绘制时都调用 `ImmSetCandidateWindow`（Builtin preedit）或 `ImmSetCompositionWindow`（System preedit），而 IME 每次收到调用都会销毁并重建候选窗，于是组合输入时候选窗每敲一键闪一次（Google 日语输入法、微软 IME、Rime/Weasel 都如此；Claude Code、Codex CLI 这类高频重绘的 TUI 更明显）。补丁缓存上次成功上报给 IME 的光标矩形，位置不变就跳过调用；在 `WM_SETFOCUS`、`WM_IME_SETCONTEXT`、`WM_IME_STARTCOMPOSITION`、`WM_IME_ENDCOMPOSITION` 以及尺寸或配置变化时清缓存，保证重新获得焦点、每次组合开始时至少重新上报一次。
 
@@ -75,6 +75,8 @@ uniform 模式下 tab 的 hover 判定也改用像素：按同样的份额累计
 
 `format-tab-title` 的返回值可以用 U+001F 分成左右两段：右段作为右浮动元素渲染在关闭按钮左侧。比例字体下标题文字的实际 advance 小于单元格预算，靠空格/EM SPACE 填充无法精确对齐；右浮动后缀不依赖字体宽度。
 
+左右片段共享分隔符处的前景色、背景色和文字属性；后缀中的显式 reset 仍恢复默认样式。没有注册 `format-tab-title` 时直接走内置标题路径，不创建 Lua 配置快照。异步字体回退完成后会同时失效标签/状态栏字形及宽度预算，避免中文或 emoji 标题持续使用旧字形。
+
 `config.integrated_title_button_style = "MacOsNative"` 原本只在 macOS 生效（按钮由系统绘制），现在任何平台都接受该值：macOS 仍由系统绘制，其他平台由 fork 自绘三个圆点（关=红 `#ff5f57`、最小化=黄 `#febc2e`、最大化=绿 `#28c840`），顺序按 `integrated_title_buttons`，位置按 `integrated_title_button_alignment`（默认右侧），悬停时同色相略提亮，并在圆点中央画出 macOS 式的深色符号（最小化 −、最大化 +、关闭 ×，墨色取各自色相的暗色），只看颜色认不出功能时可以悬停确认。符号通过 box model 新增的 `hover_overlay` 绘制：Poly 元素悬停时在同一位置叠画第二个 glyph。圆点直径约为标题字体格高的 0.7 倍（本机约 19px，接近 macOS 的 12pt 圆点），间距为直径的 0.4 倍，三个合计约 95px，仍明显窄于 Windows 字形按钮（每个约 46px，合计约 140px），右侧状态栏因此多出约 45px。fancy 标签栏按实际像素宽度为它们预留空间（`reserved_side_width`），均分 tab 不会压到按钮下面。`window_buttons_at_left` 的「macOS 按钮总在左边」逻辑、以及标签栏最左侧为原生按钮预留的 4 格边距，都只对真正的 macOS 生效；否则 tab 会被无谓地往右推。
 
 `tab_bar_close_button_on_hover = true` 时，非活动 tab 在悬停时显示关闭按钮，活动 tab 常显。绘制和命中区域都裁剪在标签之内，空间不足时一起隐藏。
@@ -91,6 +93,8 @@ uniform 模式下 tab 的 hover 判定也改用像素：按同样的份额累计
 
 OSC 9 / OSC 777 的点击动作通过一个 D-Bus 工作线程和一条连接分发，通知服务更换 owner 时清除旧回调。点击后切换到来源 pane，必要时取消该标签的 zoom。在 Wayland 上使用通知服务提供的 activation token 请求前台激活，缺少 token 时仍切换来源 pane。
 
+等待 `Notify` 回复时也持续消费总线信号，避免通知突发填满队列后堵住回复。回复前到达的 token、点击和关闭按来源及通知 ID 暂存，缓存有数量上限；关闭顺序与服务 owner 变更仍会阻止过期动作。
+
 ## 通用工作区持久化（自用）
 
 `mux` 新增通用 `SessionState`，保存窗口/tab/活动 tab、每个 tab 的 pane 列表与分屏树（方向、两侧尺寸）、活动 pane、zoom 状态、每个 pane 的 cwd、原始 spawn argv、标题和 user vars；不保存颜色、标题栏样式或窗口几何。新增 CLI：
@@ -105,6 +109,8 @@ wezterm cli set-user-var [--pane-id ID] --name NAME [--value VALUE | --unset]
 
 `--path` 相对于 CLI 的当前目录。`--replace` 通过保存文件里的首个窗口恢复到显式或唯一目标窗口。若目标中的任一 tab 或 pane 恢复失败，保留原 tab，清理新增的目标 tab。其他保存窗口独立恢复。成功替换时恢复目标的 workspace 名字，并优先激活保存时正在使用的 workspace。存在多个窗口时，`--replace` 需要 `--window-id`。
 
+CLI 在发送前解析相对路径，包括 Windows 的 `C:session.json` 盘符相对路径。协议仅支持 UTF-8 路径：无法无损表示的路径会明确报错；无法获取 CLI 工作目录时也不会把相对路径交给 mux 重新解释。`set-user-var` 的旧式 `--name/--value` 与批量 `--var` 不可混用，裸 `--unset` 仅配合 `--name`，无效组合在发送更新前拒绝。
+
 会话文件 v3 保存每个标签的分屏树、前序 pane 列表、当前 pane 和 zoom，并记录原始 domain 与应用 domain 包装前的启动命令。目标尺寸改变时按比例计算分屏并限制在两侧可用格数内。分别报告失败的 tab 和 pane。旧 v1/v2 文件仍可读取，已包装的旧命令按原样启动，避免重复套用 ExecDomain 或 WSL。
 
 Agent 集成通过通用 user vars 完成：`agent.restore_argv`（JSON argv，**整条替换** pane 的启动命令）、`agent.shutdown`（非空表示参与优雅关闭）、`agent.session_id`（诊断用）。mux/CLI 不包含 Claude 专用字段。恢复命令由白名单重建：保留 argv[0] 与 `--settings`/`--effort`/`--model`/`--permission-mode`/`--dangerously-skip-permissions`/`--add-dir`（含 `=` 写法），最后追加 `--resume <id>`；`-c`、`--continue`、`--resume`、`--session-id`、`--fork-session`、位置 prompt 和未知 flag 一律丢弃，避免重复重启时累积 `--resume` 或重放首条 prompt。命令词是裸 `claude` 且未带权限 flag 时不加引号，交给交互式 zsh 的 `claude` alias 补上 `--dangerously-skip-permissions`（yolo 会话因此保持 yolo）；完整路径或已带权限 flag 的 argv 会加引号，避免 alias 再补一次造成重复。
@@ -118,6 +124,8 @@ Agent 集成通过通用 user vars 完成：`agent.restore_argv`（JSON argv，*
 `CODEC_VERSION` 为 49。新 CLI 能使用旧协议连接 codec 48 的运行实例来保存、追加恢复及优雅关闭。安全替换要求服务端支持 codec 49。保存结果报告 `panes` 和 `skipped`，恢复结果报告 `failed`、`failed_panes` 和 `replaced`，部分恢复返回非零。`wezterm cli list` 的 `window_index` 按 `WindowId` 排序，`tab_index` 对应标签栏顺序。
 
 没有本地 spawn 命令的 pane（如 SSH 或 tmux domain）在保存时剪枝并计入 `skipped`。若快照会漏掉所有 pane，保存失败并保留原文件。
+
+保存快照及 `.bak` 使用同目录独占临时文件，写完后原子替换，Unix 权限为 `0600`。备份失败时保留原快照；已有 `.bak` 符号链接只替换链接本身，不写入其目标。主快照路径若为符号链接或非普通文件则拒绝保存。临时文件失败时自动清理。
 
 ## 日常维护入口
 
@@ -143,6 +151,8 @@ git push origin patched
 ## 构建与安装（Windows）
 
 前提：VS 2022 Build Tools（MSVC）、Rust stable MSVC 工具链、原生 Windows Perl（上游 CI 同款 Strawberry Perl；MSYS 的 perl 无法构建 vendored OpenSSL）。本机用的是便携版 `~/.local/opt/strawberry-perl`。
+
+Fork checks 额外通过 `OPENSSL_SRC_PERL` 指定 Strawberry Perl 的完整路径，并在编译前检查 `MSWin32` 和 `IPC::Cmd`。只写 `GITHUB_PATH` 不够：Git Bash 启动时仍可能将自己的 Perl 放到前面。
 
 ```powershell
 $env:PATH = "$env:USERPROFILE\.local\opt\strawberry-perl\perl\bin;" + $env:PATH

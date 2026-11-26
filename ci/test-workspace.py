@@ -134,6 +134,28 @@ return {{
         return self.cli("restore-workspace", "--path", self.snapshot,
                         "--window-id", self.window_id, "--replace", check=check)
 
+    def test_save_uses_private_snapshot_and_backup(self):
+        self.cli("save-workspace", "--path", self.snapshot)
+        original = self.snapshot.read_bytes()
+        self.assertEqual(self.snapshot.stat().st_mode & 0o777, 0o600)
+        # Existing permissive snapshots must not make subsequent saves public.
+        self.snapshot.chmod(0o644)
+        self.cli("save-workspace", "--path", self.snapshot)
+        backup = self.snapshot.with_name(self.snapshot.name + ".bak")
+        self.assertEqual(backup.read_bytes(), original)
+        for path in (self.snapshot, backup):
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_failed_backup_does_not_replace_snapshot(self):
+        self.cli("save-workspace", "--path", self.snapshot)
+        original = self.snapshot.read_bytes()
+        backup = self.snapshot.with_name(self.snapshot.name + ".bak")
+        backup.mkdir()
+        result = self.cli("save-workspace", "--path", self.snapshot, check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.snapshot.read_bytes(), original)
+        self.assertIn("workspace backup", result.stderr)
+
     def test_failed_root_and_split_keep_original_pane(self):
         missing = pane([str(self.root / "missing-command")])
         for bad_tab in [tab([missing]), tab([pane(), missing], split(

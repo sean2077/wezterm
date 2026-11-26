@@ -39,7 +39,11 @@ jobs:
         if: runner.os == 'Windows'
         run: |
           test -f /c/Strawberry/perl/bin/perl.exe
+          /c/Strawberry/perl/bin/perl.exe -MIPC::Cmd -e 'die "native Windows Perl required\n" unless $^O eq "MSWin32"'
           echo 'C:\Strawberry\perl\bin' >> "$GITHUB_PATH"
+          # Git Bash prepends its own /usr/bin even after GITHUB_PATH updates.
+          # openssl-src honors this explicit path instead of searching for perl.
+          echo 'OPENSSL_SRC_PERL=C:\Strawberry\perl\bin\perl.exe' >> "$GITHUB_ENV"
       - name: Build runtime
         run: cargo build --locked --release -p wezterm -p wezterm-gui -p wezterm-mux-server -p strip-ansi-escapes
       - name: Test fork components

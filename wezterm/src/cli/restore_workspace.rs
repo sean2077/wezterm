@@ -26,10 +26,7 @@ pub struct RestoreWorkspaceCommand {
 
 impl RestoreWorkspaceCommand {
     pub async fn run(&self, client: Client) -> anyhow::Result<()> {
-        let path = std::env::current_dir()
-            .map(|cwd| cwd.join(&self.path))
-            .unwrap_or_else(|_| self.path.clone());
-        let path = path.to_string_lossy().into_owned();
+        let path = super::resolve_relative_path(&self.path)?;
         let version = client.get_codec_version(GetCodecVersion {}).await?;
         if version.codec_vers >= WORKSPACE_DETAILS_CODEC_VERSION {
             let response = client

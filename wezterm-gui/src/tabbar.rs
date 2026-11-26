@@ -132,18 +132,6 @@ fn split_marker(items: Vec<FormatItem>, marker: char) -> (Vec<FormatItem>, Vec<F
     (items, vec![], false)
 }
 
-fn split_right(items: Vec<FormatItem>) -> (Vec<FormatItem>, Option<Vec<FormatItem>>) {
-    let (left, right, found) = split_marker(items, RIGHT_MARKER);
-    (
-        left,
-        if found && !right.is_empty() {
-            Some(right)
-        } else {
-            None
-        },
-    )
-}
-
 struct TabTitleCallback<'lua> {
     lua: &'lua mlua::Lua,
     tabs: Vec<mlua::AnyUserData<'lua>>,
@@ -157,8 +145,11 @@ impl<'lua> TabTitleCallback<'lua> {
         tabs: &[TabInformation],
         panes: &[PaneInformation],
         config: &ConfigHandle,
-    ) -> mlua::Result<Self> {
-        Ok(Self {
+    ) -> mlua::Result<Option<Self>> {
+        if !config::lua::has_event_handler(lua, "format-tab-title")? {
+            return Ok(None);
+        }
+        Ok(Some(Self {
             lua,
             tabs: tabs
                 .iter()
@@ -169,7 +160,7 @@ impl<'lua> TabTitleCallback<'lua> {
                 .map(|pane| lua.create_userdata(pane.clone()))
                 .collect::<mlua::Result<_>>()?,
             config: (**config).clone().into_lua(lua)?,
-        })
+        }))
     }
 
     fn call(
@@ -196,7 +187,15 @@ impl<'lua> TabTitleCallback<'lua> {
             mlua::Value::Table(_) => {
                 let items = <Vec<FormatItem>>::from_lua(v, lua)?;
                 let (items, accent) = take_accent(items);
-                let (left_items, right_items) = split_right(items);
+                // Parse both sides in one pass so the floating suffix keeps
+                // the foreground, background and attributes at U+001F.
+                let esc = format_as_escapes(items.clone())?;
+                let (line, right) = parse_status_text_impl(
+                    &esc,
+                    CellAttributes::default(),
+                    Some(ControlCode::UnitSeparator),
+                );
+                let (left_items, _, _) = split_marker(items, RIGHT_MARKER);
                 // U+001E separates the fixed left block (index + badge)
                 // from the title. The tab bar measures the left block and
                 // passes the rest of the share to the title as its budget.
@@ -210,15 +209,6 @@ impl<'lua> TabTitleCallback<'lua> {
                 };
                 let mut all_items = left_items;
                 all_items.extend(title_items);
-                let esc = format_as_escapes(all_items.clone())?;
-                let line = parse_status_text(&esc, CellAttributes::default());
-                let right = match right_items {
-                    Some(items) => {
-                        let esc = format_as_escapes(items)?;
-                        Some(parse_status_text(&esc, CellAttributes::default()))
-                    }
-                    None => None,
-                };
 
                 Ok(Some(TitleText {
                     items: all_items,
@@ -231,15 +221,15 @@ impl<'lua> TabTitleCallback<'lua> {
             }
             _ => {
                 let s = String::from_lua(v, lua)?;
-                let (left, right) = match s.find(RIGHT_MARKER) {
-                    Some(pos) => (
-                        s[..pos].to_string(),
-                        Some(s[pos + RIGHT_MARKER.len_utf8()..].to_string()),
-                    ),
-                    None => (s, None),
+                let (line, right) = parse_status_text_impl(
+                    &s,
+                    CellAttributes::default(),
+                    Some(ControlCode::UnitSeparator),
+                );
+                let left = match s.find(RIGHT_MARKER) {
+                    Some(pos) => s[..pos].to_string(),
+                    None => s,
                 };
-                let line = parse_status_text(&left, CellAttributes::default());
-                let right = right.map(|r| parse_status_text(&r, CellAttributes::default()));
                 Ok(Some(TitleText {
                     len: line.len(),
                     items: vec![FormatItem::Text(left)],
@@ -780,6 +770,99 @@ mod tests {
         Ok(())
     }
 
+    fn tab() -> super::TabInformation {
+        super::TabInformation {
+            tab_id: 0,
+            tab_index: 0,
+            is_active: true,
+            is_last_active: true,
+            active_pane: None,
+            window_id: 0,
+            tab_title: String::new(),
+            agent_waiting: false,
+        }
+    }
+
+    #[test]
+    fn unused_title_callback_skips_snapshots_but_sees_later_registration() -> anyhow::Result<()> {
+        let lua = mlua::Lua::new();
+        let config = config::ConfigHandle::default_config();
+        assert!(super::TabTitleCallback::new(&lua, &[], &[], &config)?.is_none());
+
+        // Registration may occur after startup; never cache a negative lookup
+        // across tab bar rebuilds or across Lua contexts after config reload.
+        let callback = lua.create_function(|_, _: mlua::MultiValue| Ok("custom title"))?;
+        config::lua::register_event(&lua, ("format-tab-title".into(), callback))?;
+        let callbacks = super::TabTitleCallback::new(&lua, &[], &[], &config)?.unwrap();
+        assert_eq!(callbacks.call(&tab(), false, 30)?.unwrap().len, 12);
+
+        let reloaded = mlua::Lua::new();
+        assert!(super::TabTitleCallback::new(&reloaded, &[], &[], &config)?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn floating_title_suffix_inherits_styles_and_honors_resets() -> anyhow::Result<()> {
+        use super::{format_as_escapes, parse_status_text, CellAttributes};
+        use termwiz::cell::Intensity;
+        use termwiz::color::ColorAttribute;
+
+        // Exercise both supported callback result forms. The separator must
+        // change placement without resetting SGR attributes; an explicit reset
+        // inside the suffix must still restore the default attributes.
+        for source in [
+            r##"return function()
+                return {
+                    { Foreground = { Color = '#12ab34' } },
+                    { Background = { Color = '#112233' } },
+                    { Attribute = { Intensity = 'Bold' } },
+                    { Text = 'A\31B' },
+                    'ResetAttributes',
+                    { Text = 'C' },
+                }
+            end"##,
+            r#"return function()
+                return '\27[38;2;18;171;52m\27[48;2;17;34;51m\27[1mA\31B\27[0mC'
+            end"#,
+        ] {
+            let lua = mlua::Lua::new();
+            let callback: mlua::Function = lua.load(source).eval()?;
+            config::lua::register_event(&lua, ("format-tab-title".into(), callback))?;
+            let config = config::ConfigHandle::default_config();
+            let callbacks = super::TabTitleCallback::new(&lua, &[], &[], &config)?.unwrap();
+            let title = callbacks.call(&tab(), false, 30)?.unwrap();
+            assert_eq!(title.len, 1);
+            let left =
+                parse_status_text(&format_as_escapes(title.items)?, CellAttributes::default());
+            let right = title.right.unwrap();
+            assert_eq!(right.len(), 2);
+            let before = left.get_cell(0).unwrap();
+            let inherited = right.get_cell(0).unwrap();
+            assert_ne!(before.attrs().foreground(), ColorAttribute::Default);
+            assert_ne!(before.attrs().background(), ColorAttribute::Default);
+            assert_eq!(before.attrs().intensity(), Intensity::Bold);
+            assert_eq!(inherited.attrs(), before.attrs());
+            assert_eq!(
+                right.get_cell(1).unwrap().attrs(),
+                &CellAttributes::default()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn floating_suffix_survives_a_newline_before_the_separator() {
+        // A CR/LF ends the visible title line, but U+001F still starts the
+        // right-floating suffix instead of being swallowed by the newline.
+        let (line, right) = super::parse_status_text_impl(
+            "visible\nignored\x1fsuffix",
+            super::CellAttributes::default(),
+            Some(super::ControlCode::UnitSeparator),
+        );
+        assert_eq!(line.len(), 7);
+        assert_eq!(right.unwrap().len(), 6);
+    }
+
     fn fg(s: &str) -> FormatItem {
         FormatItem::Foreground(FormatColor::Color(s.to_string()))
     }
@@ -984,10 +1067,10 @@ impl TabBarState {
             return build(None);
         }
         match config::run_immediate_with_lua_config(|lua| {
-            let callback = lua
-                .as_deref()
-                .map(|lua| TabTitleCallback::new(lua, tab_info, pane_info, config))
-                .transpose()?;
+            let callback = match lua.as_deref() {
+                Some(lua) => TabTitleCallback::new(lua, tab_info, pane_info, config)?,
+                None => None,
+            };
             Ok(build(callback.as_ref()))
         }) {
             Ok(state) => state,
@@ -1346,8 +1429,17 @@ impl TabBarState {
 }
 
 pub fn parse_status_text(text: &str, default_cell: CellAttributes) -> Line {
+    parse_status_text_impl(text, default_cell, None).0
+}
+
+fn parse_status_text_impl(
+    text: &str,
+    default_cell: CellAttributes,
+    split_at: Option<ControlCode>,
+) -> (Line, Option<Line>) {
     let mut pen = default_cell.clone();
     let mut cells = vec![];
+    let mut left_cells = None;
     let mut ignoring = false;
     let mut print_buffer = String::new();
 
@@ -1368,6 +1460,15 @@ pub fn parse_status_text(text: &str, default_cell: CellAttributes) -> Line {
     let mut parser = Parser::new();
     parser.parse(text.as_bytes(), |action| {
         if ignoring {
+            // A CR/LF ends the single visible line, but the U+001F separator
+            // still starts the floating suffix. Resume collecting after it
+            // rather than dropping the suffix from a multi-line title.
+            if let Action::Control(c) = action {
+                if split_at == Some(c) && left_cells.is_none() {
+                    left_cells = Some(std::mem::take(&mut cells));
+                    ignoring = false;
+                }
+            }
             return;
         }
         match action {
@@ -1375,6 +1476,9 @@ pub fn parse_status_text(text: &str, default_cell: CellAttributes) -> Line {
             Action::PrintString(s) => print_buffer.push_str(&s),
             Action::Control(c) => {
                 flush_print(&mut print_buffer, &mut cells, &pen);
+                if split_at == Some(c) && left_cells.is_none() {
+                    left_cells = Some(std::mem::take(&mut cells));
+                }
                 match c {
                     ControlCode::CarriageReturn | ControlCode::LineFeed => {
                         ignoring = true;
@@ -1447,5 +1551,9 @@ pub fn parse_status_text(text: &str, default_cell: CellAttributes) -> Line {
         }
     });
     flush_print(&mut print_buffer, &mut cells, &pen);
-    Line::from_cells(cells, SEQ_ZERO)
+    let line = Line::from_cells(cells, SEQ_ZERO);
+    match left_cells {
+        Some(left) => (Line::from_cells(left, SEQ_ZERO), Some(line)),
+        None => (line, None),
+    }
 }

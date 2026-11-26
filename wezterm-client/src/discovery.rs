@@ -1,6 +1,7 @@
 use anyhow::Context;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
+#[cfg(windows)]
 use wezterm_uds::UnixStream;
 
 /// There's a lot more code in this windows module than I thought I would need
@@ -458,7 +459,28 @@ pub fn discover_gui_socks() -> Vec<PathBuf> {
 }
 
 fn is_sock_dead(sock: &std::path::Path) -> bool {
-    UnixStream::connect(sock).is_err()
+    #[cfg(unix)]
+    let result = socket2::SockAddr::unix(sock).and_then(|addr| probe_socket(&addr));
+    #[cfg(windows)]
+    let result = UnixStream::connect(sock).map(|_| ());
+
+    result.err().is_some_and(|err| socket_error_is_dead(&err))
+}
+
+#[cfg(unix)]
+fn probe_socket(addr: &socket2::SockAddr) -> std::io::Result<()> {
+    // Discovery runs during GUI startup. A blocking connect can hang forever
+    // when an existing listener's accept queue is full. A timeout is uncertain
+    // liveness, not a reason to unlink the other instance's socket.
+    let socket = socket2::Socket::new(addr.domain(), socket2::Type::STREAM, None)?;
+    socket.connect_timeout(addr, Duration::from_millis(50))
+}
+
+fn socket_error_is_dead(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+    )
 }
 
 /// Remove `agent.*` symlinks whose target no longer exists.  SSH agent
@@ -603,6 +625,46 @@ fn prune_old_gui_logs_in(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn socket_cleanup_requires_a_definite_connection_failure() {
+        use std::io::{Error, ErrorKind};
+        for kind in [ErrorKind::NotFound, ErrorKind::ConnectionRefused] {
+            assert!(socket_error_is_dead(&Error::from(kind)));
+        }
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::WouldBlock,
+            ErrorKind::TimedOut,
+            ErrorKind::Interrupted,
+            ErrorKind::Other,
+        ] {
+            assert!(!socket_error_is_dead(&Error::from(kind)), "{:?}", kind);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn socket_probe_preserves_busy_listeners_and_detects_closed_ones() {
+        // Exercise the bounded connect using loopback TCP so this regression
+        // also runs in build sandboxes that disallow binding Unix sockets.
+        let listener =
+            socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+        let address = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
+        listener.bind(&address.into()).unwrap();
+        listener.listen(1).unwrap();
+        let address = listener.local_addr().unwrap();
+        assert!(probe_socket(&address).is_ok());
+        let start = std::time::Instant::now();
+        for _ in 0..4 {
+            if let Err(err) = probe_socket(&address) {
+                assert!(!socket_error_is_dead(&err), "{:?}", err);
+            }
+        }
+        assert!(start.elapsed() < Duration::from_secs(3));
+        drop(listener);
+        assert!(socket_error_is_dead(&probe_socket(&address).unwrap_err()));
+    }
 
     #[test]
     fn gui_log_pid_parses_only_wezterm_logs() {

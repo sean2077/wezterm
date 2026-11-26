@@ -5,7 +5,7 @@
 use crate::ToastNotification;
 use async_channel::{Receiver, Sender};
 use futures_util::{pin_mut, select_biased, FutureExt, TryStreamExt};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use zbus::{fdo::DBusProxy, message::Type, proxy, MatchRule, MessageStream};
@@ -128,12 +128,17 @@ impl PendingActions {
     }
 }
 
+struct PostedAction {
+    owner: String,
+    id: u32,
+    action: Action,
+}
+
 async fn post(
     dbus: &DBusProxy<'_>,
     service: &NotificationsProxy<'_>,
-    pending: &mut PendingActions,
     request: Request,
-) -> zbus::Result<()> {
+) -> zbus::Result<Option<PostedAction>> {
     let notif = request.notification;
     let mut action = request
         .on_click
@@ -166,7 +171,7 @@ async fn post(
             action_proxy = Some((owner, proxy));
         } else if matches!(action, Some(Action::OpenUrl(_))) {
             // URL toasts may explicitly ask the user to click their button.
-            return Ok(());
+            return Ok(None);
         } else {
             action = None;
         }
@@ -189,10 +194,156 @@ async fn post(
                 .unwrap_or(0),
         )
         .await?;
-    if let (Some((owner, _)), Some(action)) = (action_proxy, action) {
-        pending.insert(owner.as_str().to_owned(), id, action);
+    Ok(match (action_proxy, action) {
+        (Some((owner, _)), Some(action)) => Some(PostedAction {
+            owner: owner.as_str().to_owned(),
+            id,
+            action,
+        }),
+        _ => None,
+    })
+}
+
+// Signals can arrive before Notify returns its ID. Keep the relevant early
+// events while continuing to drain zbus's bounded stream; otherwise a burst
+// of signals blocks its socket reader and even the Notify reply cannot arrive.
+// Existing actions are still dispatched immediately. Limit the unknown IDs to
+// the same budget as pending actions so unrelated applications cannot grow our
+// memory without bound.
+#[derive(Default)]
+struct EarlyNotification {
+    token: Option<String>,
+    // Only the two keys that we advertise are retained. Each key records the
+    // token present at its first invocation, before any subsequent close.
+    invoked: HashMap<String, Option<String>>,
+    closed: bool,
+}
+
+#[derive(Default)]
+struct EarlySignals {
+    entries: VecDeque<(String, u32, EarlyNotification)>,
+    service_changed: bool,
+}
+
+impl EarlySignals {
+    fn receive(&mut self, pending: &mut PendingActions, signal: zbus::Message) -> zbus::Result<()> {
+        let header = signal.header();
+        let Some(sender) = header.sender().map(|name| name.as_str()) else {
+            return Ok(());
+        };
+        let member = header.member().map(|name| name.as_str());
+        if header
+            .interface()
+            .is_some_and(|name| name.as_str() == "org.freedesktop.DBus")
+            && member == Some("NameOwnerChanged")
+            && sender == "org.freedesktop.DBus"
+        {
+            let (name, old_owner, _): (String, String, String) = signal.body().deserialize()?;
+            if name == SERVICE && !old_owner.is_empty() {
+                // A daemon disappeared or was replaced during this request.
+                // Discard its in-flight action as well as already posted ones.
+                self.service_changed = true;
+                self.entries.clear();
+            }
+            return dispatch_signal(pending, signal);
+        }
+        if !header
+            .interface()
+            .is_some_and(|name| name.as_str() == SERVICE)
+            || !header.path().is_some_and(|path| path.as_str() == PATH)
+            || !matches!(
+                member,
+                Some("ActivationToken" | "ActionInvoked" | "NotificationClosed")
+            )
+        {
+            return Ok(());
+        }
+        let (id, value) = match member {
+            Some("ActivationToken" | "ActionInvoked") => {
+                let (id, value): (u32, String) = signal.body().deserialize()?;
+                (id, value)
+            }
+            _ => {
+                let (id, _): (u32, u32) = signal.body().deserialize()?;
+                (id, String::new())
+            }
+        };
+        if pending
+            .0
+            .get(sender)
+            .is_some_and(|entries| entries.contains_key(&id))
+        {
+            return dispatch_signal(pending, signal);
+        }
+        if self.service_changed {
+            return Ok(());
+        }
+        let index = self
+            .entries
+            .iter()
+            .position(|(owner, entry_id, _)| owner == sender && *entry_id == id);
+        let mut entry = match index {
+            Some(index) => self.entries.remove(index).unwrap(),
+            None => (sender.to_owned(), id, EarlyNotification::default()),
+        };
+        if !entry.2.closed {
+            match member {
+                Some("ActivationToken") if !value.is_empty() => entry.2.token = Some(value),
+                Some("ActionInvoked") if matches!(value.as_str(), "default" | "show") => {
+                    let token = entry.2.token.clone();
+                    entry.2.invoked.entry(value).or_insert(token);
+                }
+                Some("NotificationClosed") => entry.2.closed = true,
+                _ => {}
+            }
+        }
+        self.entries.push_back(entry);
+        if self.entries.len() > MAX_PENDING_ACTIONS {
+            // A drained click cannot be replayed, so drop an entry that has
+            // not accepted one first. A burst of signals for other
+            // notifications must not discard an action we already saw.
+            let evict = self
+                .entries
+                .iter()
+                .position(|(_, _, entry)| entry.invoked.is_empty())
+                .unwrap_or(0);
+            self.entries.remove(evict);
+        }
+        Ok(())
     }
-    Ok(())
+
+    fn finish(self, pending: &mut PendingActions, posted: PostedAction) {
+        if self.service_changed {
+            return;
+        }
+        let early = self
+            .entries
+            .into_iter()
+            .find(|(owner, id, _)| owner == &posted.owner && *id == posted.id);
+        if let Some((_, _, mut early)) = early {
+            if let Some(token) = early.invoked.remove(posted.action.key_and_label()[0]) {
+                invoke_action(posted.action, token);
+                return;
+            }
+            if early.closed {
+                return;
+            }
+            let owner = posted.owner;
+            pending.insert(owner.clone(), posted.id, posted.action);
+            if let Some(token) = early.token {
+                pending.set_token(&owner, posted.id, token);
+            }
+        } else {
+            pending.insert(posted.owner, posted.id, posted.action);
+        }
+    }
+}
+
+fn invoke_action(action: Action, token: Option<String>) {
+    match action {
+        Action::OpenUrl(url) => wezterm_open_url::open_url(&url),
+        Action::Activate(on_click) => on_click(token),
+    }
 }
 
 fn dispatch_signal(pending: &mut PendingActions, signal: zbus::Message) -> zbus::Result<()> {
@@ -219,10 +370,7 @@ fn dispatch_signal(pending: &mut PendingActions, signal: zbus::Message) -> zbus:
                 Some("ActionInvoked") => {
                     let (id, key): (u32, String) = signal.body().deserialize()?;
                     if let Some(entry) = pending.take_action(sender, id, &key) {
-                        match entry.action {
-                            Action::OpenUrl(url) => wezterm_open_url::open_url(&url),
-                            Action::Activate(on_click) => on_click(entry.token),
-                        }
+                        invoke_action(entry.action, entry.token);
                     }
                 }
                 Some("NotificationClosed") => {
@@ -241,10 +389,9 @@ async fn run_connection(requests: &Receiver<Request>, first: Request) -> zbus::R
     let connection = zbus::Connection::session().await?;
     let dbus = DBusProxy::new(&connection).await?;
     let service = NotificationsProxy::new(&connection).await?;
-    let mut signals = MessageStream::from(&connection);
-    signals.set_max_queued(MAX_REQUESTS);
-    // Use a single stream so owner changes, activations, tokens and closes
-    // are observed in bus order, including signals queued during Notify.
+    // Register matches before activating the bounded message stream. No
+    // notification has been posted yet, and an undrained stream could otherwise
+    // block the reply to the second AddMatch during a signal burst.
     dbus.add_match_rule(
         MatchRule::builder()
             .msg_type(Type::Signal)
@@ -265,6 +412,10 @@ async fn run_connection(requests: &Receiver<Request>, first: Request) -> zbus::R
     )
     .await?;
 
+    // Use a single stream so owner changes, activations, tokens and closes
+    // are observed in bus order, including signals queued during Notify.
+    let mut signals = MessageStream::from(&connection);
+    signals.set_max_queued(MAX_REQUESTS);
     let mut pending = PendingActions::default();
     let mut first = Some(first);
     loop {
@@ -288,16 +439,35 @@ async fn run_connection(requests: &Receiver<Request>, first: Request) -> zbus::R
             }
             request = next => {
                 let Ok(request) = request else { return Ok(()); };
-                let posting = post(&dbus, &service, &mut pending, request).fuse();
+                let posting = post(&dbus, &service, request).fuse();
                 let timeout = async_io::Timer::after(Duration::from_secs(5)).fuse();
                 pin_mut!(posting, timeout);
-                select_biased! {
-                    result = posting => {
-                        if let Err(err) = result {
-                            log::error!("while showing notification: {err:#}");
+                let mut early = EarlySignals::default();
+                loop {
+                    let signal = signals.try_next().fuse();
+                    pin_mut!(signal);
+                    select_biased! {
+                        result = posting => {
+                            match result {
+                                Ok(Some(posted)) => early.finish(&mut pending, posted),
+                                Ok(None) => {},
+                                Err(err) => log::error!("while showing notification: {err:#}"),
+                            }
+                            break;
+                        }
+                        _ = timeout => {
+                            log::warn!("timed out posting desktop notification");
+                            break;
+                        }
+                        message = signal => {
+                            let Some(message) = message? else { return Ok(()); };
+                            if message.message_type() == Type::Signal {
+                                if let Err(err) = early.receive(&mut pending, message) {
+                                    log::debug!("ignoring invalid notification signal: {err:#}");
+                                }
+                            }
                         }
                     }
-                    _ = timeout => log::warn!("timed out posting desktop notification"),
                 }
             }
         }
@@ -396,6 +566,149 @@ mod tests {
             .is_none());
     }
 
+    fn early_signal(member: &str, id: u32, value: &str) -> zbus::Message {
+        zbus::Message::signal(PATH, SERVICE, member)
+            .unwrap()
+            .sender(":1.1")
+            .unwrap()
+            .build(&(id, value))
+            .unwrap()
+    }
+
+    fn close_signal(id: u32) -> zbus::Message {
+        zbus::Message::signal(PATH, SERVICE, "NotificationClosed")
+            .unwrap()
+            .sender(":1.1")
+            .unwrap()
+            .build(&(id, 2u32))
+            .unwrap()
+    }
+
+    #[test]
+    fn early_click_uses_its_token_and_survives_a_following_close() {
+        let mut pending = PendingActions::default();
+        let mut early = EarlySignals::default();
+        for token in ["stale", "stale", "stale", "stale", "click-token"] {
+            early
+                .receive(&mut pending, early_signal("ActivationToken", 42, token))
+                .unwrap();
+        }
+        early
+            .receive(&mut pending, early_signal("ActionInvoked", 42, "default"))
+            .unwrap();
+        early
+            .receive(
+                &mut pending,
+                early_signal("ActivationToken", 42, "too-late"),
+            )
+            .unwrap();
+        early.receive(&mut pending, close_signal(42)).unwrap();
+        let (send, recv) = std::sync::mpsc::channel();
+        early.finish(
+            &mut pending,
+            PostedAction {
+                owner: ":1.1".into(),
+                id: 42,
+                action: Action::Activate(Box::new(move |token| send.send(token).unwrap())),
+            },
+        );
+        assert_eq!(recv.try_recv().unwrap().as_deref(), Some("click-token"));
+        assert!(pending.0.is_empty());
+    }
+
+    #[test]
+    fn early_close_prevents_a_later_click_and_owner_changes_cancel_inflight_actions() {
+        let mut pending = PendingActions::default();
+        let mut early = EarlySignals::default();
+        early.receive(&mut pending, close_signal(42)).unwrap();
+        early
+            .receive(&mut pending, early_signal("ActionInvoked", 42, "default"))
+            .unwrap();
+        early.finish(
+            &mut pending,
+            PostedAction {
+                owner: ":1.1".into(),
+                id: 42,
+                action: Action::Activate(Box::new(|_| panic!("closed notification was activated"))),
+            },
+        );
+        assert!(pending.0.is_empty());
+
+        let mut early = EarlySignals::default();
+        early
+            .receive(&mut pending, early_signal("ActionInvoked", 42, "default"))
+            .unwrap();
+        let changed = zbus::Message::signal(
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+            "NameOwnerChanged",
+        )
+        .unwrap()
+        .sender("org.freedesktop.DBus")
+        .unwrap()
+        .build(&(SERVICE, ":1.1", ":1.2"))
+        .unwrap();
+        early.receive(&mut pending, changed).unwrap();
+        early.finish(
+            &mut pending,
+            PostedAction {
+                owner: ":1.1".into(),
+                id: 42,
+                action: Action::Activate(Box::new(|_| {
+                    panic!("replaced daemon's action was activated")
+                })),
+            },
+        );
+        assert!(pending.0.is_empty());
+    }
+
+    #[test]
+    fn early_click_survives_eviction_from_a_signal_burst() {
+        let mut pending = PendingActions::default();
+        let mut early = EarlySignals::default();
+        let (send, recv) = std::sync::mpsc::channel();
+        early
+            .receive(&mut pending, early_signal("ActionInvoked", 42, "default"))
+            .unwrap();
+        for id in 100..100 + MAX_PENDING_ACTIONS as u32 * 2 {
+            early
+                .receive(&mut pending, early_signal("ActivationToken", id, "token"))
+                .unwrap();
+        }
+        early.finish(
+            &mut pending,
+            PostedAction {
+                owner: ":1.1".into(),
+                id: 42,
+                action: Action::Activate(Box::new(move |token| send.send(token).unwrap())),
+            },
+        );
+        assert_eq!(recv.try_recv().unwrap(), None);
+        assert!(pending.0.is_empty());
+    }
+
+    #[test]
+    fn posting_dispatches_existing_actions_and_bounds_unknown_ids() {
+        let mut pending = PendingActions::default();
+        let mut early = EarlySignals::default();
+        let (send, recv) = std::sync::mpsc::channel();
+        pending.insert(
+            ":1.1".into(),
+            7,
+            Action::Activate(Box::new(move |token| send.send(token).unwrap())),
+        );
+        early
+            .receive(&mut pending, early_signal("ActionInvoked", 7, "default"))
+            .unwrap();
+        assert_eq!(recv.try_recv().unwrap(), None);
+        for id in 100..100 + MAX_PENDING_ACTIONS as u32 * 2 {
+            early
+                .receive(&mut pending, early_signal("ActivationToken", id, "token"))
+                .unwrap();
+        }
+        assert_eq!(early.entries.len(), MAX_PENDING_ACTIONS);
+    }
+
     struct NotificationService;
 
     #[zbus::interface(name = "org.freedesktop.Notifications")]
@@ -410,7 +723,7 @@ mod tests {
             _app_name: &str,
             _replaces_id: u32,
             _app_icon: &str,
-            _summary: &str,
+            summary: &str,
             _body: &str,
             actions: Vec<String>,
             _hints: HashMap<String, zvariant::OwnedValue>,
@@ -418,6 +731,14 @@ mod tests {
             #[zbus(signal_context)] context: SignalContext<'_>,
         ) -> zbus::fdo::Result<u32> {
             assert_eq!(actions, ["default", "Open pane"]);
+            if summary == "Signal burst" {
+                // Another application's signals can fill the bounded stream
+                // before Notify returns. Keep draining it while waiting for
+                // the reply, or zbus cannot read the reply from the socket.
+                for id in 1000..1000 + MAX_REQUESTS as u32 * 2 {
+                    Self::activation_token(&context, id, "unrelated-token").await?;
+                }
+            }
             Self::activation_token(&context, 42, "test-token").await?;
             Self::action_invoked(&context, 42, "default").await?;
             Ok(42)
@@ -440,7 +761,7 @@ mod tests {
 
     #[test]
     #[ignore = "run under dbus-run-session with WEZTERM_TEST_NOTIFICATIONS_DBUS=1"]
-    fn immediate_click_keeps_the_activation_token() {
+    fn immediate_click_keeps_the_activation_token_during_a_signal_burst() {
         assert_eq!(
             std::env::var("WEZTERM_TEST_NOTIFICATIONS_DBUS").as_deref(),
             Ok("1")
@@ -455,18 +776,20 @@ mod tests {
                 .build()
                 .await
                 .unwrap();
-            let (send, receive) = async_channel::bounded(1);
-            persistent_toast_notification_with_click_action("Example", "Message", move |token| {
-                send.try_send(token).unwrap();
-            });
-            let click = receive.recv().fuse();
-            let timeout = async_io::Timer::after(Duration::from_secs(5)).fuse();
-            pin_mut!(click, timeout);
-            let token = select_biased! {
-                result = click => result.unwrap(),
-                _ = timeout => panic!("the fake notification service's immediate click was lost"),
-            };
-            assert_eq!(token.as_deref(), Some("test-token"));
+            for title in ["Example", "Signal burst"] {
+                let (send, receive) = async_channel::bounded(1);
+                persistent_toast_notification_with_click_action(title, "Message", move |token| {
+                    send.try_send(token).unwrap();
+                });
+                let click = receive.recv().fuse();
+                let timeout = async_io::Timer::after(Duration::from_secs(3)).fuse();
+                pin_mut!(click, timeout);
+                let token = select_biased! {
+                    result = click => result.unwrap(),
+                    _ = timeout => panic!("the fake notification service's {} click was lost", title),
+                };
+                assert_eq!(token.as_deref(), Some("test-token"));
+            }
         });
     }
 }
