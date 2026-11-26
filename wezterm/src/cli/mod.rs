@@ -250,11 +250,8 @@ fn resolve_relative_path(path: &Path) -> anyhow::Result<String> {
     let path = if path.is_absolute() {
         path.to_path_buf()
     } else {
-        // On Windows, joining a drive-relative path such as C:session.json
-        // leaves it relative. Resolve it in the CLI process before sending it
-        // to a mux server with its own per-drive working directories.
         #[cfg(windows)]
-        let resolved = std::path::absolute(path);
+        let resolved = resolve_windows_relative(path);
         #[cfg(not(windows))]
         let resolved = std::env::current_dir().map(|cwd| cwd.join(path));
         resolved.context("resolving path relative to the CLI's current directory")?
@@ -264,6 +261,26 @@ fn resolve_relative_path(path: &Path) -> anyhow::Result<String> {
     path.into_os_string()
         .into_string()
         .map_err(|_| anyhow!("path is not valid UTF-8 and cannot be sent to the mux server"))
+}
+
+/// Resolve a Windows relative path in the CLI process. Ordinary relative
+/// paths stay joined to the CLI directory so the OS resolves `.` and `..`
+/// with normal filesystem semantics, including junctions and symlinks. Only
+/// paths with a prefix or root (`C:file`, `\file`) need lexical expansion:
+/// a mux server would otherwise resolve them against its own per-drive
+/// working directories.
+#[cfg(windows)]
+fn resolve_windows_relative(path: &Path) -> std::io::Result<std::path::PathBuf> {
+    let needs_lexical_resolution = path.has_root()
+        || matches!(
+            path.components().next(),
+            Some(std::path::Component::Prefix(_))
+        );
+    if needs_lexical_resolution {
+        std::path::absolute(path)
+    } else {
+        std::env::current_dir().map(|cwd| cwd.join(path))
+    }
 }
 
 #[cfg(test)]
@@ -306,6 +323,19 @@ mod path_tests {
         let resolved = resolve_relative_path(Path::new(&relative)).unwrap();
         assert!(Path::new(&resolved).is_absolute());
         assert_eq!(Path::new(&resolved), cwd.join("session.json"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ordinary_relative_paths_keep_os_resolution() {
+        // `..` must reach the OS unnormalized so junctions and symlinks
+        // resolve the same way they do in the user's shell.
+        let relative = Path::new("nested").join("..").join("session.json");
+        let expected = std::env::current_dir().unwrap().join(&relative);
+        assert_eq!(
+            resolve_relative_path(&relative).unwrap(),
+            expected.to_str().unwrap()
+        );
     }
 
     #[cfg(unix)]
