@@ -850,6 +850,19 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn floating_suffix_survives_a_newline_before_the_separator() {
+        // A CR/LF ends the visible title line, but U+001F still starts the
+        // right-floating suffix instead of being swallowed by the newline.
+        let (line, right) = super::parse_status_text_impl(
+            "visible\nignored\x1fsuffix",
+            super::CellAttributes::default(),
+            Some(super::ControlCode::UnitSeparator),
+        );
+        assert_eq!(line.len(), 7);
+        assert_eq!(right.unwrap().len(), 6);
+    }
+
     fn fg(s: &str) -> FormatItem {
         FormatItem::Foreground(FormatColor::Color(s.to_string()))
     }
@@ -1447,6 +1460,15 @@ fn parse_status_text_impl(
     let mut parser = Parser::new();
     parser.parse(text.as_bytes(), |action| {
         if ignoring {
+            // A CR/LF ends the single visible line, but the U+001F separator
+            // still starts the floating suffix. Resume collecting after it
+            // rather than dropping the suffix from a multi-line title.
+            if let Action::Control(c) = action {
+                if split_at == Some(c) && left_cells.is_none() {
+                    left_cells = Some(std::mem::take(&mut cells));
+                    ignoring = false;
+                }
+            }
             return;
         }
         match action {
