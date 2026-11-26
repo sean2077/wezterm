@@ -10,10 +10,10 @@ use crate::termwindow::{RenderState, UIItem, UIItemType};
 use crate::utilsprites::RenderMetrics;
 use config::{Dimension, DimensionContext, TabBarColors};
 use std::rc::Rc;
-use wezterm_font::LoadedFont;
+use wezterm_font::{ClearShapeCache, LoadedFont};
 use wezterm_term::color::{ColorAttribute, ColorPalette};
 use wezterm_term::{CellAttributes, Line};
-use window::{IntegratedTitleButtonAlignment, RectF};
+use window::{IntegratedTitleButtonAlignment, RectF, WindowOps};
 
 /// Half a stroke in from the near edge / far edge of a corner glyph, so a
 /// stroke of `line_width` lands inside the tab's border pixels.
@@ -760,9 +760,21 @@ impl crate::TermWindow {
             metrics,
             zindex: 10,
         };
-        self.compute_element(&context, element)
-            .ok()
-            .map(|computed| computed.bounds.width())
+        match self.compute_element(&context, element) {
+            Ok(computed) => Some(computed.bounds.width()),
+            Err(err) => {
+                if err.downcast_ref::<ClearShapeCache>().is_some() {
+                    // Measuring may be the first shape operation to consume
+                    // newly resolved fallback fonts. Keep the renderer's
+                    // invalidation signal instead of caching the estimated
+                    // width indefinitely after swallowing this error.
+                    self.window
+                        .as_ref()?
+                        .notify(crate::termwindow::TermWindowNotif::InvalidateShapeCache);
+                }
+                None
+            }
+        }
     }
 
     pub fn build_fancy_tab_bar(&self, palette: &ColorPalette) -> anyhow::Result<ComputedElement> {

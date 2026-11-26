@@ -1139,6 +1139,10 @@ impl TermWindow {
             TermWindowNotif::InvalidateShapeCache => {
                 self.shape_generation += 1;
                 self.shape_cache.borrow_mut().clear();
+                // Asynchronous font fallback also changes cached tab/status
+                // glyphs and their measured widths, even if the text is the same.
+                self.invalidate_fancy_tab_bar();
+                self.update_title_post_status();
                 self.invalidate_modal();
                 window.invalidate();
             }

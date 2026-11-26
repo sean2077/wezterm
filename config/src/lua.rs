@@ -744,6 +744,14 @@ pub fn register_event<'lua>(
     }
 }
 
+/// Whether an event has any registered handlers. Callers with expensive
+/// callback arguments can avoid constructing them when the event is unused.
+pub fn has_event_handler(lua: &Lua, name: &str) -> mlua::Result<bool> {
+    let decorated_name = format!("wezterm-event-{}", name);
+    let handlers: mlua::Value = lua.named_registry_value(&decorated_name)?;
+    Ok(matches!(handlers, mlua::Value::Table(table) if table.raw_len() > 0))
+}
+
 const IS_EVENT: &str = "wezterm-is-event-emission";
 
 /// Returns true if the current lua context is being called as part
@@ -866,6 +874,19 @@ pub fn add_to_config_reload_watch_list<'lua>(
 mod test {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn detects_registered_event_handlers_without_calling_them() -> mlua::Result<()> {
+        let lua = Lua::new();
+        assert!(!has_event_handler(&lua, "format-tab-title")?);
+        let callback = lua.create_function(|_, ()| -> mlua::Result<()> {
+            panic!("checking for a handler must not invoke it")
+        })?;
+        register_event(&lua, ("format-tab-title".into(), callback))?;
+        assert!(has_event_handler(&lua, "format-tab-title")?);
+        assert!(!has_event_handler(&lua, "update-status")?);
+        Ok(())
+    }
 
     #[test]
     fn can_register_and_emit_multiple_events() -> anyhow::Result<()> {
